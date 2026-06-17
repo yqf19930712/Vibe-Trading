@@ -620,12 +620,18 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
     if caps.name == "moonshot" and name.lower().startswith("kimi-k2") and temperature != 1.0:
         logger.info("Forcing temperature=1.0 for %s (provider requirement)", name)
         temperature = 1.0
+    # Anthropic Opus 4.8 (proxied via OpenAI-compat) rejects `temperature`
+    # entirely ("`temperature` is deprecated for this model"). Pass None so
+    # langchain-openai omits the field from the request payload.
+    temperature_param: float | None = temperature
+    if "opus-4-8" in name.lower():
+        temperature_param = None
     # Optional reasoning activation for relays requiring opt-in (e.g. OpenRouter).
     # Moonshot/DeepSeek official APIs emit reasoning by default and ignore this field.
     effort = os.getenv("LANGCHAIN_REASONING_EFFORT", "").strip().lower()
     kwargs: dict[str, Any] = {
         "model": name,
-        "temperature": temperature,
+        "temperature": temperature_param,
         "timeout": int(os.getenv("TIMEOUT_SECONDS", "120")),
         "max_retries": int(os.getenv("MAX_RETRIES", "2")),
         "callbacks": callbacks,
