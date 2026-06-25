@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 import pkgutil
 from collections.abc import Mapping
 from collections import deque
@@ -28,6 +29,26 @@ logger = logging.getLogger(__name__)
 
 _SUBCLASSES_CACHE: list[type[BaseTool]] | None = None
 _SHELL_TOOL_NAMES = {"bash", "background_run"}
+
+# Tools excluded when this instance is an isolated single-user tenant behind a
+# shared multi-tenant gateway (env VIBE_TRADING_TENANT_SAFE=1, injected by the
+# vibe-router). These either read/write cross-session state (run_swarm,
+# session_search, background_*) or expose a broker order / connection / mandate
+# surface the tenant doesn't need and that widens blast radius. The trading_*
+# family is matched by prefix. See MULTI_TENANCY.md §4.3 / B2 / M2.
+_TENANT_SAFE_BLOCKED_NAMES = {
+    "run_swarm",
+    "session_search",
+    "background_run",
+    "check_background",
+    "propose_mandate_profiles",
+}
+_TENANT_SAFE_BLOCKED_PREFIXES = ("trading_",)
+
+
+def _tenant_safe_enabled() -> bool:
+    """Whether the multi-tenant safety profile is active for this process."""
+    return os.getenv("VIBE_TRADING_TENANT_SAFE", "").strip().lower() in {"1", "true", "yes"}
 
 
 def _discover_subclasses() -> list[type[BaseTool]]:
@@ -129,10 +150,17 @@ def build_registry(
         UpdateResearchGoalStatusTool,
     }
     registry = ToolRegistry()
+    tenant_safe = _tenant_safe_enabled()
     for cls in _discover_subclasses():
         try:
             if cls.name in _SHELL_TOOL_NAMES and not include_shell_tools:
                 logger.info("Tool %s disabled by shell tool policy", cls.name)
+                continue
+            if tenant_safe and (
+                cls.name in _TENANT_SAFE_BLOCKED_NAMES
+                or cls.name.startswith(_TENANT_SAFE_BLOCKED_PREFIXES)
+            ):
+                logger.info("Tool %s disabled by tenant-safe policy", cls.name)
                 continue
             if not cls.check_available():
                 logger.info("Tool %s unavailable, skipping", cls.name)

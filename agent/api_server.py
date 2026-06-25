@@ -39,9 +39,32 @@ for _s in ("stdout", "stderr"):
     if callable(_r):
         _r(encoding="utf-8", errors="replace")
 
-RUNS_DIR = Path(__file__).resolve().parent / "runs"
-SESSIONS_DIR = Path(__file__).resolve().parent / "sessions"
-UPLOADS_DIR = Path(__file__).resolve().parent / "uploads"
+def _data_root() -> Path:
+    """Root for per-tenant mutable state (runs / sessions / uploads).
+
+    Honors ``VIBE_DATA_DIR`` so a multi-tenant launcher can point each instance
+    at a per-user HOME (``$HOME/.vibe-trading``) to isolate state across tenants.
+    Defaults to the install dir, preserving single-user behavior unchanged.
+    See MULTI_TENANCY.md §4.2.
+    """
+    env = os.getenv("VIBE_DATA_DIR")
+    return Path(env).expanduser() if env else Path(__file__).resolve().parent
+
+
+# Fail loud rather than silently writing tenant state into the shared install
+# dir when a multi-tenant launcher forgot to set the per-tenant data dir.
+if os.getenv("VIBE_MULTITENANT", "").strip().lower() in {"1", "true", "yes"} and not os.getenv(
+    "VIBE_DATA_DIR"
+):
+    raise SystemExit(
+        "VIBE_MULTITENANT is set but VIBE_DATA_DIR is not — refusing to write tenant "
+        "state into the shared install directory. Set VIBE_DATA_DIR=$HOME/.vibe-trading."
+    )
+
+_DATA_ROOT = _data_root()
+RUNS_DIR = _DATA_ROOT / "runs"
+SESSIONS_DIR = _DATA_ROOT / "sessions"
+UPLOADS_DIR = _DATA_ROOT / "uploads"
 AGENT_DIR = Path(__file__).resolve().parent
 ENV_PATH = AGENT_DIR / ".env"
 ENV_EXAMPLE_PATH = AGENT_DIR / ".env.example"
@@ -2315,9 +2338,10 @@ def _get_swarm_runtime():
     if _swarm_runtime is not None:
         return _swarm_runtime
     from src.config import load_swarm_agent_config
-    from src.swarm.store import SwarmStore
+    from src.swarm.store import SwarmStore, swarm_runs_root
     from src.swarm.runtime import SwarmRuntime
-    swarm_dir = Path(__file__).resolve().parent / ".swarm" / "runs"
+    # Single source of truth (honors VIBE_DATA_DIR for per-tenant isolation).
+    swarm_dir = swarm_runs_root()
     store = SwarmStore(base_dir=swarm_dir)
     # Boot-time / operator-trusted: REST API callers cannot influence the
     # config path. See docs/2026-05-25_swarm_mcp_tools_roadmap.md.

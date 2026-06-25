@@ -260,9 +260,13 @@ class TraceWriter:
             Directory containing ``trace.jsonl``, or ``None`` when absent.
         """
         if sessions_dir is None:
-            sessions_dir = Path(__file__).resolve().parents[2] / "sessions"
+            from src.core.paths import data_root
+
+            sessions_dir = data_root() / "sessions"
         if runs_dir is None:
-            runs_dir = Path(__file__).resolve().parents[2] / "runs"
+            from src.core.paths import runs_root
+
+            runs_dir = runs_root()
 
         session_dir = sessions_dir / run_id
         if (session_dir / "trace.jsonl").exists():

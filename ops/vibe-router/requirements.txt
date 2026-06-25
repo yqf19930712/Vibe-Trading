@@ -1,0 +1,7 @@
+# vibe-router runtime deps (a tiny venv separate from the Vibe agent install).
+# Plain uvicorn (no [standard]) avoids uvloop/httptools native builds — a loopback,
+# low-traffic router doesn't need them, and it keeps the install portable.
+fastapi>=0.104.0
+uvicorn>=0.24.0
+httpx>=0.28.0
+psutil>=5.9.0          # boot-time orphan-instance cleanup (m5); router degrades gracefully if absent

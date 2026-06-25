@@ -39,9 +39,12 @@ from src.goal.context import (
 from src.providers.chat import ChatLLM, ProviderStreamError
 from src.tools.background_tools import get_background_manager
 from src.tools.redaction import redact_payload
+from src.core.paths import data_root, runs_root
 
-RUNS_DIR = Path(__file__).resolve().parents[2] / "runs"
-SESSIONS_DIR = Path(__file__).resolve().parents[2] / "sessions"
+# Honor VIBE_DATA_DIR (multi-tenant per-user HOME) so the agent loop writes run
+# artifacts under the tenant root, not the shared install dir. See core/paths.py.
+RUNS_DIR = runs_root()
+SESSIONS_DIR = data_root() / "sessions"
 TOKEN_THRESHOLD = int(os.getenv("TOKEN_THRESHOLD", "40000"))
 KEEP_RECENT = 3
 TOOL_RESULT_LIMIT = 10_000

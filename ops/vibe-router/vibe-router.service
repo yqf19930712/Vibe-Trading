@@ -1,0 +1,37 @@
+# systemd unit for the multi-tenant vibe-router (MULTI_TENANCY.md §5, §8.5).
+# Independent of invest-web so web deploys never touch the tenant pool.
+# Install: cp to /etc/systemd/system/, set env in /opt/invest/vibe-router.env (chmod 600),
+# then: systemctl daemon-reload && systemctl enable --now vibe-router
+[Unit]
+Description=Vibe-Trading multi-tenant router (per-user instance pool)
+After=network.target
+
+[Service]
+Type=simple
+# Runs as a dedicated user that owns /srv/vibe and the env file.
+User=vibe
+Group=vibe
+EnvironmentFile=/opt/invest/vibe-router.env
+# uvicorn serves the router on loopback only.
+ExecStart=/opt/invest/vibe-venv/bin/uvicorn router:app --host 127.0.0.1 --port 8990
+WorkingDirectory=/opt/invest/vibe-router
+Restart=on-failure
+RestartSec=3
+# Reap the whole cgroup (router + all child vibe instances) on stop (m5).
+KillMode=control-group
+Delegate=yes
+LimitNOFILE=65536
+# Group-level resource cap (M4): child vibe instances inherit this unit's cgroup
+# (plain Popen, non-root), so this bounds the WHOLE pool — a runaway tenant is
+# OOM-killed within this cgroup instead of triggering the global OOM-killer and
+# taking down invest-web/market-data. Prefer killing this pool over the web app.
+MemoryMax=5G
+MemorySwapMax=0
+OOMScoreAdjust=500
+# No broad ExecStartPre pkill: pattern "vibe-trading serve --host 127.0.0.1"
+# would also match the legacy standalone vibe-trading.service on :8899 (still
+# serving laicai during phase 1). Orphaned router-managed instances are reaped
+# precisely in-process by env marker (router.py _kill_orphans_on_boot, psutil).
+
+[Install]
+WantedBy=multi-user.target
