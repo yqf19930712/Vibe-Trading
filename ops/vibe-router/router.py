@@ -120,7 +120,12 @@ async def _spawn(tk: str) -> Instance:
             "HOME": str(home),
             "VIBE_DATA_DIR": str(home / ".vibe-trading"),  # co-locate sessions/runs/uploads/swarm with memory (B1/B4)
             "VIBE_MULTITENANT": "1",                        # fail-loud if data dir missing (B4)
-            "VIBE_TRADING_TENANT_SAFE": "1",                # strip swarm/search/background/trading tools (B2/M2)
+            "VIBE_TRADING_TENANT_SAFE": "1",                # block only real-trading/mandate tools (B2/M2)
+            # TEST PHASE: enable shell tools so background_run (arbitrary host
+            # commands, runs as the `vibe` user) is usable; this also enables
+            # the foreground `bash` tool (equivalent capability). Drop this env
+            # to lock host command execution back down before real multi-user use.
+            "VIBE_TRADING_ENABLE_SHELL_TOOLS": "1",
             "API_AUTH_KEY": hashlib.sha256(os.urandom(16)).hexdigest(),
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             INSTANCE_MARKER: tk,

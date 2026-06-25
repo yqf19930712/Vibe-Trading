@@ -148,16 +148,15 @@ if os.getenv("VIBE_MULTITENANT") == "1" and not os.getenv("VIBE_DATA_DIR"):
   + `VIBE_MULTITENANT=1`，使 sessions/uploads/runs/swarm 与 memory/search/goal **同根**。
 
 ### 4.3 租户安全档位 `VIBE_TRADING_TENANT_SAFE=1`（B2/M2）
-router 给每实例注入，`build_registry()` 据此构造**白名单/排除**（已有 `build_filtered_registry`，
-`tools/__init__.py:244`）：
-- **排除** `SwarmTool`、`session_search`、`background_run`/`check_background`、全部 `trading_*` /
-  `propose_mandate` / 连接器工具。
-- shell 工具关（默认即关，不设其 env）；`ALLOW_SESSION_MCP_SERVERS` 不设。
-- 一期不启 live 券商（凭据面归零）；二期若开，须先做 B1 relocation + `SWARM_MAX_WORKERS=1`，并把
-  券商限定在该用户私有 HOME。
+router 给每实例注入，`build_registry()` 据此排除工具（`tools/__init__.py`）。
 
-> 评审纠偏：原"仅 `session_search` 一条非 shell 路径"**不成立**；SwarmTool/trading 同为常驻可达，
-> 必须显式排除，不能依赖"不下发 MCP 配置"。
+**当前（测试阶段）配置**：只排除**会动钱的硬红线**——全部 `trading_*`（真实下单）+ `propose_mandate_profiles`（资金授权）。一个只读分析产品无论如何不得触发真实交易/资金动作，这条不可放开。
+- **放开**（测试阶段）：`run_swarm`、`session_search`、`background_run`/`check_background`。进程 + HOME 隔离已把它们的状态限定在本租户（swarm runs → `swarm_runs_root()`/VIBE_DATA_DIR；`session_search` 索引 = `Path.home()/.vibe-trading/sessions.db`，故**只搜本租户自己跨 thread 的全部历史会话，绝不跨租户**）。
+- `background_run` 额外需要 shell 门：router 注入 `VIBE_TRADING_ENABLE_SHELL_TOOLS=1`（它跑任意 host 命令）——**这同时放开前台 `bash`**（能力等价）。
+- 资源放大（并行 swarm worker、常驻后台任务）**测试阶段接受**，仅靠 pool 级 cgroup `MemoryMax=5G` 兜底；真正多用户上量前须复审（恢复排除 swarm/background 或加每请求配额）。
+- 实证（box `build_registry`）：shell ON 共 39 个工具，`session_search`/`run_swarm`/`check_background`/`background_run`/`bash` 在册，`trading_*`/`propose_mandate_profiles` 仍缺席；shell OFF 时 `background_run`/`bash` 被 shell 门挡、`session_search` 不受影响仍在册（两道门正交）。
+
+> 历史（一期设计原值，现已放宽）：曾额外排除 `SwarmTool`/`session_search`/`background_*`。评审纠偏过"仅 `session_search` 一条非 shell 路径不成立、SwarmTool/trading 同为常驻可达"——该判断仍正确，只是测试阶段主动接受 swarm/background/search 的可达性，仅死守 trading/mandate 红线。
 
 ### 4.4 端口与监听（M1）
 - 每实例 **显式 `--host 127.0.0.1`**（覆盖 `serve` 默认 `0.0.0.0`），端口段 8901–8949 分配。

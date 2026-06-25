@@ -32,15 +32,22 @@ _SHELL_TOOL_NAMES = {"bash", "background_run"}
 
 # Tools excluded when this instance is an isolated single-user tenant behind a
 # shared multi-tenant gateway (env VIBE_TRADING_TENANT_SAFE=1, injected by the
-# vibe-router). These either read/write cross-session state (run_swarm,
-# session_search, background_*) or expose a broker order / connection / mandate
-# surface the tenant doesn't need and that widens blast radius. The trading_*
-# family is matched by prefix. See MULTI_TENANCY.md §4.3 / B2 / M2.
+# vibe-router). Only the hard safety red line is blocked here: real broker
+# order placement / fund-mandate surfaces (trading_* by prefix, and
+# propose_mandate_profiles) — a read-only analysis product must never be able
+# to move money, regardless of resource posture.
+#
+# TEST PHASE: run_swarm / session_search / background_* are intentionally NOT
+# blocked. Per-process + per-HOME isolation already scopes their state to the
+# tenant (swarm runs → swarm_runs_root()/VIBE_DATA_DIR; session_search index →
+# Path.home()/.vibe-trading/sessions.db, so it searches ONLY this tenant's own
+# full session history across threads, never another tenant's). Their resource
+# blow-up (parallel swarm workers, lingering background tasks) is accepted for
+# now and bounded only by the pool-level cgroup MemoryMax; revisit before any
+# real multi-user load. background_run additionally needs the shell-tools gate
+# (VIBE_TRADING_ENABLE_SHELL_TOOLS=1, injected by the router) since it runs
+# arbitrary host commands. See MULTI_TENANCY.md §4.3.
 _TENANT_SAFE_BLOCKED_NAMES = {
-    "run_swarm",
-    "session_search",
-    "background_run",
-    "check_background",
     "propose_mandate_profiles",
 }
 _TENANT_SAFE_BLOCKED_PREFIXES = ("trading_",)
