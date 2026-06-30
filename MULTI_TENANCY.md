@@ -14,6 +14,13 @@
 
 ## 0. TL;DR（结论先行）
 
+> **落地校正（2026-06 实施，详见 §14）**：正文 §0–§13 为 v2 **设计**；实际落地有三处偏差——
+> ① cgroup 限额改为**池级 `MemoryMax=5G`**（router 以非 root `vibe` 跑，per-instance `systemd-run`
+> 需 root，故默认未用，靠 router unit 的 cgroup + `Delegate=yes` 兜底整池；`VIBE_USE_SYSTEMD_RUN=1`
+> 可 opt-in per-instance）；② **测试阶段**租户安全档位只裁 `trading_*`/`propose_mandate` 红线，**放开**
+> swarm/session_search/background（见 §4.3）；③ laicai 侧连续性最终用 URL `?lt=` 传真实 threadId +
+> 双触发（显式点名/线程绑定）。**已部署生产并经 Playwright 实测验收通过**（隔离 / 连续性 / 工具放开）。
+
 - **架构选型：进程级"每用户一实例"池（process-per-tenant pool），不引入 Docker。** 全部落盘
   状态从 `Path.home()` 或安装目录派生 → **每用户独立 `HOME` + 独立进程**即可隔离落盘状态与进程
   内全局单例（`_shared_index`/`_BG`/`_registry_cache`/`_swarm_runtime`/`_goal_store`/`_ocr_engine`）。
@@ -344,3 +351,69 @@ project quota 或 router `du` 拒超）、保留期清扫器（systemd timer 删
 - m1 冷启动 → §7。 m2 os.environ 进程隔离声明 → §1。 m3 /forget 路径校验 → §5.2。
 - m4 12K 历史/压缩 → §6。 m5 router 孤儿/env 卫生/强制 token → §5.2、§5.3。 nit 行号 → §1#4。
 - 完整性补充（出口/注入/跨租户 session）→ §12、§11。
+
+---
+
+## 14. 落地实现与实测（2026-06 实施）
+
+本节是**最终落地的权威记录**，与上文设计（§0–§13）的差异以本节为准。
+
+### 14.1 生产部署形态
+- **vibe-router**：systemd `vibe-router`，FastAPI uvicorn loopback `127.0.0.1:8990`，`User=vibe`，
+  `WorkingDirectory=/opt/invest/vibe-router`，`EnvironmentFile=/opt/invest/vibe-router.env`（`ROUTER_SECRET`/
+  `VIBE_ROUTER_TOKEN`/LLM 凭据等）。unit 设 **`MemoryMax=5G`** + `KillMode=control-group` + `Delegate=yes`
+  → router 重启连带回收其启动的子实例。
+- **租户目录**：`/srv/vibe/users/<64-hex tenant_key>/`（owner `vibe`），每用户独立 `HOME`；`VIBE_DATA_DIR=
+  $HOME/.vibe-trading`。实例端口从 **8901** 起。
+- **legacy 单实例**：`vibe-trading.service`（源码 `/opt/vibe-trading`，`serve --port 8899`）**保留作回退**，勿停。
+  laicai `web.env` **同时**配 `VIBE_ROUTER_URL`(+`VIBE_ROUTER_TOKEN`) 与 `VIBE_API_URL`，**优先走 router**，
+  `VIBE_API_URL` 仅 rollback（`askVibeTrading` 内 router 优先、direct 回退）。
+
+### 14.2 与设计的关键偏差
+1. **cgroup 限额 = 池级 `MemoryMax=5G`**（非 per-instance 1.6G）。原因：router 以非 root `vibe` 运行，
+   `systemd-run --scope -p MemoryMax` 需要 root；故默认不用 per-instance scope，靠 router unit 自身 cgroup
+   （`Delegate=yes`，子实例继承）兜底整池。`VIBE_USE_SYSTEMD_RUN=1`（以 root 跑时）可恢复 per-instance scope。
+2. **测试阶段租户安全档位放宽**（§4.3）：只裁 `trading_*` + `propose_mandate_profiles`，放开
+   `run_swarm`/`session_search`/`background_run`/`check_background`；router `_spawn` 额外注入
+   `VIBE_TRADING_ENABLE_SHELL_TOOLS=1`（使 `background_run` 可用，**连带前台 `bash`**）。多用户上量前须收紧。
+3. **python 软链坑（部署必踩）**：agent venv 与 router venv 的 python 原本软链到 `/root/.local/share/uv/
+   python`（uv 管、root 私有），`vibe` 用户 exec 不到 → `rc=203`。修法：`readlink -f` 取真实**带版本号**的
+   python 目录 `cp -aL` 到 `/opt/vibe-py312`（`chmod -R a+rX`），把两个 venv 的 `bin/python` 与
+   `bin/python3.12` 软链都重指到它（勿 cp 那个无版本号的中间软链，否则仍指回 /root）。
+
+### 14.3 laicai 侧最终实现
+- `chat_threads.vibe_session_id`（迁移自 `db:push`）绑定 laicai 对话线程 ↔ Vibe 深度会话。
+- **真实 threadId 经 URL `?lt=` 查询参数到达** `/api/chat`：`useChat` 会用自己的内部 id 覆盖请求 body 里的
+  threadId，故走 URL query 把 laicai 真实 `chat_threads.id` 传到服务端（`ai-chat.tsx` 连接 `() =>
+  /api/chat?lt=<activeId>`；`chat.ts` 读 `searchParams.get('lt')`）。
+- **深度引擎双触发**（`chat.ts`）：① **显式点名**「用/让/请… 来财AI」(`VIBE_TRIGGER`) → 强制必调
+  `ask_vibe_trading`（强提示：拿到返回前不得自行作答）；② **线程已绑定**深度会话（`vibe_session_id` 非空）
+  → 后续追问即使无动词也挂上工具（`getThreadVibeSessionId` 判定，软提示让模型按需续连），杜绝续聊时
+  「引擎没接上」。并加诚实约束：未真调引擎不得谎称已交给来财AI。
+- `chat-tools.ts` 的 `ask_vibe_trading` 处理器按 (threadId,userId) 取旧 `vibe_session_id` → 调
+  `askVibeTrading`（经 router）→ 回写新 session（复用则跳过冗余 UPDATE）。
+
+### 14.4 实测验收（VPS 4 vCPU/7.4G + Playwright 自测真实账号）
+- **隔离**：bob 召不回 alice `remember` 的秘密（Stage 1 e2e）。✓
+- **触发门**：真实 nanoid 到达服务端；`explicit`/`bound` 双触发均生效。✓
+- **会话连续性**：同线程追问 router **复用既有 session**（`POST /sessions/<sid>/messages`，非新建）；引擎
+  记得上一轮华夏银行三笔加仓价位并校准（答复明确写「第1笔 6.60-6.62（原6.55上移）」「止盈 7.05-7.15（原
+  7.10-7.20下移）」）——只有复用 session 才知道「原来那三笔」。✓
+- **效率**：复用 session 约 1 min 出结果 vs 冷启约 4.5 min。
+- **冷启 4.5min 拆解**（trace 实测）：LLM 多步往返 **252s（88%）**、工具执行 **34s（12%）**、进程冷启 ≈ 几秒
+  （trace 外）。即慢在 agent 多步推理（17 步 thinking + 25 次工具调用，含 4 次 `read_url` 抓全文推高后续
+  token），**非多租户架构开销**——单实例 legacy 跑同样问题一样慢。另见两个可优化 error：`get_market_data`
+  取个股历史失败致绕路 `read_url`、`update_research_goal_status` 连错 5 次各多一轮 LLM 往返。
+- **工具放开实证**：① `build_registry`（box）shell ON 共 **39** 工具，`session_search`/`run_swarm`/
+  `check_background`/`background_run`/`bash` 在册、`trading_*`/`propose_mandate_profiles` 缺席、两道门
+  （tenant-safe / shell-tools）正交；② 端到端引擎实际调 **`bash`×13 全 ok**、`run_dir` 隔离在租户目录、
+  `pip install akshare` 跑 pandas → 放开+shell 门+隔离全生效；③ `session_search` 在册可用、隔离正确，但
+  引擎倾向**现场重算**而未主动调（行为倾向，非故障）。
+
+### 14.5 已知遗留 / 待办
+- **测试档位收紧**：`bash`/`background_run` 是 host 任意命令执行、`run_swarm` 无每请求配额，仅靠池级
+  cgroup 兜底；真正多用户上量前恢复裁剪 / 加每请求配额 / 去 shell env。
+- **「来财AI 回顾历史」未打通**：`session_search` 工具已放开且隔离正确，但功能层未闭环——外层 Opus 会拒答
+  「检索历史对话」、引擎倾向现场重算。需要时补：外层提示转交 + 引擎 preamble 提示优先 `session_search`。
+- **代码落点**：Vibe-Trading 分支 `feat/vibe-multitenancy`（`acb9570` 进程隔离+router、`736b4b4` 测试阶段
+  放开工具）；laicai 分支 `feat/vibe-multitenancy`（`612bb2e`）。两分支已 push。
