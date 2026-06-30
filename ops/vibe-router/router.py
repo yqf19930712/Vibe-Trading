@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import hashlib
+import json
 import logging
 import os
 import re
@@ -28,6 +29,7 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 log = logging.getLogger("vibe-router")
@@ -228,15 +230,22 @@ async def _ensure_session(inst: Instance, vibe_session_id: Optional[str]) -> str
     return sid
 
 
-async def _send_and_wait(inst: Instance, sid: str, query: str, timeout_s: int) -> str:
-    """Send a turn and wait for THIS turn's answer (linked_attempt_id), not the
-    previous turn's stale reply (B3). On a missing session (404) the caller
-    rebinds with a fresh session."""
+async def _post_turn(inst: Instance, sid: str, query: str) -> Optional[str]:
+    """Start a turn; return its attempt_id. A missing session (404) makes the
+    caller rebind with a fresh session."""
     r = await _vibe(inst, "POST", f"/sessions/{sid}/messages", json={"content": query})
     if r.status_code == 404:
         raise _SessionGone()
     r.raise_for_status()
-    attempt_id = r.json().get("attempt_id")
+    return r.json().get("attempt_id")
+
+
+async def _wait_answer(
+    inst: Instance, sid: str, attempt_id: Optional[str], timeout_s: int
+) -> str:
+    """Poll for THIS turn's answer (linked_attempt_id), not the previous turn's
+    stale reply (B3). Unchanged logic, split out so progress can stream in
+    parallel."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         await asyncio.sleep(POLL_INTERVAL_S)
@@ -250,13 +259,39 @@ async def _send_and_wait(inst: Instance, sid: str, query: str, timeout_s: int) -
             content = (msg.get("content") or "").strip()
             if not content:
                 continue
-            # Only accept the reply linked to THIS attempt (or, if the server
-            # doesn't surface linkage, the newest non-empty assistant message
-            # that appeared after our send — attempt_id is the robust path).
             if attempt_id and msg.get("linked_attempt_id") not in (attempt_id, None):
                 continue
             return content
     raise HTTPException(504, "deep engine timed out")
+
+
+async def _pump_events(inst: Instance, sid: str, q: "asyncio.Queue[dict]") -> None:
+    """Subscribe to the instance's per-session SSE and push each frame as
+    {"ev": <event type>, "data": <parsed payload>} onto the queue.
+    ``replay=active`` replays the running attempt's buffered events so the early
+    steps aren't missed. Loopback-trusted → no token. Best-effort: any failure
+    just ends progress; the answer poll is the source of truth."""
+    try:
+        async with http.stream(
+            "GET",
+            f"{inst.base_url}/sessions/{sid}/events",
+            params={"replay": "active"},
+            timeout=None,
+        ) as r:
+            ev_type: Optional[str] = None
+            async for line in r.aiter_lines():
+                if line.startswith("event:"):
+                    ev_type = line[6:].strip()
+                elif line.startswith("data:"):
+                    raw = line[5:].strip()
+                    try:
+                        payload = json.loads(raw)
+                    except Exception:
+                        payload = raw
+                    q.put_nowait({"ev": ev_type or "message", "data": payload})
+                    ev_type = None
+    except Exception as e:  # stream end / instance gone — progress is best-effort
+        log.info("event pump ended (%s): %s", sid, e)
 
 
 class _SessionGone(Exception):
@@ -282,27 +317,64 @@ def _auth(authorization: Optional[str]) -> None:
         raise HTTPException(401, "unauthorized")
 
 
-@app.post("/ask")
-async def ask(body: AskBody, authorization: Optional[str] = Header(None)):
-    _auth(authorization)
+def _frame(obj: dict) -> str:
+    return json.dumps(obj, ensure_ascii=False) + "\n"
+
+
+async def _ask_stream(body: AskBody, timeout_s: int):
+    """NDJSON stream for /ask: zero or more {"t":"progress","ev","data"} frames
+    while the engine works, then exactly one terminal {"t":"answer",...} or
+    {"t":"error",...}. Resource guards live HERE (not in the handler) because a
+    StreamingResponse body runs after the handler returns — they must wrap the
+    whole stream so refcount/lock release only once the answer is sent or the
+    client disconnects."""
     tk = tenant_key(body.uid)
-    timeout_s = body.timeoutS or DEFAULT_ASK_TIMEOUT_S
-    async with active_sem:                       # bound concurrent active runs (resource, §7)
+    async with active_sem:                       # bound concurrent active runs (§7)
         inst = await get_or_create(tk)
-        inst.refcount += 1                       # in-flight guard against reaper/LRU (M3)
+        inst.refcount += 1                       # in-flight guard vs reaper/LRU (M3)
         try:
             async with inst.lock:                # single-writer per tenant
                 sid = await _ensure_session(inst, body.vibeSessionId)
                 try:
-                    answer = await _send_and_wait(inst, sid, body.query, timeout_s)
+                    attempt_id = await _post_turn(inst, sid, body.query)
                 except _SessionGone:
-                    # Stored session vanished (HOME wiped / forget) → rebind fresh (M-continuity).
+                    # Stored session vanished (HOME wiped / forget) → rebind fresh.
                     sid = await _ensure_session(inst, None)
-                    answer = await _send_and_wait(inst, sid, body.query, timeout_s)
-                inst.last_activity = time.monotonic()   # bump on completion, not arrival (M3)
-                return {"answer": answer, "vibeSessionId": sid}
+                    attempt_id = await _post_turn(inst, sid, body.query)
+
+                q: "asyncio.Queue[dict]" = asyncio.Queue()
+                pump = asyncio.create_task(_pump_events(inst, sid, q))
+                waiter = asyncio.create_task(
+                    _wait_answer(inst, sid, attempt_id, timeout_s)
+                )
+                try:
+                    while not waiter.done():
+                        try:
+                            ev = await asyncio.wait_for(q.get(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            continue             # re-check waiter even when idle
+                        yield _frame({"t": "progress", **ev})
+                    while not q.empty():          # flush progress already buffered
+                        yield _frame({"t": "progress", **q.get_nowait()})
+                    answer = await waiter         # re-raises HTTPException(504) on timeout
+                    inst.last_activity = time.monotonic()  # bump on completion (M3)
+                    yield _frame({"t": "answer", "answer": answer, "vibeSessionId": sid})
+                except HTTPException as e:
+                    yield _frame({"t": "error", "status": e.status_code, "detail": str(e.detail)})
+                finally:
+                    pump.cancel()
+                    waiter.cancel()
         finally:
             inst.refcount -= 1
+
+
+@app.post("/ask")
+async def ask(body: AskBody, authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    timeout_s = body.timeoutS or DEFAULT_ASK_TIMEOUT_S
+    return StreamingResponse(
+        _ask_stream(body, timeout_s), media_type="application/x-ndjson"
+    )
 
 
 @app.post("/forget")
