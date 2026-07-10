@@ -79,13 +79,29 @@ def tenant_home(tk: str) -> Path:
     return root
 
 
+# Per-user LLM model override (laicai 尊享档可自选引擎模型). The instance's model
+# is fixed at spawn via LANGCHAIN_MODEL_NAME (build_llm re-reads os.environ per
+# attempt, but a child's env can't change after exec) — switching models means
+# respawning the tenant instance. Sessions live on disk in the tenant HOME, so
+# conversation continuity survives the respawn.
+MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-\[\]]{0,99}")
+
+
 # ── Instance pool ─────────────────────────────────────────────────────────────
 class Instance:
-    def __init__(self, tk: str, port: int, proc: asyncio.subprocess.Process, home: Path):
+    def __init__(
+        self,
+        tk: str,
+        port: int,
+        proc: asyncio.subprocess.Process,
+        home: Path,
+        model: Optional[str] = None,
+    ):
         self.tk = tk
         self.port = port
         self.proc = proc
         self.home = home
+        self.model = model         # None = router-default LANGCHAIN_MODEL_NAME
         self.refcount = 0          # in-flight /ask count (M3: reaper/LRU skip refcount>0)
         self.last_activity = time.monotonic()
         self.lock = asyncio.Lock()  # single-writer per tenant (one attempt at a time)
@@ -111,12 +127,15 @@ def _alloc_port() -> int:
     raise HTTPException(503, "no free port (pool saturated)")
 
 
-async def _spawn(tk: str) -> Instance:
+async def _spawn(tk: str, model: Optional[str] = None) -> Instance:
     """Launch one tenant instance under a cgroup scope (M4) with full isolation env (B4)."""
     home = tenant_home(tk)
     (home / ".vibe-trading").mkdir(parents=True, exist_ok=True)
     port = _alloc_port()
     env = {k: os.environ[k] for k in FORWARD_ENV if k in os.environ}
+    if model:
+        # Per-user model override — build_llm only consumes LANGCHAIN_MODEL_NAME.
+        env["LANGCHAIN_MODEL_NAME"] = model
     env.update(
         {
             "HOME": str(home),
@@ -153,7 +172,7 @@ async def _spawn(tk: str) -> Instance:
     proc = await asyncio.create_subprocess_exec(
         *cmd, env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
     )
-    inst = Instance(tk, port, proc, home)
+    inst = Instance(tk, port, proc, home, model=model)
     # Wait for readiness (cold start = heavy imports + maybe font fetch, m1).
     deadline = time.monotonic() + READY_TIMEOUT_S
     while time.monotonic() < deadline:
@@ -185,17 +204,31 @@ async def _kill(inst: Instance) -> None:
         pass
 
 
-async def get_or_create(tk: str) -> Instance:
-    """Lazy get-or-create with a per-uid lock so concurrent first-calls coalesce (M6)."""
+async def get_or_create(tk: str, model: Optional[str] = None) -> Instance:
+    """Lazy get-or-create with a per-uid lock so concurrent first-calls coalesce (M6).
+
+    A live instance is only reused when its model matches the request; a model
+    switch kills the idle instance and respawns with the new LANGCHAIN_MODEL_NAME
+    (an in-flight instance can't be killed — 503, the caller retries)."""
     async with pool_mutex:
         inst = pool.get(tk)
-        if inst and inst.proc.returncode is None:
+        if inst and inst.proc.returncode is None and inst.model == model:
             return inst
         lock = uid_locks.setdefault(tk, asyncio.Lock())
     async with lock:
         inst = pool.get(tk)
         if inst and inst.proc.returncode is None:
-            return inst
+            if inst.model == model:
+                return inst
+            if inst.refcount > 0:
+                raise HTTPException(503, "instance busy; retry to switch model")
+            log.info(
+                "tenant %s model switch %s -> %s (respawn)",
+                tk[:8], inst.model or "<default>", model or "<default>",
+            )
+            async with pool_mutex:
+                pool.pop(tk, None)
+            await _kill(inst)
         # capacity: LRU-evict an idle (refcount==0) instance before spawning (M3)
         async with pool_mutex:
             if len(pool) >= MAX_INSTANCES:
@@ -208,7 +241,7 @@ async def get_or_create(tk: str) -> Instance:
                 victim = idle[0]
                 pool.pop(victim.tk, None)
                 await _kill(victim)
-        inst = await _spawn(tk)
+        inst = await _spawn(tk, model)
         async with pool_mutex:
             pool[tk] = inst
         return inst
@@ -307,6 +340,8 @@ class AskBody(BaseModel):
     query: str
     threadId: Optional[str] = None
     vibeSessionId: Optional[str] = None
+    # Per-user LLM model override; None = router default. Env-safe charset only.
+    model: Optional[str] = None
     timeoutS: Optional[int] = None
 
 
@@ -330,7 +365,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
     client disconnects."""
     tk = tenant_key(body.uid)
     async with active_sem:                       # bound concurrent active runs (§7)
-        inst = await get_or_create(tk)
+        inst = await get_or_create(tk, body.model)
         inst.refcount += 1                       # in-flight guard vs reaper/LRU (M3)
         try:
             async with inst.lock:                # single-writer per tenant
@@ -371,6 +406,8 @@ async def _ask_stream(body: AskBody, timeout_s: int):
 @app.post("/ask")
 async def ask(body: AskBody, authorization: Optional[str] = Header(None)):
     _auth(authorization)
+    if body.model and not MODEL_RE.fullmatch(body.model):
+        raise HTTPException(400, "invalid model")
     timeout_s = body.timeoutS or DEFAULT_ASK_TIMEOUT_S
     return StreamingResponse(
         _ask_stream(body, timeout_s), media_type="application/x-ndjson"
