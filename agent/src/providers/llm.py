@@ -630,11 +630,16 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
     # Optional reasoning activation for relays requiring opt-in (e.g. OpenRouter).
     # Moonshot/DeepSeek official APIs emit reasoning by default and ignore this field.
     effort = os.getenv("LANGCHAIN_REASONING_EFFORT", "").strip().lower()
+    # Ask for real token usage on streamed responses (stream_options.include_usage);
+    # without it most OpenAI-compat upstreams omit usage and llm_usage events stay
+    # empty. Set LANGCHAIN_STREAM_USAGE=0 for an upstream that rejects the field.
+    stream_usage = os.getenv("LANGCHAIN_STREAM_USAGE", "1").strip().lower() not in {"0", "false", "no"}
     kwargs: dict[str, Any] = {
         "model": name,
         "temperature": temperature_param,
         "timeout": int(os.getenv("TIMEOUT_SECONDS", "120")),
         "max_retries": int(os.getenv("MAX_RETRIES", "2")),
+        "stream_usage": stream_usage,
         "callbacks": callbacks,
         "extra_body": {"reasoning": {"effort": effort}} if effort and caps.openrouter_reasoning_body else None,
         "vibe_provider": provider,
