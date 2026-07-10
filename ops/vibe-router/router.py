@@ -79,12 +79,39 @@ def tenant_home(tk: str) -> Path:
     return root
 
 
-# Per-user LLM model override (laicai 尊享档可自选引擎模型). The instance's model
-# is fixed at spawn via LANGCHAIN_MODEL_NAME (build_llm re-reads os.environ per
-# attempt, but a child's env can't change after exec) — switching models means
-# respawning the tenant instance. Sessions live on disk in the tenant HOME, so
-# conversation continuity survives the respawn.
+# Per-user LLM override (laicai 尊享档可自选引擎模型). The instance's LLM config
+# is fixed at spawn via env (build_llm re-reads os.environ per attempt, but a
+# child's env can't change after exec) — switching means respawning the tenant
+# instance. Sessions live on disk in the tenant HOME, so conversation
+# continuity survives the respawn.
+#
+# Two override shapes in /ask:
+#  - model: str            — builtin channel, only LANGCHAIN_MODEL_NAME changes.
+#  - llm: {provider, model, apiKey, baseUrl} — BYOK. The engine's
+#    _sync_provider_env falls back to OPENAI_API_KEY/OPENAI_BASE_URL for every
+#    provider, so injecting those two + LANGCHAIN_PROVIDER + LANGCHAIN_MODEL_NAME
+#    covers all vendors. Provider ids from laicai are mapped below; "claude"
+#    rides the Anthropic OpenAI-compat endpoint, hence provider "openai".
 MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-\[\]]{0,99}")
+BYOK_PROVIDERS = {  # laicai provider id -> engine LANGCHAIN_PROVIDER
+    "openai": "openai",
+    "claude": "openai",
+    "gemini": "gemini",
+    "deepseek": "deepseek",
+    "kimi": "kimi",
+    "glm": "glm",
+}
+
+
+def llm_fingerprint(model: Optional[str], llm: Optional["LlmOverride"]) -> Optional[str]:
+    """Stable identity of an instance's LLM config (never logged raw — may
+    embed the API key)."""
+    if llm is not None:
+        raw = "|".join([llm.provider, llm.model, llm.apiKey, llm.baseUrl])
+        return "byok:" + hashlib.sha256(raw.encode()).hexdigest()[:16]
+    if model:
+        return f"builtin:{model}"
+    return None
 
 
 # ── Instance pool ─────────────────────────────────────────────────────────────
@@ -95,13 +122,13 @@ class Instance:
         port: int,
         proc: asyncio.subprocess.Process,
         home: Path,
-        model: Optional[str] = None,
+        llm_fp: Optional[str] = None,
     ):
         self.tk = tk
         self.port = port
         self.proc = proc
         self.home = home
-        self.model = model         # None = router-default LANGCHAIN_MODEL_NAME
+        self.llm_fp = llm_fp       # None = router-default LLM env
         self.refcount = 0          # in-flight /ask count (M3: reaper/LRU skip refcount>0)
         self.last_activity = time.monotonic()
         self.lock = asyncio.Lock()  # single-writer per tenant (one attempt at a time)
@@ -127,14 +154,28 @@ def _alloc_port() -> int:
     raise HTTPException(503, "no free port (pool saturated)")
 
 
-async def _spawn(tk: str, model: Optional[str] = None) -> Instance:
+async def _spawn(
+    tk: str,
+    model: Optional[str] = None,
+    llm: Optional["LlmOverride"] = None,
+) -> Instance:
     """Launch one tenant instance under a cgroup scope (M4) with full isolation env (B4)."""
     home = tenant_home(tk)
     (home / ".vibe-trading").mkdir(parents=True, exist_ok=True)
     port = _alloc_port()
     env = {k: os.environ[k] for k in FORWARD_ENV if k in os.environ}
-    if model:
-        # Per-user model override — build_llm only consumes LANGCHAIN_MODEL_NAME.
+    if llm is not None:
+        # BYOK: user's own vendor/key/endpoint replace the builtin channel.
+        # Drop builtin credentials so nothing falls back to them by mistake.
+        for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+            env.pop(k, None)
+        env["LANGCHAIN_PROVIDER"] = BYOK_PROVIDERS[llm.provider]
+        env["LANGCHAIN_MODEL_NAME"] = llm.model
+        env["OPENAI_API_KEY"] = llm.apiKey
+        env["OPENAI_BASE_URL"] = llm.baseUrl
+        env["OPENAI_API_BASE"] = llm.baseUrl
+    elif model:
+        # Builtin channel, different model — only the model name changes.
         env["LANGCHAIN_MODEL_NAME"] = model
     env.update(
         {
@@ -172,7 +213,7 @@ async def _spawn(tk: str, model: Optional[str] = None) -> Instance:
     proc = await asyncio.create_subprocess_exec(
         *cmd, env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
     )
-    inst = Instance(tk, port, proc, home, model=model)
+    inst = Instance(tk, port, proc, home, llm_fp=llm_fingerprint(model, llm))
     # Wait for readiness (cold start = heavy imports + maybe font fetch, m1).
     deadline = time.monotonic() + READY_TIMEOUT_S
     while time.monotonic() < deadline:
@@ -204,27 +245,33 @@ async def _kill(inst: Instance) -> None:
         pass
 
 
-async def get_or_create(tk: str, model: Optional[str] = None) -> Instance:
+async def get_or_create(
+    tk: str,
+    model: Optional[str] = None,
+    llm: Optional["LlmOverride"] = None,
+) -> Instance:
     """Lazy get-or-create with a per-uid lock so concurrent first-calls coalesce (M6).
 
-    A live instance is only reused when its model matches the request; a model
-    switch kills the idle instance and respawns with the new LANGCHAIN_MODEL_NAME
-    (an in-flight instance can't be killed — 503, the caller retries)."""
+    A live instance is only reused when its LLM fingerprint matches the request;
+    a switch kills the idle instance and respawns with the new env (an in-flight
+    instance can't be killed — 503, the caller retries)."""
+    fp = llm_fingerprint(model, llm)
     async with pool_mutex:
         inst = pool.get(tk)
-        if inst and inst.proc.returncode is None and inst.model == model:
+        if inst and inst.proc.returncode is None and inst.llm_fp == fp:
             return inst
         lock = uid_locks.setdefault(tk, asyncio.Lock())
     async with lock:
         inst = pool.get(tk)
         if inst and inst.proc.returncode is None:
-            if inst.model == model:
+            if inst.llm_fp == fp:
                 return inst
             if inst.refcount > 0:
                 raise HTTPException(503, "instance busy; retry to switch model")
+            # Fingerprints are safe to log (builtin:<model> or byok:<hash>).
             log.info(
-                "tenant %s model switch %s -> %s (respawn)",
-                tk[:8], inst.model or "<default>", model or "<default>",
+                "tenant %s llm switch %s -> %s (respawn)",
+                tk[:8], inst.llm_fp or "<default>", fp or "<default>",
             )
             async with pool_mutex:
                 pool.pop(tk, None)
@@ -241,7 +288,7 @@ async def get_or_create(tk: str, model: Optional[str] = None) -> Instance:
                 victim = idle[0]
                 pool.pop(victim.tk, None)
                 await _kill(victim)
-        inst = await _spawn(tk, model)
+        inst = await _spawn(tk, model, llm)
         async with pool_mutex:
             pool[tk] = inst
         return inst
@@ -335,13 +382,23 @@ class _SessionGone(Exception):
 app = FastAPI(title="vibe-router")
 
 
+class LlmOverride(BaseModel):
+    """BYOK engine LLM: the user's own vendor endpoint + key."""
+    provider: str
+    model: str
+    apiKey: str
+    baseUrl: str
+
+
 class AskBody(BaseModel):
     uid: str
     query: str
     threadId: Optional[str] = None
     vibeSessionId: Optional[str] = None
-    # Per-user LLM model override; None = router default. Env-safe charset only.
+    # Builtin-channel model override; None = router default. Env-safe charset only.
     model: Optional[str] = None
+    # BYOK override; wins over `model` when both are present.
+    llm: Optional[LlmOverride] = None
     timeoutS: Optional[int] = None
 
 
@@ -365,7 +422,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
     client disconnects."""
     tk = tenant_key(body.uid)
     async with active_sem:                       # bound concurrent active runs (§7)
-        inst = await get_or_create(tk, body.model)
+        inst = await get_or_create(tk, body.model, body.llm)
         inst.refcount += 1                       # in-flight guard vs reaper/LRU (M3)
         try:
             async with inst.lock:                # single-writer per tenant
@@ -408,6 +465,18 @@ async def ask(body: AskBody, authorization: Optional[str] = Header(None)):
     _auth(authorization)
     if body.model and not MODEL_RE.fullmatch(body.model):
         raise HTTPException(400, "invalid model")
+    if body.llm is not None:
+        l = body.llm
+        if l.provider not in BYOK_PROVIDERS:
+            raise HTTPException(400, "invalid llm.provider")
+        if not MODEL_RE.fullmatch(l.model):
+            raise HTTPException(400, "invalid llm.model")
+        if not re.fullmatch(r"https?://[^\s\"']{1,500}", l.baseUrl):
+            raise HTTPException(400, "invalid llm.baseUrl")
+        # Keys are opaque; just bound length and forbid control chars/newlines
+        # (they travel into a child env var).
+        if not (0 < len(l.apiKey) <= 500) or any(ord(c) < 32 or ord(c) == 127 for c in l.apiKey):
+            raise HTTPException(400, "invalid llm.apiKey")
     timeout_s = body.timeoutS or DEFAULT_ASK_TIMEOUT_S
     return StreamingResponse(
         _ask_stream(body, timeout_s), media_type="application/x-ndjson"
