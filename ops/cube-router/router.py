@@ -104,8 +104,11 @@ def llm_fingerprint(model: Optional[str], llm: Optional["LlmOverride"]) -> Optio
     return None
 
 
-def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> dict:
-    """Env the launcher passes to `vibe-trading serve` inside the guest."""
+def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict, str]:
+    """Env the launcher passes to `vibe-trading serve` inside the guest.
+    Returns (env, api_key): the engine validates `Authorization: Bearer
+    <API_AUTH_KEY>` on every non-loopback call, so the router must keep the
+    key it minted for the instance."""
     env = {k: os.environ[k] for k in FORWARD_ENV if k in os.environ}
     if llm is not None:
         for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
@@ -125,10 +128,11 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> dict:
             # Shell tools are fair game now: "arbitrary commands" land inside a
             # hardware-isolated MicroVM, not on the host.
             "VIBE_TRADING_ENABLE_SHELL_TOOLS": "1",
-            "API_AUTH_KEY": hashlib.sha256(os.urandom(16)).hexdigest(),
         }
     )
-    return env
+    api_key = hashlib.sha256(os.urandom(16)).hexdigest()
+    env["API_AUTH_KEY"] = api_key
+    return env, api_key
 
 
 # ── Persistent tenant→sandbox map ─────────────────────────────────────────────
@@ -204,10 +208,11 @@ def guest_url(sandbox_id: str, port: int) -> str:
 
 # ── Instance pool (in-memory runtime state over the persistent map) ──────────
 class Instance:
-    def __init__(self, tk: str, sandbox_id: str, llm_fp: Optional[str]):
+    def __init__(self, tk: str, sandbox_id: str, llm_fp: Optional[str], api_key: Optional[str] = None):
         self.tk = tk
         self.sandbox_id = sandbox_id
         self.llm_fp = llm_fp
+        self.api_key = api_key
         self.refcount = 0
         self.last_activity = time.monotonic()
         self.lock = asyncio.Lock()
@@ -238,7 +243,7 @@ async def _launcher_health(inst: Instance) -> Optional[dict]:
     return None
 
 
-async def _boot_engine(inst: Instance, fp: Optional[str], env: dict) -> None:
+async def _boot_engine(inst: Instance, fp: Optional[str], env: dict, api_key: str) -> None:
     r = await http.post(
         f"{inst.launcher_url}/boot", json={"env": env},
         timeout=httpx.Timeout(30.0, read=float(READY_TIMEOUT_S)),
@@ -246,12 +251,14 @@ async def _boot_engine(inst: Instance, fp: Optional[str], env: dict) -> None:
     if r.status_code != 200:
         raise HTTPException(502, f"engine boot failed: {r.status_code} {r.text[:200]}")
     inst.llm_fp = fp
+    inst.api_key = api_key
     state.setdefault(inst.tk, {})["llm_fp"] = fp
     state[inst.tk]["sandbox_id"] = inst.sandbox_id
+    state[inst.tk]["api_key"] = api_key
     _save_state()
 
 
-async def _ensure_ready(inst: Instance, fp: Optional[str], env: dict) -> None:
+async def _ensure_ready(inst: Instance, fp: Optional[str], env: dict, api_key: str) -> None:
     """Make the sandbox reachable and the engine running with the wanted LLM env."""
     h = await _launcher_health(inst)
     if h is None:
@@ -264,11 +271,11 @@ async def _ensure_ready(inst: Instance, fp: Optional[str], env: dict) -> None:
         if h is None:
             raise HTTPException(502, "sandbox unreachable after resume")
     inst.paused = False
-    if h.get("engine") == "running" and inst.llm_fp == fp:
+    if h.get("engine") == "running" and inst.llm_fp == fp and inst.api_key:
         return
     if inst.refcount > 0 and inst.llm_fp != fp:
         raise HTTPException(503, "instance busy; retry to switch model")
-    await _boot_engine(inst, fp, env)
+    await _boot_engine(inst, fp, env, api_key)
 
 
 async def get_or_create(
@@ -284,7 +291,7 @@ async def get_or_create(
             if st and st.get("sandbox_id"):
                 info = await sbx_info(st["sandbox_id"])
                 if info is not None:
-                    inst = Instance(tk, st["sandbox_id"], st.get("llm_fp"))
+                    inst = Instance(tk, st["sandbox_id"], st.get("llm_fp"), st.get("api_key"))
                 else:
                     state.pop(tk, None)
                     _save_state()
@@ -293,7 +300,8 @@ async def get_or_create(
             sandbox_id = await sbx_create()
             inst = Instance(tk, sandbox_id, None)
             log.info("tenant %s -> new sandbox %s", tk[:8], sandbox_id[:12])
-        await _ensure_ready(inst, fp, engine_env(model, llm))
+        env, api_key = engine_env(model, llm)
+        await _ensure_ready(inst, fp, env, api_key)
         async with pool_mutex:
             pool[tk] = inst
         return inst
@@ -314,8 +322,13 @@ async def _evict_for_capacity() -> None:
 
 
 # ── Vibe session helpers (unchanged semantics from v1) ───────────────────────
+def _engine_headers(inst: Instance) -> dict:
+    return {"Authorization": f"Bearer {inst.api_key}"} if inst.api_key else {}
+
+
 async def _vibe(inst: Instance, method: str, path: str, **kw):
-    return await http.request(method, f"{inst.base_url}{path}", **kw)
+    headers = {**_engine_headers(inst), **kw.pop("headers", {})}
+    return await http.request(method, f"{inst.base_url}{path}", headers=headers, **kw)
 
 
 async def _ensure_session(inst: Instance, vibe_session_id: Optional[str]) -> str:
@@ -365,6 +378,7 @@ async def _pump_events(inst: Instance, sid: str, q: "asyncio.Queue[dict]") -> No
             "GET",
             f"{inst.base_url}/sessions/{sid}/events",
             params={"replay": "active"},
+            headers=_engine_headers(inst),
             timeout=None,
         ) as r:
             ev_type: Optional[str] = None
