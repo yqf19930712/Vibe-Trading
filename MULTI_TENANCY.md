@@ -417,3 +417,66 @@ project quota 或 router `du` 拒超）、保留期清扫器（systemd timer 删
   「检索历史对话」、引擎倾向现场重算。需要时补：外层提示转交 + 引擎 preamble 提示优先 `session_search`。
 - **代码落点**：Vibe-Trading 分支 `feat/vibe-multitenancy`（`acb9570` 进程隔离+router、`736b4b4` 测试阶段
   放开工具）；laicai 分支 `feat/vibe-multitenancy`（`612bb2e`）。两分支已 push。
+
+## 15. v2 落地：CubeSandbox 沙箱化（2026-07-22 实施并切流）
+
+§14.5 第一条红线（`bash`/`background_run` = host 任意命令执行，仅靠 cgroup 兜底）的正解落地：
+**把每租户实例从「同机进程」搬进「KVM MicroVM 沙箱」**，用
+[TencentCloud/CubeSandbox](https://github.com/TencentCloud/CubeSandbox)（Apache-2.0，E2B 兼容 API）承载。
+shell 工具的任意命令执行从此落在独立 guest 内核里，host 不再暴露；§4 的 HOME/DATA_DIR 隔离机制原样沿用
+（只是搬进了沙箱盘）。
+
+### 15.1 部署形态
+
+- **宿主**：阿里云 ECS `182.92.217.17`（ecs.u1-c1m2.xlarge 4C8G，北京，Ubuntu 22.04）。普通 ECS 无嵌套虚拟
+  化（无 `/dev/kvm`、CPU 无 vmx），装 CubeSandbox 的 **PVM 宿主内核**（OpenCloudOS
+  `6.6.69-*.cubesandbox.pvm.host`，cnb.cool Releases 预编译 DEB）+ `modprobe kvm_pvm` 后由 PVM 提供 KVM。
+  100G 数据盘 XFS(reflink) 挂 `/data/cubelet`（CoW 快照硬要求）。
+- **CubeSandbox one-click v0.5.1**：`CUBE_PVM_ENABLE=1 ./install.sh`，全栈 systemd
+  `cube-sandbox-control.target`；CubeAPI(E2B) `:3000`、WebUI `:12088`。
+- **引擎模板**（`ops/cube-engine/`）：`python:3.12-slim` + 本仓库（pip install -e）+ **in-guest launcher**
+  （`launcher.py`，`:8898`）。launcher 是模板探针目标（`GET /health`），并提供 `POST /boot {env}`——按租户
+  env 拉起/重启 `vibe-trading serve :8899`。镜像推本机 `registry:2`（`127.0.0.1:5000/vibe-engine`），
+  `cubemastercli tpl create-from-image --probe 8898 --probe-path /health` 制模板。
+- **编排器 cube-router**（`ops/cube-router/`）：§5 vibe-router 的后继，对 laicai 的 `/ask`(NDJSON)/`
+  /forget`/`/healthz`/Bearer/`tenant_key` 派生完全兼容（laicai 只改 `VIBE_ROUTER_URL` 指向）。生命周期映射：
+
+  | v1（进程） | v2（沙箱） |
+  |---|---|
+  | spawn 进程 + 端口池 | `POST /sandboxes`（**不带 timeout** → 永不过期）+ launcher `/boot` |
+  | idle 回收 = kill | idle 20min = **pause**（盘+内存保留；resume 秒级） |
+  | LLM/BYOK 切换 = kill+respawn | 仅 launcher `/boot` 重启引擎（沙箱不动、sessions 不丢） |
+  | forget = kill + rm -rf HOME | delete sandbox |
+  | cgroup MemoryMax | 沙箱规格（默认 2C/2G）+ MicroVM 硬隔离 |
+
+  租户映射持久化在 `/var/lib/cube-router/state.json`（tk → sandbox_id/llm_fp/api_key），router 重启后重挂
+  既有沙箱不泄漏。
+
+### 15.2 实测坑（必读）
+
+1. **引擎鉴权**：数据面走 cube-proxy（`http://<port>-<sandboxID>.cube.app`，宿主 split-DNS），到引擎已**不是
+   loopback**，Vibe 的 loopback 信任不生效 → router 必须带 `Authorization: Bearer <API_AUTH_KEY>`（router
+   生成、经 /boot 注入、持久化）。
+2. **pause 后代理流量不会自动 resume**（one-click 形态），需显式 `POST /sandboxes/<id>/resume`。
+3. **E2B SDK 默认给 5min TTL**（endAt 后沙箱被杀）；裸 API 创建不带 timeout 才是永不过期
+   （one-click `default_timeout_insec=-1`）。
+4. 阿里云北京出网：Docker Hub 直连超时（配镜像加速）、镜像内 apt 换 mirrors.aliyun.com；
+   google/yahoo 不可达 → 引擎境外搜索/美股数据退化（已知接受）；A 股链路 akshare/tushare/mootdx 可能抖动，
+   引擎会自动回落腾讯财经日线。sub2api LLM 代理可达。
+5. PVM 内核 GRUB 参数含 `net.ifnames=0`/`console=ttyS0`，与阿里云 Ubuntu 镜像默认一致，换内核不破网。
+
+### 15.3 验收与性能（2026-07-22 生产实测）
+
+- 创建沙箱 → 引擎 healthy ≈ **12s**（vs v1 进程冷启分钟级预热依赖）；pause→resume 秒级。
+- 生产全链路：laicai `/api/chat`「用来财AI…」→ ask_vibe_trading → cube-router 新建租户沙箱 → 5 帧
+  vibe_progress → 真实行情结论 → `ai_token_usage` deep_engine 行入账。
+- 内存：宿主 OS+CubeSandbox 控制面 ≈2.5G，余 ~4.5G ≈ 3 个并发 RUNNING 沙箱（`VIBE_MAX_INSTANCES=3`）；
+  上量前建议升 16G。
+
+### 15.4 回滚与遗留
+
+- **回滚**：Vultr `web.env.bak-cube-cutover` 恢复 + restart invest-web → 秒级回到 v1 进程版（Vultr 上
+  vibe-router/legacy 均保留未动）。
+- 遗留：老租户数据（/srv/vibe/users）未迁移，老线程首问 `_SessionGone` 自动重建会话；CubeEgress 出网白名单
+  未启用（沙箱可全量出网，比 v1 host 出网风险低但仍可收紧）；§14.5 的 `session_search` 功能层未闭环问题
+  与本次无关、依旧存在。
