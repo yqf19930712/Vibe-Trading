@@ -1,4 +1,4 @@
-# systemd unit for the multi-tenant vibe-router (MULTI_TENANCY.md §5, §8.5).
+# systemd unit for the retired v1 multi-tenant vibe-router (see ../../docs/HISTORY.md).
 # Independent of invest-web so web deploys never touch the tenant pool.
 # Install: cp to /etc/systemd/system/, set env in /opt/invest/vibe-router.env (chmod 600),
 # then: systemctl daemon-reload && systemctl enable --now vibe-router

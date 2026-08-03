@@ -1,6 +1,11 @@
-# vibe-router — provisioning & rollout runbook
+# vibe-router — provisioning & rollout runbook (RETIRED)
 
-Multi-tenant orchestrator for Vibe-Trading. Design: `../../MULTI_TENANCY.md` (v2).
+> **Retired.** This was the v1 process-per-tenant orchestrator; production now runs
+> `ops/cube-router` on CubeSandbox MicroVMs. Kept as archive — see
+> `../../docs/HISTORY.md` for the v1 record and `../../PRODUCT_DESIGN.md` for the
+> current architecture.
+
+Multi-tenant orchestrator for Vibe-Trading.
 This is the **production runbook** for standing it up on the VPS. Every step that
 mutates the production box is listed so it can be reviewed before running.
 
@@ -89,7 +94,7 @@ Set laicai `VIBE_ROUTER_URL` empty (keeps `VIBE_API_URL`) → laicai talks to th
 single shared instance again. `systemctl stop vibe-router` to free the pool.
 The legacy single instance must NOT have `VIBE_MULTITENANT=1` (it would fail loud).
 
-## Acceptance (maps to MULTI_TENANCY.md §11)
+## Acceptance (maps to the test matrix in ../../docs/HISTORY.md)
 isolation (A's memory invisible to B) · continuity (turn2 ≠ turn1; cross-thread long-term recall) ·
 tools (run_swarm/trading_*/session_search absent under tenant-safe) · resource (cgroup cap, no OOM,
 in-flight not reaped) · failure (instance restart, router restart reaps orphans) · forget (dir removed).
