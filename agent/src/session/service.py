@@ -213,11 +213,14 @@ class SessionService:
         Returns:
             Result dictionary containing status, run_dir, run_id, metrics, and related fields.
         """
+        import contextvars
+
         from src.tools import build_registry
         from src.providers.chat import ChatLLM
         from src.agent.loop import AgentLoop
         from src.memory.persistent import PersistentMemory
         from src.config.loader import load_runtime_agent_config, sanitize_session_overrides
+        from src.core.logging_setup import bind_log_context
 
         llm = ChatLLM()
         pm = PersistentMemory()
@@ -225,6 +228,12 @@ class SessionService:
         session_id = attempt.session_id
         attempt_id = attempt.attempt_id
         loop = asyncio.get_running_loop()
+
+        # Correlate every log line of this attempt (loop, tools, data loaders)
+        # with the router ask log / laicai deep_engine_runs via attempt_id.
+        # Executor threads don't inherit contextvars, so run the sync work
+        # inside an explicit context copy.
+        bind_log_context(session_id=session_id, attempt_id=attempt_id)
 
         safe_overrides = sanitize_session_overrides(session_config) if session_config else session_config
         agent_config = load_runtime_agent_config(overrides=safe_overrides)
@@ -240,6 +249,7 @@ class SessionService:
 
         registry = await loop.run_in_executor(
             _AGENT_EXECUTOR,
+            contextvars.copy_context().run,
             lambda: build_registry(
                 persistent_memory=pm,
                 include_shell_tools=include_shell_tools,
@@ -265,6 +275,7 @@ class SessionService:
         try:
             result = await loop.run_in_executor(
                 _AGENT_EXECUTOR,
+                contextvars.copy_context().run,
                 lambda: agent.run(
                     user_message=attempt.prompt,
                     history=history,

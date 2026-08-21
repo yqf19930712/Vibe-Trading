@@ -14,6 +14,7 @@ Tool execution:
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import json
 import logging
 import os
@@ -166,6 +167,11 @@ def _redact_trace_result(result: str) -> str:
     except (TypeError, json.JSONDecodeError):
         return result
     return json.dumps(redact_payload(payload), ensure_ascii=False)
+
+
+def _new_run_stats() -> dict[str, Any]:
+    """Per-run accumulator behind the ``attempt_stats`` summary event."""
+    return {"llm_calls": 0, "llm_ms": 0, "compact_calls": 0, "tools": {}}
 
 
 def _format_timeout(seconds: float) -> str:
@@ -460,6 +466,7 @@ class AgentLoop:
         self._previous_summary: str = ""
         self._persistent_memory = persistent_memory
         self._run_iteration: int = 0
+        self._stats: Dict[str, Any] = _new_run_stats()
 
     def cancel(self) -> None:
         """Cancel the current loop.
@@ -485,6 +492,8 @@ class AgentLoop:
         self._cancel_event.clear()
         self._called_ok = set()
         self._previous_summary = ""
+        self._stats = _new_run_stats()
+        run_t0 = _time.perf_counter()
 
         state_store = RunStateStore()
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
@@ -626,7 +635,9 @@ class AgentLoop:
                 if is_last_iteration:
                     trace.write({"type": "forced_text_only", "iter": current_iter})
 
+                llm_t0 = _time.perf_counter()
                 try:
+                    self._stats["llm_calls"] += 1
                     response = self.llm.stream_chat(
                         messages,
                         tools=tool_defs,
@@ -660,6 +671,7 @@ class AgentLoop:
                     reasoning_chars = 0
                     last_reasoning_emit = None
                     _time.sleep(STREAM_RETRY_DELAY_S)
+                    self._stats["llm_calls"] += 1
                     response = self.llm.stream_chat(
                         messages,
                         tools=tool_defs,
@@ -667,6 +679,7 @@ class AgentLoop:
                         on_reasoning_chunk=_on_reasoning_chunk,
                         should_cancel=self._cancel_event.is_set,
                     )
+                self._stats["llm_ms"] += int((_time.perf_counter() - llm_t0) * 1000)
 
                 # Cancelled mid-stream: discard this turn's partial response and
                 # end the run now, without executing any of its tool calls.
@@ -847,6 +860,9 @@ class AgentLoop:
                 else "agent_loop_error"
             )
             trace.write({"type": "end", "iter": self._run_iteration, "status": "error", "reason": str(exc), "iterations": iteration})
+            self._emit_attempt_stats(
+                "error", iteration, run_t0, llm_usage_summary, trace, reason=str(exc)
+            )
             trace.close()
             state_store.mark_failure(run_dir, str(exc))
             return {
@@ -898,6 +914,14 @@ class AgentLoop:
         if final_reason is not None:
             end_event["reason"] = final_reason
         trace.write(end_event)
+        self._emit_attempt_stats(
+            {"success": "ok", "cancelled": "cancelled"}.get(final_status, "failed"),
+            iteration,
+            run_t0,
+            llm_usage_summary,
+            trace,
+            reason=final_reason,
+        )
         trace.close()
 
         result: dict[str, Any] = {
@@ -912,6 +936,57 @@ class AgentLoop:
         if final_reason is not None:
             result["reason"] = final_reason
         return result
+
+    def _emit_attempt_stats(
+        self,
+        status: str,
+        iterations: int,
+        run_t0: float,
+        llm_usage_summary: dict[str, Any] | None,
+        trace: TraceWriter,
+        reason: str | None = None,
+    ) -> None:
+        """Emit the per-attempt observability summary (SSE + trace).
+
+        One frame per attempt, at the very end, regardless of outcome. The
+        multi-tenant router forwards it to laicai as a progress frame; laicai
+        persists it into ``deep_engine_runs``. ``data_fetches`` / ``data_gaps``
+        are reserved for the data-reliability batch and empty for now, so the
+        frame shape is stable for consumers from day one.
+        """
+        totals = (llm_usage_summary or {}).get("totals", {}) or {}
+        tool_map: dict[str, dict[str, int]] = self._stats.get("tools", {})
+        tools = [
+            {"name": name, **vals}
+            for name, vals in sorted(tool_map.items(), key=lambda kv: -kv[1]["ms"])
+        ]
+        stats: dict[str, Any] = {
+            "status": status,
+            "total_ms": int((_time.perf_counter() - run_t0) * 1000),
+            "iterations": iterations,
+            "max_iterations": self.max_iterations,
+            "llm_calls": int(self._stats.get("llm_calls", 0)),
+            "llm_ms": int(self._stats.get("llm_ms", 0)),
+            "compact_calls": int(self._stats.get("compact_calls", 0)),
+            "tool_ms": sum(v.get("ms", 0) for v in tool_map.values()),
+            "tokens": {
+                "input": int(totals.get("input_tokens") or 0),
+                "output": int(totals.get("output_tokens") or 0),
+                "total": int(totals.get("total_tokens") or 0),
+            },
+            "tools": tools,
+            "data_fetches": [],
+            "data_gaps": [],
+            "model": getattr(self.llm, "model_name", None)
+            or os.getenv("LANGCHAIN_MODEL_NAME", ""),
+        }
+        if reason:
+            stats["reason"] = str(reason)[:500]
+        try:
+            trace.write({"type": "attempt_stats", **stats})
+        except Exception:  # noqa: BLE001 - stats must never break the run
+            logger.debug("attempt_stats trace write failed", exc_info=True)
+        self._emit("attempt_stats", stats)
 
     # -- Tool execution with read/write batching --------------------------------
 
@@ -1062,7 +1137,13 @@ class AgentLoop:
             return tc, result, elapsed_ms
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(runnable), 8)) as pool:
-            futures = [pool.submit(_run, item) for item in runnable]
+            # copy_context per worker keeps the bound session/attempt log ids
+            # visible inside tool threads (each Context can only be entered once
+            # at a time, hence one copy per submission).
+            futures = [
+                pool.submit(contextvars.copy_context().run, _run, item)
+                for item in runnable
+            ]
             results = []
             for i, f in enumerate(futures):
                 try:
@@ -1230,8 +1311,9 @@ class AgentLoop:
             finally:
                 _set_emitter(None)
 
+        worker_ctx = contextvars.copy_context()
         worker = threading.Thread(
-            target=_worker,
+            target=lambda: worker_ctx.run(_worker),
             name=f"tool-{tool_name}",
             daemon=True,
         )
@@ -1300,6 +1382,14 @@ class AgentLoop:
         success = _is_tool_success(result)
         if success:
             self._called_ok.add(tc.name)
+
+        tool_stats = self._stats.setdefault("tools", {}).setdefault(
+            tc.name, {"calls": 0, "ms": 0, "errors": 0}
+        )
+        tool_stats["calls"] += 1
+        tool_stats["ms"] += int(elapsed_ms or 0)
+        if not success:
+            tool_stats["errors"] += 1
 
         status = "ok" if success else "error"
         truncated = result[:TOOL_RESULT_LIMIT]
@@ -1398,7 +1488,11 @@ class AgentLoop:
         else:
             prompt = _STRUCTURED_SUMMARY_PROMPT.format(focus_section=focus_section) + conv_text
 
+        compact_t0 = _time.perf_counter()
         summary_resp = self.llm.chat([{"role": "user", "content": prompt}])
+        self._stats["compact_calls"] += 1
+        self._stats["llm_calls"] += 1
+        self._stats["llm_ms"] += int((_time.perf_counter() - compact_t0) * 1000)
         summary = summary_resp.content or ""
         self._previous_summary = summary
 

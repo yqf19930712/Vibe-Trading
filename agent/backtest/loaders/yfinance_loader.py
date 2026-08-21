@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import Dict, List, Optional, Union
 
@@ -10,6 +11,8 @@ import yfinance as yf
 
 from backtest.loaders.base import loader_cache_get, loader_cache_put, validate_date_range
 from backtest.loaders.registry import register
+
+logger = logging.getLogger(__name__)
 
 _OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
 _COLUMN_RENAMES = {
@@ -278,7 +281,10 @@ class DataLoader:
         try:
             bulk_data = _download_history(pending, start_date, yf_end_date, yf_interval)
         except Exception as exc:
-            print(f"[WARN] yfinance bulk download failed for {pending}: {exc}")
+            logger.warning(
+                "yfinance bulk download failed",
+                extra={"source": "yfinance", "symbols": pending, "error": str(exc)},
+            )
             bulk_data = pd.DataFrame()
 
         for symbol in pending:
@@ -289,7 +295,10 @@ class DataLoader:
 
                 normalized = _normalize_frame(symbol_frame, requested_interval)
                 if normalized.empty:
-                    print(f"[WARN] yfinance returned no usable data for {symbol}")
+                    logger.warning(
+                        "yfinance returned no usable data",
+                        extra={"source": "yfinance", "symbol": symbol},
+                    )
                     continue
 
                 loader_cache_put(
@@ -304,7 +313,10 @@ class DataLoader:
                 for original_code in symbol_groups[symbol]:
                     results[original_code] = normalized.copy()
             except Exception as exc:
-                print(f"[WARN] Failed to fetch data for {symbol}: {exc}")
+                logger.warning(
+                    "yfinance fetch failed",
+                    extra={"source": "yfinance", "symbol": symbol, "error": str(exc)},
+                )
                 continue
 
         return results

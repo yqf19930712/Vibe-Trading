@@ -37,8 +37,9 @@ import os
 import re
 import shutil
 import time
+from collections import deque
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
@@ -74,6 +75,10 @@ IDLE_TTL_S = int(os.environ.get("VIBE_IDLE_TTL_S", str(20 * 60)))     # pause af
 READY_TIMEOUT_S = int(os.environ.get("VIBE_READY_TIMEOUT_S", "180"))  # create+boot budget
 POLL_INTERVAL_S = float(os.environ.get("VIBE_POLL_INTERVAL_S", "3"))
 DEFAULT_ASK_TIMEOUT_S = int(os.environ.get("VIBE_ASK_TIMEOUT_S", str(15 * 60)))
+# Per-ask observability: one JSONL line per /ask (segment timings, outcome,
+# attempt_id) so slow/failed asks can be traced without any extra infra.
+ASK_LOG = Path(os.environ.get("VIBE_ASK_LOG", "/var/lib/cube-router/ask_log.jsonl"))
+ASK_LOG_MAX_BYTES = 20 * 1024 * 1024
 # LLM / data-source env forwarded into each tenant engine (via launcher /boot).
 FORWARD_ENV = [
     "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_MODEL",
@@ -302,11 +307,16 @@ async def _boot_engine(inst: Instance, fp: Optional[str], env: dict, api_key: st
     _save_state()
 
 
-async def _ensure_ready(inst: Instance, fp: Optional[str], env: dict, api_key: str) -> None:
+async def _ensure_ready(
+    inst: Instance, fp: Optional[str], env: dict, api_key: str,
+    meta: Optional[dict] = None,
+) -> None:
     """Make the sandbox reachable and the engine running with the wanted LLM env."""
     h = await _launcher_health(inst)
     if h is None:
         # Paused (or proxy lost it) — explicit resume, then retry.
+        if meta is not None:
+            meta["resumed"] = True
         await sbx_resume(inst.sandbox_id)
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline and h is None:
@@ -319,13 +329,17 @@ async def _ensure_ready(inst: Instance, fp: Optional[str], env: dict, api_key: s
         return
     if inst.refcount > 0 and inst.llm_fp != fp:
         raise HTTPException(503, "instance busy; retry to switch model")
+    if meta is not None:
+        meta["booted"] = True
     await _boot_engine(inst, fp, env, api_key)
 
 
 async def get_or_create(
-    tk: str, model: Optional[str] = None, llm: Optional["LlmOverride"] = None
+    tk: str, model: Optional[str] = None, llm: Optional["LlmOverride"] = None,
+    meta: Optional[dict] = None,
 ) -> Instance:
     fp = llm_fingerprint(model, llm)
+    t0 = time.monotonic()
     async with pool_mutex:
         lock = uid_locks.setdefault(tk, asyncio.Lock())
     async with lock:
@@ -352,9 +366,13 @@ async def get_or_create(
             await _evict_for_capacity()
             sandbox_id = await sbx_create(tk)
             inst = Instance(tk, sandbox_id, None)
+            if meta is not None:
+                meta["cold_start"] = True
             log.info("tenant %s -> new sandbox %s", tk[:8], sandbox_id[:12])
         env, api_key = engine_env(model, llm)
-        await _ensure_ready(inst, fp, env, api_key)
+        await _ensure_ready(inst, fp, env, api_key, meta=meta)
+        if meta is not None:
+            meta["sandbox_ready_ms"] = int((time.monotonic() - t0) * 1000)
         async with pool_mutex:
             pool[tk] = inst
         return inst
@@ -454,6 +472,51 @@ class _SessionGone(Exception):
     pass
 
 
+# ── Ask metrics (in-process; reset on router restart) ────────────────────────
+metrics: dict[str, Any] = {
+    "asks_total": 0,
+    "asks_ok": 0,
+    "asks_timeout": 0,
+    "asks_busy": 0,
+    "asks_error": 0,
+    "started_at": time.time(),
+}
+recent_ask_ms: "deque[int]" = deque(maxlen=100)
+
+
+def _percentile(values: list[int], pct: float) -> Optional[int]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, round(pct * (len(ordered) - 1))))
+    return ordered[idx]
+
+
+def _record_ask(stats: dict) -> None:
+    """Update counters and append one JSONL line to the ask log. Best-effort."""
+    outcome = stats.get("outcome")
+    metrics["asks_total"] += 1
+    if outcome == "ok":
+        metrics["asks_ok"] += 1
+    elif outcome == "timeout":
+        metrics["asks_timeout"] += 1
+    elif outcome == "busy":
+        metrics["asks_busy"] += 1
+    else:
+        metrics["asks_error"] += 1
+    total_ms = stats.get("total_ms")
+    if isinstance(total_ms, int) and outcome == "ok":
+        recent_ask_ms.append(total_ms)
+    try:
+        ASK_LOG.parent.mkdir(parents=True, exist_ok=True)
+        if ASK_LOG.exists() and ASK_LOG.stat().st_size > ASK_LOG_MAX_BYTES:
+            ASK_LOG.replace(ASK_LOG.with_suffix(".jsonl.1"))
+        with ASK_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": time.time(), **stats}, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.warning("ask log write failed: %s", e)
+
+
 # ── API ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="cube-router")
 
@@ -485,42 +548,107 @@ def _frame(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=False) + "\n"
 
 
+def _classify_status(status_code: int) -> str:
+    return {503: "busy", 504: "timeout", 502: "upstream_failed"}.get(status_code, "error")
+
+
 async def _ask_stream(body: AskBody, timeout_s: int):
     tk = tenant_key(body.uid)
-    async with active_sem:
-        inst = await get_or_create(tk, body.model, body.llm)
-        inst.refcount += 1
-        try:
-            async with inst.lock:
-                sid = await _ensure_session(inst, body.vibeSessionId)
-                try:
-                    attempt_id = await _post_turn(inst, sid, body.query)
-                except _SessionGone:
-                    sid = await _ensure_session(inst, None)
-                    attempt_id = await _post_turn(inst, sid, body.query)
+    t_req = time.monotonic()
+    stats: dict[str, Any] = {
+        "tk8": tk[:8],
+        "channel": "byok" if body.llm else "builtin",
+        "model": (body.llm.model if body.llm else body.model) or None,
+        "timeout_s": timeout_s,
+        "outcome": "incomplete",
+    }
+    engine_stats: Optional[dict] = None
 
-                q: "asyncio.Queue[dict]" = asyncio.Queue()
-                pump = asyncio.create_task(_pump_events(inst, sid, q))
-                waiter = asyncio.create_task(_wait_answer(inst, sid, attempt_id, timeout_s))
-                try:
-                    while not waiter.done():
-                        try:
-                            ev = await asyncio.wait_for(q.get(), timeout=1.0)
-                        except asyncio.TimeoutError:
-                            continue
-                        yield _frame({"t": "progress", **ev})
-                    while not q.empty():
-                        yield _frame({"t": "progress", **q.get_nowait()})
-                    answer = await waiter
-                    inst.last_activity = time.monotonic()
-                    yield _frame({"t": "answer", "answer": answer, "vibeSessionId": sid})
-                except HTTPException as e:
-                    yield _frame({"t": "error", "status": e.status_code, "detail": str(e.detail)})
-                finally:
-                    pump.cancel()
-                    waiter.cancel()
-        finally:
-            inst.refcount -= 1
+    def _grab_engine_stats(ev: dict) -> None:
+        nonlocal engine_stats
+        if ev.get("ev") == "attempt_stats" and isinstance(ev.get("data"), dict):
+            engine_stats = ev["data"]
+
+    try:
+        sem_t0 = time.monotonic()
+        async with active_sem:
+            stats["queue_wait_ms"] = int((time.monotonic() - sem_t0) * 1000)
+            meta: dict[str, Any] = {}
+            try:
+                inst = await get_or_create(tk, body.model, body.llm, meta=meta)
+            finally:
+                stats.update(meta)
+            inst.refcount += 1
+            try:
+                async with inst.lock:
+                    sess_t0 = time.monotonic()
+                    sid = await _ensure_session(inst, body.vibeSessionId)
+                    try:
+                        attempt_id = await _post_turn(inst, sid, body.query)
+                    except _SessionGone:
+                        stats["session_recovered"] = True
+                        sid = await _ensure_session(inst, None)
+                        attempt_id = await _post_turn(inst, sid, body.query)
+                    stats["session_ms"] = int((time.monotonic() - sess_t0) * 1000)
+                    stats["attempt_id"] = attempt_id
+
+                    q: "asyncio.Queue[dict]" = asyncio.Queue()
+                    pump = asyncio.create_task(_pump_events(inst, sid, q))
+                    waiter = asyncio.create_task(_wait_answer(inst, sid, attempt_id, timeout_s))
+                    try:
+                        while not waiter.done():
+                            try:
+                                ev = await asyncio.wait_for(q.get(), timeout=1.0)
+                            except asyncio.TimeoutError:
+                                continue
+                            stats.setdefault(
+                                "first_progress_ms", int((time.monotonic() - t_req) * 1000)
+                            )
+                            _grab_engine_stats(ev)
+                            yield _frame({"t": "progress", **ev})
+                        while not q.empty():
+                            ev = q.get_nowait()
+                            _grab_engine_stats(ev)
+                            yield _frame({"t": "progress", **ev})
+                        answer = await waiter
+                        inst.last_activity = time.monotonic()
+                        stats["outcome"] = "ok"
+                        stats["total_ms"] = int((time.monotonic() - t_req) * 1000)
+                        yield _frame({
+                            "t": "answer",
+                            "answer": answer,
+                            "vibeSessionId": sid,
+                            "stats": {"router": dict(stats), "engine": engine_stats},
+                        })
+                    finally:
+                        pump.cancel()
+                        waiter.cancel()
+            finally:
+                inst.refcount -= 1
+    except HTTPException as e:
+        stats["outcome"] = _classify_status(e.status_code)
+        stats["error"] = str(e.detail)[:300]
+        stats["total_ms"] = int((time.monotonic() - t_req) * 1000)
+        yield _frame({
+            "t": "error", "status": e.status_code, "detail": str(e.detail),
+            "stats": {"router": dict(stats), "engine": engine_stats},
+        })
+    except Exception as e:  # noqa: BLE001 - surface as an error frame, not a broken stream
+        log.exception("ask failed (tenant %s)", tk[:8])
+        stats["outcome"] = "exception"
+        stats["error"] = f"{type(e).__name__}: {e}"[:300]
+        stats["total_ms"] = int((time.monotonic() - t_req) * 1000)
+        yield _frame({
+            "t": "error", "status": 502,
+            "detail": f"router internal error: {type(e).__name__}",
+            "stats": {"router": dict(stats), "engine": engine_stats},
+        })
+    finally:
+        stats.setdefault("total_ms", int((time.monotonic() - t_req) * 1000))
+        if engine_stats:
+            stats["engine_status"] = engine_stats.get("status")
+            stats["iterations"] = engine_stats.get("iterations")
+        _record_ask(stats)
 
 
 @app.post("/ask")
@@ -562,12 +690,21 @@ async def forget(body: dict, authorization: Optional[str] = Header(None)):
 
 
 @app.get("/healthz")
-async def healthz():
+async def healthz(authorization: Optional[str] = Header(None)):
+    _auth(authorization)  # docs always said Bearer; the check was simply missing
+    ok_ms = list(recent_ask_ms)
     return {
         "instances": len(pool),
         "running": sum(1 for i in pool.values() if not i.paused),
         "active": MAX_CONCURRENT_ACTIVE - active_sem._value,  # noqa: SLF001
         "max_running": MAX_RUNNING,
+        "asks": {
+            **{k: v for k, v in metrics.items() if k != "started_at"},
+            "uptime_s": round(time.time() - metrics["started_at"]),
+            "p50_ms": _percentile(ok_ms, 0.50),
+            "p95_ms": _percentile(ok_ms, 0.95),
+            "window": len(ok_ms),
+        },
         "tenants": [
             {
                 "tk8": i.tk[:8],

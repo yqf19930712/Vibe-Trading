@@ -649,9 +649,11 @@ async def _spa_html_deep_link_fallback(request: Request, call_next):
 
 @app.on_event("startup")
 async def _run_startup_preflight() -> None:
-    """Run preflight checks on server startup."""
+    """Configure structured logging, then run preflight checks."""
+    from src.core.logging_setup import setup_logging
     from src.preflight import run_preflight
 
+    setup_logging()
     run_preflight(console)
 
 

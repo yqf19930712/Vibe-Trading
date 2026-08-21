@@ -5,11 +5,14 @@ Supports 1m/5m/15m/30m/1H/4H/1D.
 Up to 300 bars per request; paginates with ``after`` for longer history.
 """
 
+import logging
 import time
 from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
+
+logger = logging.getLogger(__name__)
 
 from backtest.loaders.base import (
     cached_loader_fetch,
@@ -70,11 +73,11 @@ class DataLoader:
         validate_date_range(start_date, end_date)
 
         if fields:
-            print(f"[WARN] OKX ignores extra fields: {fields}")
+            logger.warning("OKX ignores extra fields: %s", fields)
 
         valid_intervals = {"1m", "5m", "15m", "30m", "1H", "4H", "1D"}
         if interval not in valid_intervals:
-            print(f"[WARN] unsupported OKX interval {interval}, using 1D")
+            logger.warning("unsupported OKX interval %s, using 1D", interval)
             interval = "1D"
 
         codes = [c.replace("/", "-").upper() for c in codes]
@@ -101,7 +104,10 @@ class DataLoader:
                 if df is not None and not df.empty:
                     result[symbol] = df
             except Exception as exc:
-                print(f"[WARN] failed to fetch {symbol}: {exc}")
+                logger.warning(
+                    "okx fetch failed",
+                    extra={"source": "okx", "symbol": symbol, "error": str(exc)},
+                )
         return result
 
     def _fetch_candles(
@@ -161,7 +167,9 @@ class DataLoader:
             after = str(oldest_ts)
 
         if not all_rows:
-            print(f"[WARN] OKX empty response: {inst_id}")
+            logger.warning(
+                "OKX empty response", extra={"source": "okx", "symbol": inst_id}
+            )
             return None
 
         columns = ["ts", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote", "confirm"]

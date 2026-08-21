@@ -4,6 +4,7 @@ Supports ``interval``: 1D (default) / 1m / 5m / 15m / 30m / 1H.
 Minute data uses ``pro.stk_mins()`` (Tushare points >= 2000).
 """
 
+import logging
 import os
 from typing import Dict, List, Optional
 
@@ -12,6 +13,8 @@ import pandas as pd
 from backtest.loaders.base import cached_loader_fetch, validate_date_range
 from backtest.loaders.registry import register
 
+
+logger = logging.getLogger(__name__)
 
 TUSHARE_TOKEN_PLACEHOLDERS = {"", "your-tushare-token"}
 
@@ -79,7 +82,10 @@ class DataLoader:
                     )
                     return merged.get(code)
                 except Exception as exc:
-                    print(f"[WARN] failed to fetch {code}: {exc}")
+                    logger.warning(
+                        "tushare daily fetch failed",
+                        extra={"source": "tushare", "symbol": code, "error": str(exc)},
+                    )
                     return None
 
             df = cached_loader_fetch(
@@ -160,7 +166,10 @@ class DataLoader:
                         if f in basic.columns:
                             result[code][f] = basic[f]
             except Exception as exc:
-                print(f"[WARN] daily_basic for {code} failed: {exc}")
+                logger.warning(
+                    "tushare daily_basic fetch failed",
+                    extra={"source": "tushare", "symbol": code, "error": str(exc)},
+                )
 
         return result
 
@@ -185,7 +194,7 @@ class DataLoader:
         freq_map = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1H": "60min"}
         freq = freq_map.get(interval)
         if not freq:
-            print(f"[ERROR] unsupported Tushare interval: {interval}")
+            logger.error("unsupported Tushare interval: %s", interval)
             return {}
 
         sd = start_date.replace("-", "")
@@ -196,7 +205,10 @@ class DataLoader:
             try:
                 df = self.api.stk_mins(ts_code=code, freq=freq, start_date=sd, end_date=ed)
                 if df is None or df.empty:
-                    print(f"[WARN] empty Tushare minute data: {code} (points >= 2000 required)")
+                    logger.warning(
+                        "empty Tushare minute data (points >= 2000 required)",
+                        extra={"source": "tushare", "symbol": code},
+                    )
                     continue
                 df = df.sort_values("trade_time")
                 df["trade_date"] = pd.to_datetime(df["trade_time"])
@@ -210,5 +222,8 @@ class DataLoader:
                 )
                 result[code] = ohlcv
             except Exception as exc:
-                print(f"[WARN] failed to fetch minute data {code}: {exc}")
+                logger.warning(
+                    "tushare minute fetch failed",
+                    extra={"source": "tushare", "symbol": code, "error": str(exc)},
+                )
         return result
