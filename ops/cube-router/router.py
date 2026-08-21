@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Optional
@@ -58,6 +59,15 @@ SANDBOX_HTTP_PORT = os.environ.get("VIBE_SANDBOX_HTTP_PORT", "80")  # cube-proxy
 ENGINE_PORT = 8899
 LAUNCHER_PORT = 8898
 STATE_FILE = Path(os.environ.get("VIBE_STATE_FILE", "/var/lib/cube-router/state.json"))
+# Tenant engine data (sessions.db, runs/, memory/) lives on the HOST, one dir per
+# tenant, bind-mounted into the sandbox at GUEST_DATA_DIR via CubeSandbox's
+# host-mount. The sandbox's own writable layer then holds nothing worth keeping,
+# so a Vibe-Trading upgrade is "delete sandbox, create from the new template" —
+# no in-place patching of live sandboxes, no data loss. The host path must sit
+# under cubemaster's allowed_host_mount_prefixes (conf.yaml extra_conf).
+DATA_ROOT = Path(os.environ.get("VIBE_HOST_DATA_ROOT", "/data/shared/vibe"))
+GUEST_DATA_DIR = "/home/vibe/.vibe-trading"
+GUEST_UID = GUEST_GID = 1000  # the image's `vibe` user
 MAX_RUNNING = int(os.environ.get("VIBE_MAX_INSTANCES", "3"))          # concurrent RUNNING sandboxes
 MAX_CONCURRENT_ACTIVE = int(os.environ.get("VIBE_MAX_CONCURRENT_ACTIVE", "2"))
 IDLE_TTL_S = int(os.environ.get("VIBE_IDLE_TTL_S", str(20 * 60)))     # pause after idle
@@ -69,6 +79,7 @@ FORWARD_ENV = [
     "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_MODEL",
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
     "LANGCHAIN_PROVIDER", "LANGCHAIN_MODEL_NAME", "LANGCHAIN_TEMPERATURE",
+    "LANGCHAIN_NO_TEMPERATURE_MODELS",
     "TUSHARE_TOKEN", "VIBE_TRADING_SEARCH_BACKENDS",
 ]
 
@@ -162,8 +173,27 @@ api = httpx.AsyncClient(
 http = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=120.0))
 
 
-async def sbx_create() -> str:
-    r = await api.post("/sandboxes", json={"templateID": TEMPLATE_ID})
+def tenant_data_dir(tk: str) -> Path:
+    """Host dir bind-mounted at the engine's VIBE_DATA_DIR for this tenant."""
+    d = DATA_ROOT / tk
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chown(d, GUEST_UID, GUEST_GID)  # engine runs as uid 1000 in the guest
+    except PermissionError:
+        log.warning("cannot chown %s to %d:%d", d, GUEST_UID, GUEST_GID)
+    return d
+
+
+async def sbx_create(tk: str) -> str:
+    host_mount = json.dumps([{
+        "hostPath": str(tenant_data_dir(tk)),
+        "mountPath": GUEST_DATA_DIR,
+        "readOnly": False,
+    }])
+    r = await api.post("/sandboxes", json={
+        "templateID": TEMPLATE_ID,
+        "metadata": {"host-mount": host_mount},
+    })
     if r.status_code not in (200, 201):
         raise HTTPException(502, f"sandbox create failed: {r.status_code} {r.text[:200]}")
     sid = r.json().get("sandboxID") or r.json().get("sandboxId")
@@ -193,8 +223,21 @@ async def sbx_pause(sandbox_id: str) -> None:
 
 
 async def sbx_delete(sandbox_id: str) -> None:
+    """Delete a sandbox, resuming it first if needed.
+
+    CubeAPI refuses to delete a paused sandbox ("sandbox not in normal state")
+    and answers 500 — which httpx does not raise on, so without the status check
+    below the failure is swallowed and the sandbox leaks forever, holding disk
+    and a slot against VIBE_MAX_INSTANCES.
+    """
     try:
-        await api.delete(f"/sandboxes/{sandbox_id}")
+        await sbx_resume(sandbox_id)
+    except Exception as e:
+        log.warning("resume-before-delete %s failed: %s", sandbox_id[:12], e)
+    try:
+        r = await api.delete(f"/sandboxes/{sandbox_id}")
+        if r.status_code not in (200, 202, 204, 404):
+            log.warning("delete %s -> %s %s", sandbox_id[:12], r.status_code, r.text[:200])
     except Exception as e:
         log.warning("delete %s failed: %s", sandbox_id[:12], e)
 
@@ -255,6 +298,7 @@ async def _boot_engine(inst: Instance, fp: Optional[str], env: dict, api_key: st
     state.setdefault(inst.tk, {})["llm_fp"] = fp
     state[inst.tk]["sandbox_id"] = inst.sandbox_id
     state[inst.tk]["api_key"] = api_key
+    state[inst.tk]["template_id"] = TEMPLATE_ID
     _save_state()
 
 
@@ -290,14 +334,23 @@ async def get_or_create(
             st = state.get(tk)
             if st and st.get("sandbox_id"):
                 info = await sbx_info(st["sandbox_id"])
-                if info is not None:
-                    inst = Instance(tk, st["sandbox_id"], st.get("llm_fp"), st.get("api_key"))
-                else:
+                if info is None:
                     state.pop(tk, None)
                     _save_state()
+                elif st.get("template_id") != TEMPLATE_ID:
+                    # Engine code is baked into the image, so a new template only
+                    # reaches a tenant by rebuilding its sandbox. Lossless: the
+                    # data dir is host-mounted, not in the writable layer.
+                    log.info("tenant %s template %s -> %s; rebuilding sandbox",
+                             tk[:8], st.get("template_id"), TEMPLATE_ID)
+                    await sbx_delete(st["sandbox_id"])
+                    state.pop(tk, None)
+                    _save_state()
+                else:
+                    inst = Instance(tk, st["sandbox_id"], st.get("llm_fp"), st.get("api_key"))
         if inst is None:
             await _evict_for_capacity()
-            sandbox_id = await sbx_create()
+            sandbox_id = await sbx_create(tk)
             inst = Instance(tk, sandbox_id, None)
             log.info("tenant %s -> new sandbox %s", tk[:8], sandbox_id[:12])
         env, api_key = engine_env(model, llm)
@@ -501,6 +554,8 @@ async def forget(body: dict, authorization: Optional[str] = Header(None)):
     sandbox_id = inst.sandbox_id if inst else (state.get(tk) or {}).get("sandbox_id")
     if sandbox_id:
         await sbx_delete(sandbox_id)
+    # Tenant data now outlives the sandbox, so forgetting must remove it here too.
+    shutil.rmtree(DATA_ROOT / tk, ignore_errors=True)
     state.pop(tk, None)
     _save_state()
     return {"ok": True}

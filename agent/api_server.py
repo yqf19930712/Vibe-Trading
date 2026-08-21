@@ -45,7 +45,7 @@ def _data_root() -> Path:
     Honors ``VIBE_DATA_DIR`` so a multi-tenant launcher can point each instance
     at a per-user HOME (``$HOME/.vibe-trading``) to isolate state across tenants.
     Defaults to the install dir, preserving single-user behavior unchanged.
-    See MULTI_TENANCY.md §4.2.
+    See PRODUCT_DESIGN.md §2.3.
     """
     env = os.getenv("VIBE_DATA_DIR")
     return Path(env).expanduser() if env else Path(__file__).resolve().parent

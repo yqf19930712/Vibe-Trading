@@ -5,7 +5,7 @@ all run/session/upload artifacts under a per-user HOME so tenants are isolated.
 Unset (single-user / upstream) it falls back to the install ``agent/`` dir,
 leaving behavior unchanged. Every run/session/upload path resolver should derive
 from here so a new write site can't silently escape the tenant root again.
-See MULTI_TENANCY.md §4.2.
+See PRODUCT_DESIGN.md §2.3.
 """
 from __future__ import annotations
 

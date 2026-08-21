@@ -72,7 +72,7 @@ def swarm_runs_root() -> Path:
     Honors ``VIBE_DATA_DIR`` (multi-tenant: per-user HOME) so swarm run
     artifacts are isolated per tenant alongside runs/sessions/uploads, instead
     of all tenants sharing the install-dir ``.swarm/runs`` tree. Defaults to the
-    install dir, preserving single-user behavior. See MULTI_TENANCY.md §4.2/B1.
+    install dir, preserving single-user behavior. See PRODUCT_DESIGN.md §2.3.
     """
     env = os.getenv("VIBE_DATA_DIR")
     base = Path(env).expanduser() if env else Path(__file__).resolve().parents[2]

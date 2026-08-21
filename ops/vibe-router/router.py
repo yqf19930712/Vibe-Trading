@@ -7,7 +7,7 @@ reuses, and reaps those per-tenant instances, and proxies a single `/ask` call
 (create-or-reuse session → send → poll-by-attempt_id → answer) so the caller
 (laicai) stays thin.
 
-Design: ../../MULTI_TENANCY.md (v2, review-incorporated). All the non-obvious
+Design record: ../../docs/HISTORY.md (v1, retired). All the non-obvious
 choices here trace to a numbered finding there (B1–B4, M1–M8, m1–m5).
 
 Stdlib + fastapi + uvicorn + httpx (all already in Vibe's deps).

@@ -46,7 +46,7 @@ _SHELL_TOOL_NAMES = {"bash", "background_run"}
 # now and bounded only by the pool-level cgroup MemoryMax; revisit before any
 # real multi-user load. background_run additionally needs the shell-tools gate
 # (VIBE_TRADING_ENABLE_SHELL_TOOLS=1, injected by the router) since it runs
-# arbitrary host commands. See MULTI_TENANCY.md §4.3.
+# arbitrary host commands. See PRODUCT_DESIGN.md §2.3.
 _TENANT_SAFE_BLOCKED_NAMES = {
     "propose_mandate_profiles",
 }
