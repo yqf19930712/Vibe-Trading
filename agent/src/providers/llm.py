@@ -620,12 +620,15 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
     if caps.name == "moonshot" and name.lower().startswith("kimi-k2") and temperature != 1.0:
         logger.info("Forcing temperature=1.0 for %s (provider requirement)", name)
         temperature = 1.0
-    # Anthropic Opus 4.8 and the Claude 5 family (Fable/Mythos), proxied via
-    # OpenAI-compat, reject `temperature` entirely ("`temperature` is
-    # deprecated for this model"). Pass None so langchain-openai omits the
-    # field from the request payload.
+    # Anthropic models that removed sampling params, proxied via OpenAI-compat,
+    # reject `temperature` entirely ("`temperature` is deprecated for this
+    # model"): Opus 4.7 / 4.8 / 5, Sonnet 5, and the Fable/Mythos 5 family.
+    # Opus 4.6, Sonnet 4.6 and anything older still accept it, so keep the
+    # match version-specific rather than a blanket "opus"/"sonnet".
+    # Pass None so langchain-openai omits the field from the request payload.
+    _NO_TEMPERATURE = ("opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "fable", "mythos")
     temperature_param: float | None = temperature
-    if any(s in name.lower() for s in ("opus-4-8", "fable", "mythos")):
+    if any(s in name.lower() for s in _NO_TEMPERATURE):
         temperature_param = None
     # Optional reasoning activation for relays requiring opt-in (e.g. OpenRouter).
     # Moonshot/DeepSeek official APIs emit reasoning by default and ignore this field.
