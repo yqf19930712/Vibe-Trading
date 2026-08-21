@@ -25,6 +25,68 @@ try:
 except ImportError:
     ChatOpenAI = None  # type: ignore
 
+# Models that removed sampling parameters and reject `temperature` outright when
+# reached over an OpenAI-compatible endpoint ("`temperature` is deprecated for
+# this model"): Opus 4.7 / 4.8 / 5, Sonnet 5, and the Fable / Mythos 5 family.
+# Opus 4.6, Sonnet 4.6 and everything older still accept it, so this matches on
+# version rather than a blanket "opus" / "sonnet" — a blanket match would silently
+# drop temperature=0 for those models and make the agent non-deterministic.
+#
+# Both knobs below exist so that switching the engine to a new model is an env
+# change, never a code change (the engine ships inside a sandbox image, so a code
+# change means rebuilding the image and re-provisioning every tenant sandbox):
+#   LANGCHAIN_TEMPERATURE=none            → never send temperature, any model
+#   LANGCHAIN_NO_TEMPERATURE_MODELS=a,b   → add to the list below
+NO_TEMPERATURE_MODELS: tuple[str, ...] = (
+    "opus-4-7",
+    "opus-4-8",
+    "opus-5",
+    "sonnet-5",
+    "fable",
+    "mythos",
+)
+
+# LANGCHAIN_TEMPERATURE values that mean "omit the parameter entirely".
+_TEMPERATURE_OFF = {"", "none", "null", "off", "omit"}
+
+
+def _temperature_setting() -> tuple[float, bool]:
+    """Parse LANGCHAIN_TEMPERATURE into (value, disabled).
+
+    `disabled` means the caller should omit `temperature` from the request.
+    An unparseable value falls back to 0.0 rather than crashing engine start-up.
+    """
+    raw = os.getenv("LANGCHAIN_TEMPERATURE", "0.0").strip()
+    if raw.lower() in _TEMPERATURE_OFF:
+        return 0.0, True
+    try:
+        return float(raw), False
+    except ValueError:
+        logger.warning("LANGCHAIN_TEMPERATURE=%r is not a number; using 0.0", raw)
+        return 0.0, False
+
+
+def _no_temperature_markers() -> tuple[str, ...]:
+    """Model-name substrings whose models reject `temperature`.
+
+    LANGCHAIN_NO_TEMPERATURE_MODELS (comma-separated) *extends* the built-in list
+    rather than replacing it, so covering a newly released model is one env entry
+    and can never silently un-cover the models already known to need this.
+    """
+    raw = os.getenv("LANGCHAIN_NO_TEMPERATURE_MODELS", "").strip()
+    if not raw:
+        return NO_TEMPERATURE_MODELS
+    extra = tuple(part.strip().lower() for part in raw.split(",") if part.strip())
+    return NO_TEMPERATURE_MODELS + extra
+
+
+def omit_temperature(model_name: str, temperature_disabled: bool = False) -> bool:
+    """Whether `temperature` must be left out of the request for this model."""
+    if temperature_disabled:
+        return True
+    lowered = model_name.lower()
+    return any(marker in lowered for marker in _no_temperature_markers())
+
 
 if ChatOpenAI is not None:
     class ChatOpenAIWithReasoning(ChatOpenAI):  # type: ignore[misc,valid-type]
@@ -580,7 +642,7 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
     name = model_name or os.getenv("LANGCHAIN_MODEL_NAME", "").strip()
     if not name:
         raise RuntimeError("LANGCHAIN_MODEL_NAME is not set")
-    temperature = float(os.getenv("LANGCHAIN_TEMPERATURE", "0.0"))
+    temperature, temperature_disabled = _temperature_setting()
     provider = os.getenv("LANGCHAIN_PROVIDER", "openai").lower()
     caps = get_provider_capabilities(provider, name)
     if provider in {"openai-codex", "openai_codex"}:
@@ -620,15 +682,10 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
     if caps.name == "moonshot" and name.lower().startswith("kimi-k2") and temperature != 1.0:
         logger.info("Forcing temperature=1.0 for %s (provider requirement)", name)
         temperature = 1.0
-    # Anthropic models that removed sampling params, proxied via OpenAI-compat,
-    # reject `temperature` entirely ("`temperature` is deprecated for this
-    # model"): Opus 4.7 / 4.8 / 5, Sonnet 5, and the Fable/Mythos 5 family.
-    # Opus 4.6, Sonnet 4.6 and anything older still accept it, so keep the
-    # match version-specific rather than a blanket "opus"/"sonnet".
-    # Pass None so langchain-openai omits the field from the request payload.
-    _NO_TEMPERATURE = ("opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "fable", "mythos")
+    # Some models reject `temperature` outright — see NO_TEMPERATURE_MODELS.
+    # Passing None makes langchain-openai omit the field from the payload.
     temperature_param: float | None = temperature
-    if any(s in name.lower() for s in _NO_TEMPERATURE):
+    if omit_temperature(name, temperature_disabled):
         temperature_param = None
     # Optional reasoning activation for relays requiring opt-in (e.g. OpenRouter).
     # Moonshot/DeepSeek official APIs emit reasoning by default and ignore this field.
