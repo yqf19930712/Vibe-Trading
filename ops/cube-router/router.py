@@ -689,6 +689,85 @@ async def forget(body: dict, authorization: Optional[str] = Header(None)):
     return {"ok": True}
 
 
+# ── Read-only tenant observability (laicai admin deep-run detail page) ───────
+# Serves the tenant's engine.jsonl / trace.jsonl straight off the host
+# bind-mount, so operators can inspect a run in the browser instead of SSH.
+# Bearer-gated like everything else; ids are strictly validated so a caller
+# can never traverse outside the tenant's data dir.
+
+_OBS_ID_RE = re.compile(r"[A-Za-z0-9_-]{4,64}")
+_OBS_TAIL_BYTES = 4_000_000
+
+
+def _obs_tail_lines(path: Path, max_bytes: int = _OBS_TAIL_BYTES) -> list[str]:
+    with path.open("rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - max_bytes))
+        data = f.read().decode("utf-8", "replace")
+    lines = data.splitlines()
+    if size > max_bytes and lines:
+        lines = lines[1:]  # drop the partial first line
+    return lines
+
+
+def _obs_clip(entry: dict, max_chars: int = 600) -> dict:
+    for k, v in list(entry.items()):
+        if isinstance(v, str) and len(v) > max_chars:
+            entry[k] = v[:max_chars] + "…"
+    return entry
+
+
+@app.get("/obs/engine-log")
+async def obs_engine_log(
+    uid: str,
+    attempt_id: Optional[str] = None,
+    limit: int = 500,
+    authorization: Optional[str] = Header(None),
+):
+    _auth(authorization)
+    if attempt_id and not _OBS_ID_RE.fullmatch(attempt_id):
+        raise HTTPException(400, "invalid attempt_id")
+    limit = max(1, min(limit, 2000))
+    path = DATA_ROOT / tenant_key(uid) / "logs" / "engine.jsonl"
+    if not path.exists():
+        return {"lines": [], "truncated": False}
+    raw = await asyncio.to_thread(_obs_tail_lines, path)
+    out = []
+    for line in raw:
+        if attempt_id and attempt_id not in line:
+            continue
+        try:
+            out.append(_obs_clip(json.loads(line)))
+        except Exception:
+            continue
+    return {"lines": out[-limit:], "truncated": len(out) > limit}
+
+
+@app.get("/obs/trace")
+async def obs_trace(
+    uid: str,
+    session_id: str,
+    limit: int = 800,
+    authorization: Optional[str] = Header(None),
+):
+    _auth(authorization)
+    if not _OBS_ID_RE.fullmatch(session_id):
+        raise HTTPException(400, "invalid session_id")
+    limit = max(1, min(limit, 2000))
+    path = DATA_ROOT / tenant_key(uid) / "sessions" / session_id / "trace.jsonl"
+    if not path.exists():
+        return {"entries": [], "truncated": False}
+    raw = await asyncio.to_thread(_obs_tail_lines, path)
+    out = []
+    for line in raw:
+        try:
+            out.append(_obs_clip(json.loads(line)))
+        except Exception:
+            continue
+    return {"entries": out[-limit:], "truncated": len(out) > limit}
+
+
 @app.get("/healthz")
 async def healthz(authorization: Optional[str] = Header(None)):
     _auth(authorization)  # docs always said Bearer; the check was simply missing
