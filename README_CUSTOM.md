@@ -46,7 +46,16 @@ laicai web (阿里云) ──Bearer──► cube-router :8990 (CubeSandbox 宿�
 1. 安装 OpenCloudOS `6.6.69-*.cubesandbox.pvm.host` 预编译 DEB（[TencentCloud/CubeSandbox](https://github.com/TencentCloud/CubeSandbox) Releases），`modprobe kvm_pvm`（配置开机自载）后由 PVM 提供 KVM 能力。原内核保留在 GRUB 可回退。
    - PVM 内核 GRUB 参数含 `net.ifnames=0` / `console=ttyS0`，与阿里云 Ubuntu 镜像默认一致，换内核不破网。
 2. 数据盘格式化为 **XFS（reflink 开启）** 挂 `/data/cubelet` —— CoW 快照的硬要求。
-3. CubeSandbox one-click 安装：`CUBE_PVM_ENABLE=1 ./install.sh`，全栈由 systemd `cube-sandbox-control.target` 管理。关键端口：CubeAPI（E2B 兼容）`:3000`（`X-API-Key`，one-click 默认 `e2b_000000`）、WebUI `:12088`、cubemaster `:8089`。WebUI 端口务必用安全组限制来源 IP。
+3. **放行 host-mount 前缀**（租户数据持久化的前提）：在 `CubeMaster/conf.yaml` 末尾加
+
+   ```yaml
+   extra_conf:
+     allowed_host_mount_prefixes:
+       - "/data/shared/"
+   ```
+
+   然后 `systemctl restart cube-sandbox-cubemaster`。不放行的话建沙箱时的 `host-mount` 会被拒。
+4. CubeSandbox one-click 安装：`CUBE_PVM_ENABLE=1 ./install.sh`，全栈由 systemd `cube-sandbox-control.target` 管理。关键端口：CubeAPI（E2B 兼容）`:3000`（`X-API-Key`，one-click 默认 `e2b_000000`）、WebUI `:12088`、cubemaster `:8089`。WebUI 端口务必用安全组限制来源 IP。
 
 ### 2. 引擎镜像构建与模板发布
 
@@ -91,6 +100,7 @@ systemctl daemon-reload && systemctl enable --now cube-router
 | `CUBE_API_URL` / `CUBE_API_KEY` | | CubeAPI 控制面，默认 `http://127.0.0.1:3000` / `e2b_000000` |
 | `VIBE_SANDBOX_DOMAIN` / `VIBE_SANDBOX_HTTP_PORT` | | cube-proxy 数据面域名/端口，默认 `cube.app` / `80` |
 | `VIBE_STATE_FILE` | | 租户映射持久化，默认 `/var/lib/cube-router/state.json` |
+| `VIBE_HOST_DATA_ROOT` | | 租户引擎数据在**宿主**上的根目录，默认 `/data/shared/vibe`。每租户一个子目录（名 = tenant_key），建沙箱时 bind-mount 到 `/home/vibe/.vibe-trading`。必须落在 `allowed_host_mount_prefixes` 之内 |
 | `VIBE_MAX_INSTANCES` | | 并发 RUNNING 沙箱上限，默认 3（8G 宿主机的安全值） |
 | `VIBE_MAX_CONCURRENT_ACTIVE` | | 并发 `/ask` 处理上限，默认 2 |
 | `VIBE_IDLE_TTL_S` | | 空闲 pause 阈值，默认 1200 |
@@ -106,7 +116,9 @@ laicai 侧只需在 `web.env` 配 `VIBE_ROUTER_URL=http://<宿主机>:8990` + `V
 两条路径的影响面完全不同：
 
 - **只改 router**（`ops/cube-router/router.py`）：scp 覆盖 `/opt/cube-router/router.py` → `systemctl restart cube-router`。沙箱不受影响——重启后从 `state.json` 重挂既有租户沙箱，不泄漏、不丢数据。
-- **改引擎代码**（`agent/`）：重建镜像 → push → `cubemastercli tpl create-from-image` 发新模板 → 更新 `VIBE_CUBE_TEMPLATE_ID` → restart cube-router。**既有租户沙箱仍运行旧模板的代码**（引擎代码烧在沙箱镜像里），只有新建的沙箱用新模板；要让老租户升级需删其沙箱（`/forget`，会清空该租户全部数据）或等自然重建。
+- **改引擎代码**（`agent/`）：重建镜像 → push → `cubemastercli tpl create-from-image` 发新模板 → 更新 `VIBE_CUBE_TEMPLATE_ID` → restart cube-router。**不需要动既有沙箱**：router 在 `get_or_create` 里比对 `state.json` 里记的 `template_id`，不一致就删掉旧沙箱、用新模板重建。租户数据在宿主 bind-mount 里，重建无损。
+
+  > 这是 2026-08-21 之后的行为。在那之前引擎数据在沙箱可写层里，换模板只影响新建沙箱，老租户要么继续跑旧代码、要么 `/forget` 丢数据——踩过一次，见 `docs/HISTORY.md`。
 - **只改 LLM 配置**（`FORWARD_ENV` 里的凭据/模型）：改 `router.env` → restart cube-router。下一次 `/ask` 时 LLM 指纹变化会自动触发 launcher `/boot` 重启引擎进程，沙箱与会话数据不动。
 
 ### 换模型（不需要动代码）
