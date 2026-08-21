@@ -96,6 +96,8 @@ systemctl daemon-reload && systemctl enable --now cube-router
 | `VIBE_IDLE_TTL_S` | | 空闲 pause 阈值，默认 1200 |
 | `VIBE_READY_TIMEOUT_S` / `VIBE_POLL_INTERVAL_S` / `VIBE_ASK_TIMEOUT_S` | | 就绪预算 180s / 轮询间隔 3s / 单问默认超时 900s |
 | `OPENAI_*` `ANTHROPIC_*` `LANGCHAIN_*` `TUSHARE_TOKEN` `VIBE_TRADING_SEARCH_BACKENDS` | | 内置默认 LLM 凭据与数据源配置，经 launcher `/boot` 转发进每个租户引擎（完整清单见 `router.py` 的 `FORWARD_ENV`） |
+| `LANGCHAIN_TEMPERATURE` | | `none` / `off` / 空 = 任何模型都不发 `temperature`；否则按数值发。填了非数字会 warning 后回落 `0.0` |
+| `LANGCHAIN_NO_TEMPERATURE_MODELS` | | 逗号分隔的模型名子串，**追加**到 `llm.py` 内置的 `NO_TEMPERATURE_MODELS` 名单（追加而非替换，避免为了加新模型把已知的漏掉） |
 
 laicai 侧只需在 `web.env` 配 `VIBE_ROUTER_URL=http://<宿主机>:8990` + `VIBE_ROUTER_TOKEN`。
 
@@ -106,6 +108,23 @@ laicai 侧只需在 `web.env` 配 `VIBE_ROUTER_URL=http://<宿主机>:8990` + `V
 - **只改 router**（`ops/cube-router/router.py`）：scp 覆盖 `/opt/cube-router/router.py` → `systemctl restart cube-router`。沙箱不受影响——重启后从 `state.json` 重挂既有租户沙箱，不泄漏、不丢数据。
 - **改引擎代码**（`agent/`）：重建镜像 → push → `cubemastercli tpl create-from-image` 发新模板 → 更新 `VIBE_CUBE_TEMPLATE_ID` → restart cube-router。**既有租户沙箱仍运行旧模板的代码**（引擎代码烧在沙箱镜像里），只有新建的沙箱用新模板；要让老租户升级需删其沙箱（`/forget`，会清空该租户全部数据）或等自然重建。
 - **只改 LLM 配置**（`FORWARD_ENV` 里的凭据/模型）：改 `router.env` → restart cube-router。下一次 `/ask` 时 LLM 指纹变化会自动触发 launcher `/boot` 重启引擎进程，沙箱与会话数据不动。
+
+### 换模型（不需要动代码）
+
+模型名本来就是运行时参数（`LANGCHAIN_MODEL_NAME`）。以前唯一逼着改代码的是「哪些模型拒绝 `temperature`」那份硬编码名单——而引擎代码烧在沙箱镜像里，改它就要重建镜像并逐个补既有租户沙箱。该策略现已可由 env 表达：
+
+```bash
+# 换模型：改这一行 → systemctl restart cube-router，完事
+LANGCHAIN_MODEL_NAME=claude-opus-5
+
+# 如果新模型也拒绝 temperature，而 llm.py 的内置名单还没收录它：
+LANGCHAIN_NO_TEMPERATURE_MODELS=opus-6,某新模型
+
+# 或者干脆对所有模型都不发 temperature：
+LANGCHAIN_TEMPERATURE=none
+```
+
+判定实现见 `agent/src/providers/llm.py` 的 `omit_temperature()`。内置名单 `NO_TEMPERATURE_MODELS` 按**版本**精确匹配（`opus-4-7 / opus-4-8 / opus-5 / sonnet-5 / fable / mythos`）而不是笼统的 `opus`/`sonnet`——Opus 4.6、Sonnet 4.6 及更早仍接受 `temperature`，笼统匹配会让它们悄悄丢掉 `temperature=0`。
 
 ### 5. 日常运维
 
