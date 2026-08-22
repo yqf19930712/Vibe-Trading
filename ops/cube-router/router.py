@@ -744,6 +744,36 @@ async def obs_engine_log(
     return {"lines": out[-limit:], "truncated": len(out) > limit}
 
 
+@app.get("/obs/ask-log")
+async def obs_ask_log(
+    uid: str,
+    attempt_id: Optional[str] = None,
+    limit: int = 50,
+    authorization: Optional[str] = Header(None),
+):
+    """This tenant's rows from the router ask log (segment timings/outcomes)."""
+    _auth(authorization)
+    if attempt_id and not _OBS_ID_RE.fullmatch(attempt_id):
+        raise HTTPException(400, "invalid attempt_id")
+    limit = max(1, min(limit, 200))
+    tk8 = tenant_key(uid)[:8]
+    if not ASK_LOG.exists():
+        return {"lines": [], "truncated": False}
+    raw = await asyncio.to_thread(_obs_tail_lines, ASK_LOG)
+    out = []
+    for line in raw:
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if e.get("tk8") != tk8:
+            continue
+        if attempt_id and e.get("attempt_id") != attempt_id:
+            continue
+        out.append(_obs_clip(e))
+    return {"lines": out[-limit:], "truncated": len(out) > limit}
+
+
 @app.get("/obs/trace")
 async def obs_trace(
     uid: str,
