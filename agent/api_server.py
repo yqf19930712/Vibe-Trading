@@ -253,6 +253,10 @@ class SessionResponse(BaseModel):
 class SendMessageRequest(BaseModel):
     """Send chat message: natural-language strategy description."""
     content: str = Field(..., description="Natural language strategy description", min_length=1, max_length=5000)
+    # Wall-clock budget for this attempt (seconds). When set, the agent loop
+    # finalizes with whatever it has BEFORE the caller's timeout instead of
+    # grinding past it (multi-tenant router forwards laicai's /ask timeout here).
+    deadline_s: Optional[float] = Field(None, gt=0, le=24 * 3600)
 
 
 class MessageResponse(BaseModel):
@@ -649,11 +653,21 @@ async def _spa_html_deep_link_fallback(request: Request, call_next):
 
 @app.on_event("startup")
 async def _run_startup_preflight() -> None:
-    """Configure structured logging, then run preflight checks."""
+    """Configure structured logging + socket timeout floor, then preflight."""
+    import socket
+
     from src.core.logging_setup import setup_logging
     from src.preflight import run_preflight
 
     setup_logging()
+    # Several data SDKs (tushare/akshare/baostock) issue blocking HTTP calls
+    # with no timeout — a stalled upstream would hang a tool thread for the
+    # whole tool timeout. This floor only affects blocking sockets; asyncio's
+    # non-blocking server sockets are untouched.
+    try:
+        socket.setdefaulttimeout(float(os.getenv("VIBE_SOCKET_TIMEOUT_S", "30")))
+    except ValueError:
+        socket.setdefaulttimeout(30.0)
     run_preflight(console)
 
 
@@ -2127,6 +2141,7 @@ async def send_message(session_id: str, payload: SendMessageRequest, http_reques
             session_id=session_id,
             content=payload.content,
             include_shell_tools=_shell_tools_enabled_for_request(http_request),
+            deadline_s=payload.deadline_s,
         )
         return result
     except ValueError as exc:

@@ -6,17 +6,43 @@ Minute data uses ``pro.stk_mins()`` (Tushare points >= 2000).
 
 import logging
 import os
+import threading
+import time
 from typing import Dict, List, Optional
 
 import pandas as pd
 
-from backtest.loaders.base import cached_loader_fetch, validate_date_range
+from backtest.loaders.base import (
+    cached_loader_fetch,
+    positive_env_float,
+    retry_with_budget,
+    validate_date_range,
+)
 from backtest.loaders.registry import register
 
 
 logger = logging.getLogger(__name__)
 
 TUSHARE_TOKEN_PLACEHOLDERS = {"", "your-tushare-token"}
+
+# One TUSHARE_TOKEN is shared by every tenant engine, so concurrent attempts can
+# trip the per-minute quota together. This in-process throttle spaces calls out;
+# the ceiling is configurable to match the account's Pro tier (default leaves
+# headroom under the common 500/min tier).
+_THROTTLE_MIN_INTERVAL_S = 60.0 / positive_env_float("TUSHARE_MAX_PER_MIN", 300.0)
+_throttle_lock = threading.Lock()
+_throttle_last = 0.0
+
+
+def _throttled_call(fn, *args, **kwargs):
+    """Serialize Tushare API calls to at most TUSHARE_MAX_PER_MIN per minute."""
+    global _throttle_last
+    with _throttle_lock:
+        wait = _throttle_last + _THROTTLE_MIN_INTERVAL_S - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _throttle_last = time.monotonic()
+    return fn(*args, **kwargs)
 
 
 @register
@@ -108,8 +134,17 @@ class DataLoader:
         start_date: str,
         end_date: str,
     ) -> Optional[pd.DataFrame]:
-        """Fetch and normalize one daily OHLCV frame."""
-        df = self.api.daily(ts_code=code, start_date=start_date, end_date=end_date)
+        """Fetch and normalize one daily OHLCV frame (throttled + bounded retry)."""
+        df = retry_with_budget(
+            lambda: _throttled_call(
+                self.api.daily, ts_code=code, start_date=start_date, end_date=end_date
+            ),
+            transient=Exception,
+            deadline=time.monotonic() + 30,
+            label=f"tushare daily {code}",
+            max_retries=2,
+            backoff=(1.0, 3.0),
+        )
         if df is None or df.empty:
             return None
         df = df.sort_values("trade_date")
@@ -153,7 +188,8 @@ class DataLoader:
 
         for code in active_codes:
             try:
-                basic = self.api.daily_basic(
+                basic = _throttled_call(
+                    self.api.daily_basic,
                     ts_code=code,
                     start_date=sd,
                     end_date=ed,
@@ -203,7 +239,9 @@ class DataLoader:
 
         for code in codes:
             try:
-                df = self.api.stk_mins(ts_code=code, freq=freq, start_date=sd, end_date=ed)
+                df = _throttled_call(
+                    self.api.stk_mins, ts_code=code, freq=freq, start_date=sd, end_date=ed
+                )
                 if df is None or df.empty:
                     logger.warning(
                         "empty Tushare minute data (points >= 2000 required)",

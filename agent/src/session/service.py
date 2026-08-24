@@ -89,6 +89,7 @@ class SessionService:
         role: str = "user",
         *,
         include_shell_tools: bool = False,
+        deadline_s: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Send a message to a session and trigger execution.
 
@@ -121,7 +122,14 @@ class SessionService:
         self.store.update_session(session)
         self.event_bus.emit(session_id, "attempt.created", {"attempt_id": attempt.attempt_id, "prompt": content})
 
-        asyncio.create_task(self._run_attempt(session, attempt, include_shell_tools=include_shell_tools))
+        asyncio.create_task(
+            self._run_attempt(
+                session,
+                attempt,
+                include_shell_tools=include_shell_tools,
+                deadline_s=deadline_s,
+            )
+        )
         return {"message_id": message.message_id, "attempt_id": attempt.attempt_id}
 
     def get_messages(self, session_id: str, limit: int = 100) -> list[Message]:
@@ -143,7 +151,14 @@ class SessionService:
         loop.cancel()
         return True
 
-    async def _run_attempt(self, session: Session, attempt: Attempt, *, include_shell_tools: bool = False) -> None:
+    async def _run_attempt(
+        self,
+        session: Session,
+        attempt: Attempt,
+        *,
+        include_shell_tools: bool = False,
+        deadline_s: Optional[float] = None,
+    ) -> None:
         """Execute an Attempt in the background."""
         attempt.mark_running()
         self.store.update_attempt(attempt)
@@ -156,6 +171,7 @@ class SessionService:
                 messages=messages,
                 include_shell_tools=include_shell_tools,
                 session_config=dict(session.config),
+                deadline_s=deadline_s,
             )
             if result.get("status") == "success":
                 attempt.mark_completed(summary=result.get("content", ""))
@@ -198,6 +214,7 @@ class SessionService:
         *,
         include_shell_tools: bool = False,
         session_config: Optional[Dict[str, Any]] = None,
+        deadline_s: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Execute an attempt with the V5 AgentLoop.
 
@@ -214,12 +231,15 @@ class SessionService:
             Result dictionary containing status, run_dir, run_id, metrics, and related fields.
         """
         import contextvars
+        import os
+        import time
 
         from src.tools import build_registry
         from src.providers.chat import ChatLLM
         from src.agent.loop import AgentLoop
         from src.memory.persistent import PersistentMemory
         from src.config.loader import load_runtime_agent_config, sanitize_session_overrides
+        from src.core.budget import bind_deadline
         from src.core.logging_setup import bind_log_context
 
         llm = ChatLLM()
@@ -234,6 +254,10 @@ class SessionService:
         # Executor threads don't inherit contextvars, so run the sync work
         # inside an explicit context copy.
         bind_log_context(session_id=session_id, attempt_id=attempt_id)
+        # Bind the wall-clock budget so the loop (and every tool thread it
+        # spawns via copy_context) can finalize before the caller's timeout.
+        deadline = time.monotonic() + deadline_s if deadline_s else None
+        bind_deadline(deadline)
 
         safe_overrides = sanitize_session_overrides(session_config) if session_config else session_config
         agent_config = load_runtime_agent_config(overrides=safe_overrides)
@@ -260,11 +284,18 @@ class SessionService:
             ),
         )
 
+        # Iteration ceiling is an env knob now (batch 3): the multi-tenant
+        # router hands laicai tenants 25 — the incident data showed 50 lets a
+        # single question grind for 15-19 minutes, past every outer budget.
+        try:
+            max_iterations = max(1, int(os.getenv("VIBE_MAX_ITERATIONS", "50")))
+        except ValueError:
+            max_iterations = 50
         agent = AgentLoop(
             registry=registry,
             llm=llm,
             event_callback=event_callback,
-            max_iterations=50,
+            max_iterations=max_iterations,
             persistent_memory=pm,
         )
         self._active_loops[session_id] = agent

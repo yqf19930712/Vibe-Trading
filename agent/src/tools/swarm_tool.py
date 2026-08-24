@@ -787,8 +787,14 @@ class SwarmTool(BaseTool):
             )
         pending_live_events.clear()
 
+        # Cap the wait by the attempt's remaining wall-clock budget (batch 3):
+        # a swarm wait must never outlive the caller's own deadline — keep a
+        # reserve so the main loop can still turn partial results into an answer.
+        from src.core.budget import cap_timeout
+
+        max_wait = cap_timeout(float(_MAX_WAIT_SECONDS), reserve_s=90.0, floor_s=60.0)
         t0 = time.monotonic()
-        while time.monotonic() - t0 < _MAX_WAIT_SECONDS:
+        while time.monotonic() - t0 < max_wait:
             time.sleep(_POLL_INTERVAL_SECONDS)
 
             loaded = store.load_run(run_id)

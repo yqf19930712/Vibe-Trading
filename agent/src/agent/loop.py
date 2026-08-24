@@ -40,6 +40,8 @@ from src.goal.context import (
 from src.providers.chat import ChatLLM, ProviderStreamError
 from src.tools.background_tools import get_background_manager
 from src.tools.redaction import redact_payload
+from src.core import budget as _budget
+from src.core import fetch_stats as _fetch_stats
 from src.core.paths import data_root, runs_root
 
 # Honor VIBE_DATA_DIR (multi-tenant per-user HOME) so the agent loop writes run
@@ -53,6 +55,10 @@ HEARTBEAT_INTERVAL_S = float(os.getenv("VT_HEARTBEAT_INTERVAL_S", "3.0"))
 REASONING_DELTA_MIN_INTERVAL_S = float(os.getenv("VT_REASONING_DELTA_MIN_INTERVAL_S", "1.0"))
 STREAM_RETRY_DELAY_S = float(os.getenv("VT_STREAM_RETRY_DELAY_S", "1.0"))
 TOOL_TIMEOUT_SECONDS = float(os.getenv("VIBE_TRADING_TOOL_TIMEOUT_SECONDS", "1800"))
+# Batch 3: when an attempt deadline is bound, force the final text answer once
+# less than this many seconds (or ~1.2 avg iterations) remain — a partial
+# answer beats the caller timing out on nothing.
+FINALIZE_RESERVE_S = float(os.getenv("VIBE_FINALIZE_RESERVE_S", "60"))
 GOAL_MAX_CONTINUATIONS = int(os.getenv("VIBE_TRADING_GOAL_MAX_CONTINUATIONS", "3"))
 LLM_USAGE_ARTIFACT = "llm_usage.json"
 
@@ -477,13 +483,22 @@ class AgentLoop:
         """
         self._cancel_event.set()
 
-    def run(self, user_message: str, history: Optional[List[Dict[str, Any]]] = None, session_id: str = "") -> Dict[str, Any]:
+    def run(
+        self,
+        user_message: str,
+        history: Optional[List[Dict[str, Any]]] = None,
+        session_id: str = "",
+        deadline: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """Run the ReAct loop synchronously.
 
         Args:
             user_message: User message.
             history: Prior conversation messages.
             session_id: Session ID.
+            deadline: Absolute ``time.monotonic()`` instant to finalize by.
+                Defaults to the deadline bound in the ambient budget context
+                (set by SessionService from the caller's ``deadline_s``).
 
         Returns:
             Execution result dict.
@@ -494,6 +509,14 @@ class AgentLoop:
         self._previous_summary = ""
         self._stats = _new_run_stats()
         run_t0 = _time.perf_counter()
+        _fetch_stats.start_collect()
+        if deadline is None:
+            deadline = _budget.get_deadline()
+        else:
+            _budget.bind_deadline(deadline)
+        budget_total_s = (
+            max(0.0, deadline - _time.monotonic()) if deadline is not None else None
+        )
 
         state_store = RunStateStore()
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
@@ -548,6 +571,8 @@ class AgentLoop:
         goal_continuations = 0
         goal_last_progress: tuple[int, int] | None = None
         wrap_up_at = max(1, int(self.max_iterations * 0.8))
+        budget_nudged = False
+        force_final = False
 
         try:
             while iteration < self.max_iterations:
@@ -600,6 +625,57 @@ class AgentLoop:
                         ),
                     })
 
+                # Batch 3 — wall-clock budget management. Two escalations:
+                # (a) <25% of the budget left → one wrap-up nudge, independent
+                #     of the iteration counter (which fires far too late when
+                #     iterations are slow);
+                # (b) not enough time left for another full iteration → force
+                #     the final text answer NOW, before the caller times out.
+                remaining_s = (
+                    deadline - _time.monotonic() if deadline is not None else None
+                )
+                if remaining_s is not None and iteration > 1:
+                    avg_iter_s = (_time.perf_counter() - run_t0) / max(1, iteration - 1)
+                    if remaining_s < max(FINALIZE_RESERVE_S, avg_iter_s * 1.2):
+                        force_final = True
+                        self._stats["early_finalize"] = True
+                        trace.write(
+                            {
+                                "type": "early_finalize",
+                                "iter": current_iter,
+                                "remaining_s": round(remaining_s, 1),
+                                "avg_iter_s": round(avg_iter_s, 1),
+                            }
+                        )
+                        self._emit(
+                            "early_finalize",
+                            {"iter": current_iter, "remaining_s": round(remaining_s, 1)},
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "[SYSTEM] The time budget for this request is nearly "
+                                "exhausted. Stop all tool use and give your final answer "
+                                "NOW based on the material you already gathered. State "
+                                "explicitly which parts are incomplete or unverified."
+                            ),
+                        })
+                    elif (
+                        not budget_nudged
+                        and budget_total_s
+                        and remaining_s / budget_total_s < 0.25
+                    ):
+                        budget_nudged = True
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"[SYSTEM] Less than 25% of the time budget remains "
+                                f"(~{int(remaining_s)}s). Prioritize concluding: avoid "
+                                "new lines of investigation, finish with the data you "
+                                "have, and prepare your final answer."
+                            ),
+                        })
+
                 # Streaming output + collect thinking text
                 thinking_chunks: List[str] = []
                 reasoning_chars = 0
@@ -629,8 +705,9 @@ class AgentLoop:
                         {"iter": current_iter, "chars": reasoning_chars},
                     )
 
-                # On last iteration, drop tool definitions to force text output
-                is_last_iteration = (iteration == self.max_iterations)
+                # On the last iteration (or a deadline-driven early finalize),
+                # drop tool definitions to force text output.
+                is_last_iteration = (iteration == self.max_iterations) or force_final
                 tool_defs = None if is_last_iteration else self.registry.get_definitions()
                 if is_last_iteration:
                     trace.write({"type": "forced_text_only", "iter": current_iter})
@@ -977,9 +1054,15 @@ class AgentLoop:
             "tools": tools,
             "data_fetches": [],
             "data_gaps": [],
+            "early_finalize": bool(self._stats.get("early_finalize")),
             "model": getattr(self.llm, "model_name", None)
             or os.getenv("LANGCHAIN_MODEL_NAME", ""),
         }
+        collector = _fetch_stats.current()
+        if collector is not None:
+            fetches, gaps = collector.snapshot()
+            stats["data_fetches"] = fetches
+            stats["data_gaps"] = gaps
         if reason:
             stats["reason"] = str(reason)[:500]
         try:
@@ -1221,6 +1304,10 @@ class AgentLoop:
 
         t0 = _time.perf_counter()
         timeout = TOOL_TIMEOUT_SECONDS if TOOL_TIMEOUT_SECONDS > 0 else None
+        if timeout is not None:
+            # Never let a single tool outlive the attempt budget (batch 3):
+            # keep a reserve so the loop can still produce a final answer.
+            timeout = _budget.cap_timeout(timeout, reserve_s=45.0, floor_s=10.0)
         timeout_label = _format_timeout(timeout) if timeout is not None else ""
 
         def _elapsed_ms() -> int:

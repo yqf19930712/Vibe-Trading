@@ -1,0 +1,896 @@
+{"ts": "2026-08-24T04:33:33.150660Z", "level": "INFO", "logger": "src.providers.llm", "msg": "dotenv resolved from <AGENT_DIR>/.env | provider=openai model=claude-opus-4-8 base=https://sub2api.laicai8.co"}
+{"ts": "2026-08-24T04:33:34.837772Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/alpha/compare/dddd4444/stream \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:33:34.842635Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/alpha/compare/abcdef123456/stream \"HTTP/1.1 404 Not Found\""}
+{"ts": "2026-08-24T04:33:34.844926Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/alpha/compare/bad@id/stream \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:33:34.847481Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:33:34.847736Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:33:34.858486Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/live/status \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:33:34.860749Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/live/status?broker=Robinhood+ \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:33:34.863121Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/live/status?broker=+++ \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:33:34.865080Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/live/status?broker=robinhood \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:33:34.867211Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/authorize \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:33:34.869160Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/authorize \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:33:34.871157Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/start \"HTTP/1.1 409 Conflict\""}
+{"ts": "2026-08-24T04:33:34.873036Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/start \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:33:34.874190Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=robinhood, by=test): safety"}
+{"ts": "2026-08-24T04:33:34.875499Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/start \"HTTP/1.1 409 Conflict\""}
+{"ts": "2026-08-24T04:33:34.877458Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/start \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:33:34.878517Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/start \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:33:34.881301Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/stop \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:33:34.884778Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/stop \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:33:34.893711Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/start \"HTTP/1.1 503 Service Unavailable\""}
+{"ts": "2026-08-24T04:33:34.929438Z", "level": "WARNING", "logger": "backtest.loaders.base", "msg": "invalid CCXT_TIMEOUT_MS='abc', using default 15000"}
+{"ts": "2026-08-24T04:33:34.929533Z", "level": "WARNING", "logger": "backtest.loaders.base", "msg": "invalid CCXT_FETCH_BUDGET_S='nope', using default 60.0"}
+{"ts": "2026-08-24T04:33:35.085924Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): cli live halt"}
+{"ts": "2026-08-24T04:33:35.086981Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=robinhood, by=cli): cli live halt"}
+{"ts": "2026-08-24T04:33:35.087922Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): cli live halt"}
+{"ts": "2026-08-24T04:33:35.088174Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch cleared (broker=*)"}
+{"ts": "2026-08-24T04:33:35.091482Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=robinhood, by=cli): cli live halt"}
+{"ts": "2026-08-24T04:33:35.092579Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=robinhood, by=cli): cli live halt"}
+{"ts": "2026-08-24T04:33:35.092848Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch cleared (broker=robinhood)"}
+{"ts": "2026-08-24T04:33:35.096955Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): cli live halt"}
+{"ts": "2026-08-24T04:33:35.114846Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): repl turn: 停"}
+{"ts": "2026-08-24T04:33:35.115820Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): repl turn: 停"}
+{"ts": "2026-08-24T04:33:35.175618Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): test"}
+{"ts": "2026-08-24T04:33:35.175737Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch cleared (broker=*)"}
+{"ts": "2026-08-24T04:33:35.194795Z", "level": "WARNING", "logger": "src.live.mandate.commit", "msg": "live mandate committed (broker=robinhood, mandate_id=mandate_ff81177faaac466e8e73d5447991c348, consent=cr_5f3f58339a534280b2bc5006ad40edc2, ordinal=2)"}
+{"ts": "2026-08-24T04:33:35.196180Z", "level": "WARNING", "logger": "src.live.mandate.commit", "msg": "live mandate committed (broker=robinhood, mandate_id=mandate_52842eb55a5343a09294a8ee276004e8, consent=cr_0c0303514bde4e32b92bfde799e01a94, ordinal=1)"}
+{"ts": "2026-08-24T04:33:35.202057Z", "level": "WARNING", "logger": "src.live.mandate.commit", "msg": "live mandate committed (broker=robinhood, mandate_id=mandate_06d1385b0cdb49868f4169656c05ba27, consent=cr_4eecd8fed53c4aa380b9a66e31e25db5, ordinal=3)"}
+{"ts": "2026-08-24T04:33:35.204313Z", "level": "WARNING", "logger": "src.live.mandate.commit", "msg": "live mandate committed (broker=robinhood, mandate_id=mandate_9061dcf918f14913a3c2780ec1e98f93, consent=cr_9298db8cc20c46dbbdf77b1d05b63b7f, ordinal=3)"}
+{"ts": "2026-08-24T04:33:35.207287Z", "level": "WARNING", "logger": "src.live.mandate.commit", "msg": "live mandate committed (broker=robinhood, mandate_id=mandate_060284b30bc84905840a42d68ac39d3c, consent=cr_b9e7c65fe7ee4b1ab39f48c63e96caa3, ordinal=1)"}
+{"ts": "2026-08-24T04:33:35.210206Z", "level": "WARNING", "logger": "src.live.mandate.commit", "msg": "live mandate committed (broker=robinhood, mandate_id=mandate_ed5d4b6b0f21487599ed17945d750229, consent=cr_5f08ba8ffd7f4bcd970315b3fd395199, ordinal=2)"}
+{"ts": "2026-08-24T04:33:35.211477Z", "level": "WARNING", "logger": "src.live.mandate.commit", "msg": "live mandate committed (broker=robinhood, mandate_id=mandate_26a3a2b75f214f9db78b4430ada73f21, consent=cr_89328f72572344f9b5a97641dcef04af, ordinal=1)"}
+{"ts": "2026-08-24T04:33:35.212677Z", "level": "WARNING", "logger": "src.live.mandate.commit", "msg": "live mandate committed (broker=robinhood, mandate_id=mandate_ed0e1be019054c0b9cd7808ba6778c8e, consent=cr_0daf2316a3544f24ba94fbcfdda57fa7, ordinal=1)"}
+{"ts": "2026-08-24T04:33:35.259155Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:33:35.259315Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:33:35.541359Z", "level": "INFO", "logger": "src.providers.llm", "msg": "dotenv resolved from <TEST_SLOT> | provider=openai model=claude-opus-4-8 base=https://sub2api.laicai8.co"}
+{"ts": "2026-08-24T04:33:35.542266Z", "level": "INFO", "logger": "src.providers.llm", "msg": "dotenv resolved from none (no .env file found) | provider=openai model=claude-opus-4-8 base=https://sub2api.laicai8.co"}
+{"ts": "2026-08-24T04:33:35.542935Z", "level": "INFO", "logger": "src.providers.llm", "msg": "dotenv resolved from none (no .env file found) | provider=openai model=claude-opus-4-8 base=https://example.com:8443"}
+{"ts": "2026-08-24T04:33:35.543538Z", "level": "INFO", "logger": "src.providers.llm", "msg": "dotenv resolved from none (no .env file found) | provider=openai model=claude-opus-4-8 base=https://sub2api.laicai8.co"}
+{"ts": "2026-08-24T04:33:35.668261Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Symbols dropped (no usable price data): ['BAD']"}
+{"ts": "2026-08-24T04:33:35.669509Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Symbols dropped (no usable price data): ['X']"}
+{"ts": "2026-08-24T04:33:35.671458Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-01 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:33:35.671583Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-02 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:33:35.671677Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-03 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:33:35.671784Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-06 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:33:35.671898Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-07 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:33:35.672004Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-08 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:33:35.672113Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-09 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:33:35.672226Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-10 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:33:35.672338Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-13 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:33:35.672446Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-14 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:33:35.699303Z", "level": "ERROR", "logger": "src.swarm.runtime", "msg": "Run r failed with exception", "exc": "Traceback (most recent call last):\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/src/swarm/runtime.py\", line 278, in _execute_run\n    layer_results = self._execute_layer(\n                    ^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/tests/test_error_path_redaction.py\", line 116, in boom\n    raise RuntimeError(f\"fatal: config missing under {_ABS_LEAK}/.venvs/cfg\")\nRuntimeError: fatal: config missing under /Users/yangqinfeng/.venvs/cfg"}
+{"ts": "2026-08-24T04:33:35.745609Z", "level": "WARNING", "logger": "backtest.loaders.futu", "msg": "Futu returned error for HK.00700: error message"}
+{"ts": "2026-08-24T04:33:39.332553Z", "level": "ERROR", "logger": "src.market_data", "msg": "market-data loader failed", "source": "yfinance", "symbols": ["AAA.US", "BBB.US"], "error": "RuntimeError: simulated loader blow-up", "exc": "Traceback (most recent call last):\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/src/market_data.py\", line 109, in _fetch_via\n    data_map = loader.fetch(src_codes, start_date, end_date, interval=interval) or {}\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/tests/test_get_market_data_unresolved.py\", line 51, in fetch\n    raise RuntimeError(\"simulated loader blow-up\")\nRuntimeError: simulated loader blow-up"}
+{"ts": "2026-08-24T04:34:23.023186Z", "level": "ERROR", "logger": "src.market_data", "msg": "market-data loader failed", "source": "yfinance", "symbols": ["AAA.US", "BBB.US"], "error": "RuntimeError: simulated loader blow-up", "exc": "Traceback (most recent call last):\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/src/market_data.py\", line 109, in _fetch_via\n    data_map = loader.fetch(src_codes, start_date, end_date, interval=interval) or {}\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/tests/test_get_market_data_unresolved.py\", line 51, in fetch\n    raise RuntimeError(\"simulated loader blow-up\")\nRuntimeError: simulated loader blow-up"}
+{"ts": "2026-08-24T04:34:38.263639Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:34:38.267930Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/685ff9298e2e/goal \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:34:38.270948Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:34:38.274651Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/4c644d0118e9/goal \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:34:38.277462Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/4c644d0118e9/goal/evidence \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:34:38.280065Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PATCH http://testserver/sessions/4c644d0118e9/goal/status \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:38.282475Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:34:38.285002Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/c1a1a89541f9/goal \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:34:38.286369Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PATCH http://testserver/sessions/c1a1a89541f9/goal/status \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:38.287448Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/c1a1a89541f9/goal \"HTTP/1.1 404 Not Found\""}
+{"ts": "2026-08-24T04:34:38.290126Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:34:38.292668Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/b8859330ca3b/goal \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:34:38.294307Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PATCH http://testserver/sessions/b8859330ca3b/goal \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:38.378341Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:38.378746Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:38.398217Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:38.398323Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:38.408029Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): user said stop"}
+{"ts": "2026-08-24T04:34:38.408195Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch cleared (broker=*)"}
+{"ts": "2026-08-24T04:34:38.409099Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=robinhood, by=frontend): halt one broker"}
+{"ts": "2026-08-24T04:34:38.409221Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch cleared (broker=robinhood)"}
+{"ts": "2026-08-24T04:34:38.410027Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=robinhood, by=cli): broker only"}
+{"ts": "2026-08-24T04:34:38.410164Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): global"}
+{"ts": "2026-08-24T04:34:38.410218Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch cleared (broker=*)"}
+{"ts": "2026-08-24T04:34:38.412875Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): first"}
+{"ts": "2026-08-24T04:34:38.413030Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=frontend): second"}
+{"ts": "2026-08-24T04:34:38.413672Z", "level": "WARNING", "logger": "src.live.halt", "msg": "halt observed for broker=robinhood but no preemptive action registered (cooperative gate still blocks future orders)"}
+{"ts": "2026-08-24T04:34:38.414273Z", "level": "WARNING", "logger": "src.live.halt", "msg": "running preemptive halt action for broker=robinhood"}
+{"ts": "2026-08-24T04:34:38.414922Z", "level": "WARNING", "logger": "src.live.halt", "msg": "running preemptive halt action for broker=robinhood"}
+{"ts": "2026-08-24T04:34:38.414955Z", "level": "WARNING", "logger": "src.live.halt", "msg": "running preemptive halt action for broker=alpaca"}
+{"ts": "2026-08-24T04:34:38.415541Z", "level": "WARNING", "logger": "src.live.halt", "msg": "halt observed for broker=robinhood but no preemptive action registered (cooperative gate still blocks future orders)"}
+{"ts": "2026-08-24T04:34:38.416136Z", "level": "WARNING", "logger": "src.live.halt", "msg": "running preemptive halt action for broker=robinhood"}
+{"ts": "2026-08-24T04:34:38.416769Z", "level": "WARNING", "logger": "src.live.halt", "msg": "running preemptive halt action for broker=robinhood"}
+{"ts": "2026-08-24T04:34:38.434568Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=file): test halt"}
+{"ts": "2026-08-24T04:34:38.435750Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=robinhood, by=cli): broker halt"}
+{"ts": "2026-08-24T04:34:38.436823Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=file): test halt"}
+{"ts": "2026-08-24T04:34:38.673936Z", "level": "WARNING", "logger": "backtest.loaders.base", "msg": "loader cache read failed for ca18b6478d2c7dffa346d7f98305f81edf4a28adbd1871d7bc201012ff25cb86.parquet: invalid load key, 'n'."}
+{"ts": "2026-08-24T04:34:38.811719Z", "level": "WARNING", "logger": "src.live.mandate.store", "msg": "live mandate for robinhood is unreadable/invalid JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)"}
+{"ts": "2026-08-24T04:34:38.812665Z", "level": "WARNING", "logger": "src.live.mandate.store", "msg": "live mandate for robinhood failed structural validation: 'hard_caps'"}
+{"ts": "2026-08-24T04:34:38.814967Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:38.815063Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:38.989507Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo-bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_db7329d5_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:34:38.989609Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo_bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_5d5f20e7_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:34:38.989647Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo_bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_5d5f20e7_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:34:38.989678Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo-bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_db7329d5_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:34:38.989978Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo-bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_db7329d5_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:34:38.990018Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo_bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_5d5f20e7_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:34:38.992899Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Disambiguated MCP tool name collision: price quote -> mcp_demo_price_quote_0e3c5d8c"}
+{"ts": "2026-08-24T04:34:38.993242Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Retrying MCP operation list_tools for server demo after transient failure: Connection closed"}
+{"ts": "2026-08-24T04:34:39.000890Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:39.001009Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:39.004619Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:39.004691Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:39.008439Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:39.008547Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:40.851982Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:40.852437Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:40.865186Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://127.0.0.1:49668/sse \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:40.867462Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49668/messages/?session_id=bf690bfb3419400e806ce6bfaa3a9d84 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:40.869135Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49668/messages/?session_id=bf690bfb3419400e806ce6bfaa3a9d84 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:40.869858Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49668/messages/?session_id=bf690bfb3419400e806ce6bfaa3a9d84 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:40.871956Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'fake_sse'"}
+{"ts": "2026-08-24T04:34:41.501263Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:41.501563Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:41.511736Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://127.0.0.1:49673/sse \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:41.513513Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49673/messages/?session_id=6294c6c7103a4e12ae9cc792770cf956 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:41.514675Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49673/messages/?session_id=6294c6c7103a4e12ae9cc792770cf956 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:41.515279Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49673/messages/?session_id=6294c6c7103a4e12ae9cc792770cf956 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:41.517098Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'fake_sse'"}
+{"ts": "2026-08-24T04:34:41.521250Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://127.0.0.1:49673/sse \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:41.522277Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49673/messages/?session_id=242556e4be4041d9b6661b0c8bdf5021 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:41.523528Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49673/messages/?session_id=242556e4be4041d9b6661b0c8bdf5021 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:41.524233Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49673/messages/?session_id=242556e4be4041d9b6661b0c8bdf5021 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:41.526216Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49673/messages/?session_id=242556e4be4041d9b6661b0c8bdf5021 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:42.092999Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:42.093291Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:42.209592Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://127.0.0.1:49681/sse \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:42.211120Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49681/messages/?session_id=ecab51bed18246d097df03c3d1feb2df \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:42.212272Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49681/messages/?session_id=ecab51bed18246d097df03c3d1feb2df \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:42.212806Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49681/messages/?session_id=ecab51bed18246d097df03c3d1feb2df \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:42.214490Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'fake_sse'"}
+{"ts": "2026-08-24T04:34:42.399708Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:42.399909Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:42.792794Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'fake'"}
+{"ts": "2026-08-24T04:34:42.794694Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:42.794832Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:43.170676Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'fake'"}
+{"ts": "2026-08-24T04:34:43.543828Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:43.544022Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:43.917030Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'fake'"}
+{"ts": "2026-08-24T04:34:44.291268Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:44.291559Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:44.667165Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'fake'"}
+{"ts": "2026-08-24T04:34:44.669340Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:44.669526Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:45.045116Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'fake'"}
+{"ts": "2026-08-24T04:34:45.047120Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:45.047286Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:45.056758Z", "level": "WARNING", "logger": "src.tools", "msg": "Skipped MCP server 'bad-server': Client failed to connect: [Errno 2] No such file or directory: '/this/binary/does/not/exist'"}
+{"ts": "2026-08-24T04:34:45.386754Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:45.386999Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:45.397375Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49695/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:45.397456Z", "level": "INFO", "logger": "mcp.client.streamable_http", "msg": "Received session ID: c2780b0346494985a91e8e8a29b323f8"}
+{"ts": "2026-08-24T04:34:45.397657Z", "level": "INFO", "logger": "mcp.client.streamable_http", "msg": "Negotiated protocol version: 2025-11-25"}
+{"ts": "2026-08-24T04:34:45.398856Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49695/mcp \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:45.399015Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://127.0.0.1:49695/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:45.399940Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49695/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:45.401954Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: DELETE http://127.0.0.1:49695/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:45.402532Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'fake_http'"}
+{"ts": "2026-08-24T04:34:45.983753Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:45.984091Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:45.997491Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49703/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:45.997580Z", "level": "INFO", "logger": "mcp.client.streamable_http", "msg": "Received session ID: eccccd1185e44e04b2d7dda3beb7776d"}
+{"ts": "2026-08-24T04:34:45.997788Z", "level": "INFO", "logger": "mcp.client.streamable_http", "msg": "Negotiated protocol version: 2025-11-25"}
+{"ts": "2026-08-24T04:34:45.999184Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49703/mcp \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:45.999497Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://127.0.0.1:49703/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:46.000293Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49703/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:46.002456Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: DELETE http://127.0.0.1:49703/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:46.003092Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'fake_http'"}
+{"ts": "2026-08-24T04:34:46.007377Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49703/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:46.007460Z", "level": "INFO", "logger": "mcp.client.streamable_http", "msg": "Received session ID: 078b69147ccd4b318e31bc3563da8d48"}
+{"ts": "2026-08-24T04:34:46.007647Z", "level": "INFO", "logger": "mcp.client.streamable_http", "msg": "Negotiated protocol version: 2025-11-25"}
+{"ts": "2026-08-24T04:34:46.009210Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49703/mcp \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:46.009391Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://127.0.0.1:49703/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:46.010351Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49703/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:46.012482Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49703/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:46.014170Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: DELETE http://127.0.0.1:49703/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:46.534366Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:46.534686Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:46.546229Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49717/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:46.546329Z", "level": "INFO", "logger": "mcp.client.streamable_http", "msg": "Received session ID: ef237867297e4b54961a78f00c55f607"}
+{"ts": "2026-08-24T04:34:46.546550Z", "level": "INFO", "logger": "mcp.client.streamable_http", "msg": "Negotiated protocol version: 2025-11-25"}
+{"ts": "2026-08-24T04:34:46.547788Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49717/mcp \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:34:46.547994Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://127.0.0.1:49717/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:46.548923Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49717/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:46.550958Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: DELETE http://127.0.0.1:49717/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:34:46.551558Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'fake_http'"}
+{"ts": "2026-08-24T04:34:46.731084Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:46.731401Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:54.608316Z", "level": "WARNING", "logger": "src.tools", "msg": "Skipped MCP server 'bad-http': Client failed to connect: All connection attempts failed"}
+{"ts": "2026-08-24T04:34:54.663055Z", "level": "WARNING", "logger": "backtest.loaders.mootdx_loader", "msg": "mootdx: 北交所 (835174.BJ) not supported upstream; use akshare/tushare"}
+{"ts": "2026-08-24T04:34:54.663179Z", "level": "WARNING", "logger": "backtest.loaders.mootdx_loader", "msg": "mootdx: 北交所 (832000) not supported upstream; use akshare/tushare"}
+{"ts": "2026-08-24T04:34:54.697186Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:54.697333Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:54.721199Z", "level": "WARNING", "logger": "backtest.loaders.base", "msg": "invalid OKX_TIMEOUT_S='abc', using default 15"}
+{"ts": "2026-08-24T04:34:54.721272Z", "level": "WARNING", "logger": "backtest.loaders.base", "msg": "invalid OKX_FETCH_BUDGET_S='nope', using default 60.0"}
+{"ts": "2026-08-24T04:34:56.190967Z", "level": "WARNING", "logger": "src.agent.progress", "msg": "HeartbeatTimer interval 0.01 clamped to 0.5s"}
+{"ts": "2026-08-24T04:34:56.193135Z", "level": "WARNING", "logger": "src.agent.progress", "msg": "HeartbeatTimer interval 0.01 clamped to 0.5s"}
+{"ts": "2026-08-24T04:34:56.195583Z", "level": "WARNING", "logger": "src.agent.progress", "msg": "HeartbeatTimer interval 0.3 clamped to 0.5s"}
+{"ts": "2026-08-24T04:34:56.966562Z", "level": "INFO", "logger": "src.providers.llm", "msg": "Forcing temperature=1.0 for kimi-k2.6 (provider requirement)"}
+{"ts": "2026-08-24T04:34:56.967913Z", "level": "INFO", "logger": "src.providers.llm", "msg": "Forcing temperature=1.0 for kimi-k2.6 (provider requirement)"}
+{"ts": "2026-08-24T04:34:56.968415Z", "level": "INFO", "logger": "src.providers.llm", "msg": "Forcing temperature=1.0 for kimi-k2.6 (provider requirement)"}
+{"ts": "2026-08-24T04:34:56.980370Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=robinhood, by=test): reg-time halt"}
+{"ts": "2026-08-24T04:34:56.981002Z", "level": "WARNING", "logger": "src.live.registry", "msg": "live kill switch tripped for broker 'robinhood' — omitting order tool 'place_order' from the registry"}
+{"ts": "2026-08-24T04:34:56.981106Z", "level": "WARNING", "logger": "src.live.registry", "msg": "live kill switch tripped for broker 'robinhood' — omitting order tool 'cancel_order' from the registry"}
+{"ts": "2026-08-24T04:34:56.989759Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:56.989872Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.001119Z", "level": "INFO", "logger": "src.agent.loop", "msg": "ReAct iteration 1/3"}
+{"ts": "2026-08-24T04:34:57.018054Z", "level": "WARNING", "logger": "backtest.loaders.registry", "msg": "fake_unavailable is unavailable, falling back to fake_available for market a_share"}
+{"ts": "2026-08-24T04:34:57.019045Z", "level": "WARNING", "logger": "backtest.loaders.registry", "msg": "fake_init_error is unavailable, falling back to fake_available for market a_share"}
+{"ts": "2026-08-24T04:34:57.019382Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.019491Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.023755Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.023836Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.028287Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.028404Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.031881Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'demo'"}
+{"ts": "2026-08-24T04:34:57.032599Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.032675Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.035956Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 3 MCP tool(s) from server 'alpha'"}
+{"ts": "2026-08-24T04:34:57.036330Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.036401Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.039477Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo-bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_db7329d5_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:34:57.039542Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo_bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_5d5f20e7_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:34:57.040217Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'foo-bar'"}
+{"ts": "2026-08-24T04:34:57.040374Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'foo_bar'"}
+{"ts": "2026-08-24T04:34:57.041003Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.041121Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.044479Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'srv'"}
+{"ts": "2026-08-24T04:34:57.047984Z", "level": "WARNING", "logger": "src.tools", "msg": "Skipped MCP server 'broken': connection refused"}
+{"ts": "2026-08-24T04:34:57.048620Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.048691Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.051872Z", "level": "WARNING", "logger": "src.tools", "msg": "Skipped MCP server 'broken': refused"}
+{"ts": "2026-08-24T04:34:57.051931Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'good'"}
+{"ts": "2026-08-24T04:34:57.052247Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.052311Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.055254Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.055314Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.059233Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.059314Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.062303Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo-bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_db7329d5_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:34:57.062358Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo_bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_5d5f20e7_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:34:57.062668Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'foo-bar'"}
+{"ts": "2026-08-24T04:34:57.062828Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'foo_bar'"}
+{"ts": "2026-08-24T04:34:57.063285Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.063355Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:34:57.066245Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'alpha'"}
+{"ts": "2026-08-24T04:34:57.069531Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo-bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_db7329d5_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:34:57.069586Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo_bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_5d5f20e7_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:34:57.111085Z", "level": "WARNING", "logger": "backtest.loaders.base", "msg": "non-positive RSSHUB_FETCH_BUDGET_S='0', using default 60.0"}
+{"ts": "2026-08-24T04:35:03.122810Z", "level": "WARNING", "logger": "backtest.loaders.rsshub_events", "msg": "RSSHub feed 'news' for AAA unreachable within 60s budget (https://rsshub.local/stock/news/AAA); no items contributed from this feed"}
+{"ts": "2026-08-24T04:35:03.127903Z", "level": "WARNING", "logger": "backtest.loaders.base", "msg": "invalid RSSHUB_TIMEOUT_S='not-a-float', using default 15.0"}
+{"ts": "2026-08-24T04:35:03.131600Z", "level": "WARNING", "logger": "backtest.loaders.base", "msg": "invalid RSSHUB_FETCH_BUDGET_S='not-a-float', using default 60.0"}
+{"ts": "2026-08-24T04:35:03.172603Z", "level": "WARNING", "logger": "src.live.runtime.flatten", "msg": "live preemptive sweep (broker=robinhood): cancel-only, flatten not permitted"}
+{"ts": "2026-08-24T04:35:03.176737Z", "level": "WARNING", "logger": "src.live.runtime.flatten", "msg": "live preemptive sweep (broker=robinhood): cancel-only, flatten not permitted"}
+{"ts": "2026-08-24T04:35:03.180210Z", "level": "WARNING", "logger": "src.live.runtime.flatten", "msg": "live preemptive sweep (broker=robinhood): cancel-only, flatten not permitted"}
+{"ts": "2026-08-24T04:35:03.191273Z", "level": "ERROR", "logger": "src.live.runtime.jobstore", "msg": "job store /private/var/folders/yw/sk6r8lz53vlcgxy8m3tlg0mm0000gn/T/pytest-of-yangqinfeng/pytest-5/test_corrupt_store_quarantined0/live/runtime/jobs.json corrupt (Expecting property name enclosed in double quotes: line 1 column 3 (char 2)) — quarantined to /private/var/folders/yw/sk6r8lz53vlcgxy8m3tlg0mm0000gn/T/pytest-of-yangqinfeng/pytest-5/test_corrupt_store_quarantined0/live/runtime/jobs.json.corrupt-20260824T043503191191Z"}
+{"ts": "2026-08-24T04:35:03.192555Z", "level": "ERROR", "logger": "src.live.runtime.jobstore", "msg": "job store /private/var/folders/yw/sk6r8lz53vlcgxy8m3tlg0mm0000gn/T/pytest-of-yangqinfeng/pytest-5/test_corrupt_wrong_shape_also_0/live/runtime/jobs.json corrupt (store 'jobs' is missing or not a list) — quarantined to /private/var/folders/yw/sk6r8lz53vlcgxy8m3tlg0mm0000gn/T/pytest-of-yangqinfeng/pytest-5/test_corrupt_wrong_shape_also_0/live/runtime/jobs.json.corrupt-20260824T043503192483Z"}
+{"ts": "2026-08-24T04:35:03.193717Z", "level": "ERROR", "logger": "src.live.runtime.jobstore", "msg": "job store /private/var/folders/yw/sk6r8lz53vlcgxy8m3tlg0mm0000gn/T/pytest-of-yangqinfeng/pytest-5/test_corrupt_bad_job_field_ref0/live/runtime/jobs.json corrupt (job 'next_run_at' must be an int (epoch ms)) — quarantined to /private/var/folders/yw/sk6r8lz53vlcgxy8m3tlg0mm0000gn/T/pytest-of-yangqinfeng/pytest-5/test_corrupt_bad_job_field_ref0/live/runtime/jobs.json.corrupt-20260824T043503193652Z"}
+{"ts": "2026-08-24T04:35:03.204711Z", "level": "WARNING", "logger": "src.live.runtime.liveness", "msg": "reaped stale live runner heartbeat: stale"}
+{"ts": "2026-08-24T04:35:03.208091Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:35:03.209464Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:35:03.210673Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:35:03.210751Z", "level": "WARNING", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): UNSAFE — 1 halting delta(s); state NOT advanced"}
+{"ts": "2026-08-24T04:35:03.211717Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:35:03.211786Z", "level": "WARNING", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): UNSAFE — 1 halting delta(s); state NOT advanced"}
+{"ts": "2026-08-24T04:35:03.212881Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:35:03.214198Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:35:03.214278Z", "level": "WARNING", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): UNSAFE — 1 halting delta(s); state NOT advanced"}
+{"ts": "2026-08-24T04:35:03.215377Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:35:03.216364Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:35:03.217674Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:35:03.217740Z", "level": "WARNING", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): UNSAFE — 1 halting delta(s); state NOT advanced"}
+{"ts": "2026-08-24T04:35:03.218741Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:35:03.218852Z", "level": "WARNING", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): runtime_state.json unreadable (Expecting property name enclosed in double quotes: line 1 column 2 (char 1)); renamed to runtime_state.json.corrupt-1787546103, cold start"}
+{"ts": "2026-08-24T04:35:03.223721Z", "level": "WARNING", "logger": "src.live.runtime.runner", "msg": "live reconcile unsafe for robinhood — aborting tick"}
+{"ts": "2026-08-24T04:35:03.224531Z", "level": "WARNING", "logger": "src.live.runtime.runner", "msg": "live reconcile failed for robinhood: broker read timeout"}
+{"ts": "2026-08-24T04:35:03.225076Z", "level": "ERROR", "logger": "src.live.runtime.runner", "msg": "live agent invocation failed for robinhood", "exc": "Traceback (most recent call last):\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/src/live/runtime/runner.py\", line 500, in _invoke_and_audit\n    result = await self._agent_caller(self._session_id, prompt)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/tests/test_runtime_runner.py\", line 317, in _boom\n    raise RuntimeError(\"agent crashed\")\nRuntimeError: agent crashed"}
+{"ts": "2026-08-24T04:35:03.227120Z", "level": "INFO", "logger": "src.live.runtime.runner", "msg": "live runner started for robinhood with 1 job(s)"}
+{"ts": "2026-08-24T04:35:03.227351Z", "level": "WARNING", "logger": "src.live.runtime.runner", "msg": "live runner not starting for robinhood: no mandate"}
+{"ts": "2026-08-24T04:35:03.227606Z", "level": "WARNING", "logger": "src.live.runtime.runner", "msg": "live runner not starting for robinhood: mandate expired"}
+{"ts": "2026-08-24T04:35:03.228064Z", "level": "INFO", "logger": "src.live.runtime.runner", "msg": "live runner started for robinhood with 2 job(s)"}
+{"ts": "2026-08-24T04:35:03.228294Z", "level": "INFO", "logger": "src.live.runtime.runner", "msg": "live runner started for robinhood with 1 job(s)"}
+{"ts": "2026-08-24T04:35:03.228513Z", "level": "INFO", "logger": "src.live.runtime.runner", "msg": "live runner started for robinhood with 1 job(s)"}
+{"ts": "2026-08-24T04:35:03.228736Z", "level": "INFO", "logger": "src.live.runtime.runner", "msg": "live runner started for robinhood with 1 job(s)"}
+{"ts": "2026-08-24T04:35:03.233273Z", "level": "ERROR", "logger": "src.live.runtime.scheduler", "msg": "live scheduler on_fire failed for job bad", "exc": "Traceback (most recent call last):\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/src/live/runtime/scheduler.py\", line 321, in _fire_due\n    await self._on_fire(job)\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/tests/test_runtime_scheduler.py\", line 154, in on_fire\n    raise RuntimeError(\"boom\")\nRuntimeError: boom"}
+{"ts": "2026-08-24T04:35:03.266952Z", "level": "WARNING", "logger": "src.live.sdk_order_gate", "msg": "live place_order raised for alpaca: sdk boom"}
+{"ts": "2026-08-24T04:35:03.272222Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:35:03.273553Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/abcdef012345/goal \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:35:03.274656Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/abcdef012345/goal \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:35:03.275600Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/abcdef012345/goal/evidence \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:35:03.277425Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:35:03.279348Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs \"HTTP/1.1 401 Unauthorized\""}
+{"ts": "2026-08-24T04:35:03.280251Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions \"HTTP/1.1 401 Unauthorized\""}
+{"ts": "2026-08-24T04:35:03.280997Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/abcdef012345/goal \"HTTP/1.1 401 Unauthorized\""}
+{"ts": "2026-08-24T04:35:03.281925Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/swarm/runs \"HTTP/1.1 401 Unauthorized\""}
+{"ts": "2026-08-24T04:35:03.286747Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.288544Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.289371Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs \"HTTP/1.1 401 Unauthorized\""}
+{"ts": "2026-08-24T04:35:03.291004Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.292716Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PUT http://testserver/settings/llm \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:35:03.294983Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PUT http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.297261Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PUT http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.298170Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:35:03.299241Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs \"HTTP/1.1 401 Unauthorized\""}
+{"ts": "2026-08-24T04:35:03.300125Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/start \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:35:03.301722Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/start \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.303000Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/missing/events \"HTTP/1.1 401 Unauthorized\""}
+{"ts": "2026-08-24T04:35:03.304111Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/missing/events?api_key=secret \"HTTP/1.1 404 Not Found\""}
+{"ts": "2026-08-24T04:35:03.305666Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/swarm/runs \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:35:03.306594Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/abcdef012345/messages \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:35:03.308742Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/system/shutdown \"HTTP/1.1 401 Unauthorized\""}
+{"ts": "2026-08-24T04:35:03.309825Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/system/shutdown \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:35:03.311023Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/system/shutdown \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.316158Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/code \"HTTP/1.1 404 Not Found\""}
+{"ts": "2026-08-24T04:35:03.317267Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs/foo.bar/pine \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.318345Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs/foo%0A/pine \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.319472Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs/foo.bar \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.320667Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/foo.bar \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.321476Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: DELETE http://testserver/sessions/foo.bar \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.322490Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PATCH http://testserver/sessions/foo.bar \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.323535Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/foo.bar/messages \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.324729Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/foo.bar/messages \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.325622Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/foo.bar/cancel \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.326560Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/foo.bar/goal \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.327419Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/foo.bar/goal \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.328334Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/foo.bar/goal/evidence \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.329493Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/foo.bar/events \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.330611Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/swarm/runs/foo.bar \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.331549Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/swarm/runs/foo.bar/events \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.332364Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/swarm/runs/foo.bar/cancel \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.333234Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/swarm/runs/foo.bar/retry \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:03.334650Z", "level": "WARNING", "logger": "src.tools.web_search_tool", "msg": "web_search attempt 1/3 failed: temporary rate limit"}
+{"ts": "2026-08-24T04:35:03.649710Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.655243Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.660439Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.665632Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.670567Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PUT http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.674643Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/data-sources \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.678148Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.679395Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/data-sources \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.682253Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/llm \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:35:03.683394Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/data-sources \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:35:03.685935Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.687063Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.691086Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PUT http://testserver/settings/data-sources \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:03.693741Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PUT http://testserver/settings/data-sources \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:35:04.711973Z", "level": "INFO", "logger": "matplotlib.category", "msg": "Using categorical units to plot a list of strings that are all parsable as floats or dates. If these strings should be plotted as numbers, cast to the appropriate data type before plotting."}
+{"ts": "2026-08-24T04:35:04.712294Z", "level": "INFO", "logger": "matplotlib.category", "msg": "Using categorical units to plot a list of strings that are all parsable as floats or dates. If these strings should be plotted as numbers, cast to the appropriate data type before plotting."}
+{"ts": "2026-08-24T04:35:04.712449Z", "level": "INFO", "logger": "matplotlib.category", "msg": "Using categorical units to plot a list of strings that are all parsable as floats or dates. If these strings should be plotted as numbers, cast to the appropriate data type before plotting."}
+{"ts": "2026-08-24T04:35:04.900006Z", "level": "WARNING", "logger": "src.shadow_account.reporter", "msg": "weasyprint unavailable (cannot load library 'libgobject-2.0-0': dlopen(libgobject-2.0-0, 0x0002): tried: 'libgobject-2.0-0' (no such file), '/System/Volumes/Preboot/Cryptexes/OSlibgobject-2.0-0' (no such file), '/Users/yangqinfeng/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/libgobject-2.0-0' (no such file), '/usr/lib/libgobject-2.0-0' (no such file, not in dyld cache), 'libgobject-2.0-0' (no such file).  Additionally, ctypes.util.find_library() did not manage to locate a library called 'libgobject-2.0-0'); HTML-only output."}
+{"ts": "2026-08-24T04:35:04.920440Z", "level": "INFO", "logger": "matplotlib.category", "msg": "Using categorical units to plot a list of strings that are all parsable as floats or dates. If these strings should be plotted as numbers, cast to the appropriate data type before plotting."}
+{"ts": "2026-08-24T04:35:04.920699Z", "level": "INFO", "logger": "matplotlib.category", "msg": "Using categorical units to plot a list of strings that are all parsable as floats or dates. If these strings should be plotted as numbers, cast to the appropriate data type before plotting."}
+{"ts": "2026-08-24T04:35:04.920832Z", "level": "INFO", "logger": "matplotlib.category", "msg": "Using categorical units to plot a list of strings that are all parsable as floats or dates. If these strings should be plotted as numbers, cast to the appropriate data type before plotting."}
+{"ts": "2026-08-24T04:35:05.027676Z", "level": "WARNING", "logger": "src.shadow_account.reporter", "msg": "weasyprint unavailable (cannot load library 'libgobject-2.0-0': dlopen(libgobject-2.0-0, 0x0002): tried: 'libgobject-2.0-0' (no such file), '/System/Volumes/Preboot/Cryptexes/OSlibgobject-2.0-0' (no such file), '/Users/yangqinfeng/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/libgobject-2.0-0' (no such file), '/usr/lib/libgobject-2.0-0' (no such file, not in dyld cache), 'libgobject-2.0-0' (no such file).  Additionally, ctypes.util.find_library() did not manage to locate a library called 'libgobject-2.0-0'); HTML-only output."}
+{"ts": "2026-08-24T04:35:05.060287Z", "level": "WARNING", "logger": "src.shadow_account.reporter", "msg": "weasyprint unavailable (cannot load library 'libgobject-2.0-0': dlopen(libgobject-2.0-0, 0x0002): tried: 'libgobject-2.0-0' (no such file), '/System/Volumes/Preboot/Cryptexes/OSlibgobject-2.0-0' (no such file), '/Users/yangqinfeng/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/libgobject-2.0-0' (no such file), '/usr/lib/libgobject-2.0-0' (no such file, not in dyld cache), 'libgobject-2.0-0' (no such file).  Additionally, ctypes.util.find_library() did not manage to locate a library called 'libgobject-2.0-0'); HTML-only output."}
+{"ts": "2026-08-24T04:35:05.060901Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.061046Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.175776Z", "level": "ERROR", "logger": "src.swarm.runtime", "msg": "Worker for task t1 raised exception", "exc": "Traceback (most recent call last):\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/src/swarm/runtime.py\", line 601, in _execute_layer\n    results[tid] = future.result()\n                   ^^^^^^^^^^^^^^^\n  File \"/Users/yangqinfeng/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/concurrent/futures/_base.py\", line 449, in result\n    return self.__get_result()\n           ^^^^^^^^^^^^^^^^^^^\n  File \"/Users/yangqinfeng/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/concurrent/futures/_base.py\", line 401, in __get_result\n    raise self._exception\n  File \"/Users/yangqinfeng/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/concurrent/futures/thread.py\", line 59, in run\n    result = self.fn(*self.args, **self.kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/src/swarm/runtime.py\", line 694, in _run_worker_with_retries\n    result = run_worker(\n             ^^^^^^^^^^^\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/tests/test_swarm_error_surfacing.py\", line 89, in boom\n    raise RuntimeError(\"LANGCHAIN_MODEL_NAME is not set\")\nRuntimeError: LANGCHAIN_MODEL_NAME is not set"}
+{"ts": "2026-08-24T04:35:05.180846Z", "level": "INFO", "logger": "src.swarm.grounding", "msg": "grounding: no data returned for NOPE.US"}
+{"ts": "2026-08-24T04:35:05.181504Z", "level": "WARNING", "logger": "src.swarm.grounding", "msg": "grounding: invalid SWARM_GROUNDING_MAX_SYMBOLS='nope', using default 8"}
+{"ts": "2026-08-24T04:35:05.189362Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.189485Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.193689Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'kb'"}
+{"ts": "2026-08-24T04:35:05.197713Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'mcp_kb_search' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:35:05.201052Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'mcp_kb_search' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:35:05.201686Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.201757Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.204715Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'kb'"}
+{"ts": "2026-08-24T04:35:05.205068Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.205131Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.208916Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'kb'"}
+{"ts": "2026-08-24T04:35:05.209304Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo-bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_db7329d5_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:35:05.209357Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo_bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_5d5f20e7_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:35:05.209434Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo-bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_db7329d5_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:35:05.209467Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo_bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_5d5f20e7_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:35:05.209500Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.209564Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.212721Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'foo-bar'"}
+{"ts": "2026-08-24T04:35:05.213094Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.213163Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.216327Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.216392Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.227144Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.227238Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.231103Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'mcp_kb_search' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:35:05.236948Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.237032Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.240308Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'mcp_alpha_search' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:35:05.243944Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.244029Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.247068Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'mcp_beta_query' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:35:05.251681Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.251766Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.254892Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'mcp_kb_search' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:35:05.260060Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.260141Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:05.263228Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'mcp_kb_search' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:35:05.273158Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'mcp_attacker_evil_tool' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:35:05.792940Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'bash' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:35:11.144579Z", "level": "INFO", "logger": "src.tools.swarm_tool", "msg": "SwarmTool: resolved preset=demo, variables={'goal': 'analyze AAPL'} from prompt: analyze AAPL"}
+{"ts": "2026-08-24T04:35:11.144743Z", "level": "INFO", "logger": "src.tools.swarm_tool", "msg": "SwarmTool: started run r-web-chat (preset=demo)"}
+{"ts": "2026-08-24T04:35:11.145122Z", "level": "INFO", "logger": "src.tools.swarm_tool", "msg": "SwarmTool: resolved preset=demo, variables={'goal': 'analyze AAPL'} from prompt: analyze AAPL"}
+{"ts": "2026-08-24T04:35:11.145200Z", "level": "INFO", "logger": "src.tools.swarm_tool", "msg": "SwarmTool: started run r-no-session (preset=demo)"}
+{"ts": "2026-08-24T04:35:11.167165Z", "level": "WARNING", "logger": "src.swarm.worker", "msg": "Provider stream failed for agent=analyst task=t1 iteration=0 (provider=openrouter model=test-model); retrying once: provider_stream_error provider=openrouter model=test-model: ConnectionResetError: connection reset by peer"}
+{"ts": "2026-08-24T04:35:11.171461Z", "level": "WARNING", "logger": "src.swarm.worker", "msg": "Provider stream failed for agent=analyst task=t1 iteration=0 (provider=openrouter model=test-model); retrying once: provider_stream_error provider=openrouter model=test-model: ConnectionResetError: connection reset by peer"}
+{"ts": "2026-08-24T04:35:11.171582Z", "level": "WARNING", "logger": "src.swarm.worker", "msg": "LLM call failed at iteration 0: provider_stream_error provider=openrouter model=test-model: ConnectionResetError: connection reset by peer"}
+{"ts": "2026-08-24T04:35:11.175516Z", "level": "WARNING", "logger": "src.swarm.worker", "msg": "LLM call failed at iteration 0: boom"}
+{"ts": "2026-08-24T04:35:11.179581Z", "level": "WARNING", "logger": "src.swarm.worker", "msg": "LLM call failed at iteration 0: provider_stream_error provider=moonshot model=kimi-k2.6: Exception: invalid temperature: only 1 is allowed for this model"}
+{"ts": "2026-08-24T04:35:11.180039Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:11.180145Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:11.186785Z", "level": "WARNING", "logger": "src.agent.progress", "msg": "HeartbeatTimer interval 0.01 clamped to 0.5s"}
+{"ts": "2026-08-24T04:35:11.325576Z", "level": "WARNING", "logger": "src.agent.progress", "msg": "HeartbeatTimer interval 0.01 clamped to 0.5s"}
+{"ts": "2026-08-24T04:35:11.420995Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:11.421153Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:35:11.426229Z", "level": "INFO", "logger": "src.tools", "msg": "robinhood live connector is available through trading_* tools; broker-specific MCP wrappers are hidden from the agent registry"}
+{"ts": "2026-08-24T04:35:11.438648Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:11.441851Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:35:11.444332Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 413 Request Entity Too Large\""}
+{"ts": "2026-08-24T04:35:11.446721Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:11.448905Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 500 Internal Server Error\""}
+{"ts": "2026-08-24T04:35:11.451016Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:11.453001Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:11.455081Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:11.457455Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:11.459919Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:11.462098Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:35:11.513202Z", "level": "WARNING", "logger": "src.tools.web_reader_tool", "msg": "read_url upstream HTTP 451: ParamValidationError: bad input"}
+{"ts": "2026-08-24T04:35:11.513561Z", "level": "WARNING", "logger": "src.tools.web_reader_tool", "msg": "read_url request failed: boom: connect failed (10.0.0.1)"}
+{"ts": "2026-08-24T04:35:11.520126Z", "level": "WARNING", "logger": "src.tools.web_search_tool", "msg": "web_search attempt 1/3 failed: Ratelimit 202"}
+{"ts": "2026-08-24T04:35:11.520747Z", "level": "WARNING", "logger": "src.tools.web_search_tool", "msg": "web_search attempt 1/3 failed: Ratelimit 429"}
+{"ts": "2026-08-24T04:35:11.520796Z", "level": "WARNING", "logger": "src.tools.web_search_tool", "msg": "web_search attempt 2/3 failed: Ratelimit 429"}
+{"ts": "2026-08-24T04:35:11.520827Z", "level": "WARNING", "logger": "src.tools.web_search_tool", "msg": "web_search attempt 3/3 failed: Ratelimit 429"}
+{"ts": "2026-08-24T04:36:10.716342Z", "level": "INFO", "logger": "src.providers.llm", "msg": "dotenv resolved from <AGENT_DIR>/.env | provider=openai model=claude-opus-4-8 base=https://sub2api.laicai8.co"}
+{"ts": "2026-08-24T04:36:12.250953Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/alpha/compare/dddd4444/stream \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:12.255161Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/alpha/compare/abcdef123456/stream \"HTTP/1.1 404 Not Found\""}
+{"ts": "2026-08-24T04:36:12.257256Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/alpha/compare/bad@id/stream \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:12.260675Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:12.261102Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:12.271576Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/live/status \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:12.273798Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/live/status?broker=Robinhood+ \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:12.278177Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/live/status?broker=+++ \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:12.280644Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/live/status?broker=robinhood \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:12.283194Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/authorize \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:12.285281Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/authorize \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:12.287459Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/start \"HTTP/1.1 409 Conflict\""}
+{"ts": "2026-08-24T04:36:12.289434Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/start \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:12.290645Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=robinhood, by=test): safety"}
+{"ts": "2026-08-24T04:36:12.292808Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/start \"HTTP/1.1 409 Conflict\""}
+{"ts": "2026-08-24T04:36:12.295337Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/start \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:12.296446Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/start \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:12.298587Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/stop \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:12.300278Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/stop \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:12.306811Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/start \"HTTP/1.1 503 Service Unavailable\""}
+{"ts": "2026-08-24T04:36:12.351033Z", "level": "WARNING", "logger": "backtest.loaders.base", "msg": "invalid CCXT_TIMEOUT_MS='abc', using default 15000"}
+{"ts": "2026-08-24T04:36:12.351145Z", "level": "WARNING", "logger": "backtest.loaders.base", "msg": "invalid CCXT_FETCH_BUDGET_S='nope', using default 60.0"}
+{"ts": "2026-08-24T04:36:12.460189Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): cli live halt"}
+{"ts": "2026-08-24T04:36:12.461392Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=robinhood, by=cli): cli live halt"}
+{"ts": "2026-08-24T04:36:12.462458Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): cli live halt"}
+{"ts": "2026-08-24T04:36:12.462721Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch cleared (broker=*)"}
+{"ts": "2026-08-24T04:36:12.465479Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=robinhood, by=cli): cli live halt"}
+{"ts": "2026-08-24T04:36:12.467204Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=robinhood, by=cli): cli live halt"}
+{"ts": "2026-08-24T04:36:12.467555Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch cleared (broker=robinhood)"}
+{"ts": "2026-08-24T04:36:12.472152Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): cli live halt"}
+{"ts": "2026-08-24T04:36:12.492973Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): repl turn: 停"}
+{"ts": "2026-08-24T04:36:12.494198Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): repl turn: 停"}
+{"ts": "2026-08-24T04:36:12.562127Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): test"}
+{"ts": "2026-08-24T04:36:12.562290Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch cleared (broker=*)"}
+{"ts": "2026-08-24T04:36:12.583438Z", "level": "WARNING", "logger": "src.live.mandate.commit", "msg": "live mandate committed (broker=robinhood, mandate_id=mandate_9891a8b55616469f99ba2e56a2d0bdbb, consent=cr_0362aaa5630f42ac947d5099491e54f1, ordinal=2)"}
+{"ts": "2026-08-24T04:36:12.584796Z", "level": "WARNING", "logger": "src.live.mandate.commit", "msg": "live mandate committed (broker=robinhood, mandate_id=mandate_aa1e14e4b5de49649878a0663cf6bf49, consent=cr_c72c046fe5114921b9bb2bf47b039fc8, ordinal=1)"}
+{"ts": "2026-08-24T04:36:12.590512Z", "level": "WARNING", "logger": "src.live.mandate.commit", "msg": "live mandate committed (broker=robinhood, mandate_id=mandate_186a8e3ab8044405b9ba777539c1e9e3, consent=cr_8e0d6f8570d1423cb8c0948a40534272, ordinal=3)"}
+{"ts": "2026-08-24T04:36:12.594024Z", "level": "WARNING", "logger": "src.live.mandate.commit", "msg": "live mandate committed (broker=robinhood, mandate_id=mandate_8c1a82560f6c473a891b189f5c2d0913, consent=cr_6613176267834a52b51955e16f2230b8, ordinal=3)"}
+{"ts": "2026-08-24T04:36:12.597540Z", "level": "WARNING", "logger": "src.live.mandate.commit", "msg": "live mandate committed (broker=robinhood, mandate_id=mandate_931009cb78d34e76ad012cd8c029b448, consent=cr_141e8df235a34c3587cd32107c7d4a3e, ordinal=1)"}
+{"ts": "2026-08-24T04:36:12.600350Z", "level": "WARNING", "logger": "src.live.mandate.commit", "msg": "live mandate committed (broker=robinhood, mandate_id=mandate_f3234decbb7143e3af30cdfc071d91fe, consent=cr_a4754ecf29c74bfba43ce8c580cf90b4, ordinal=2)"}
+{"ts": "2026-08-24T04:36:12.601684Z", "level": "WARNING", "logger": "src.live.mandate.commit", "msg": "live mandate committed (broker=robinhood, mandate_id=mandate_35c379dbf67749dab5534fba6649d100, consent=cr_eb9906537988484594757c450d788895, ordinal=1)"}
+{"ts": "2026-08-24T04:36:12.603136Z", "level": "WARNING", "logger": "src.live.mandate.commit", "msg": "live mandate committed (broker=robinhood, mandate_id=mandate_02b4f140cf82446c9ee73042bf22d998, consent=cr_fbcd56e6f244450d8be3741b2f2ab4aa, ordinal=1)"}
+{"ts": "2026-08-24T04:36:12.653331Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:12.653496Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:12.886084Z", "level": "INFO", "logger": "src.providers.llm", "msg": "dotenv resolved from <TEST_SLOT> | provider=openai model=claude-opus-4-8 base=https://sub2api.laicai8.co"}
+{"ts": "2026-08-24T04:36:12.886992Z", "level": "INFO", "logger": "src.providers.llm", "msg": "dotenv resolved from none (no .env file found) | provider=openai model=claude-opus-4-8 base=https://sub2api.laicai8.co"}
+{"ts": "2026-08-24T04:36:12.887621Z", "level": "INFO", "logger": "src.providers.llm", "msg": "dotenv resolved from none (no .env file found) | provider=openai model=claude-opus-4-8 base=https://example.com:8443"}
+{"ts": "2026-08-24T04:36:12.888214Z", "level": "INFO", "logger": "src.providers.llm", "msg": "dotenv resolved from none (no .env file found) | provider=openai model=claude-opus-4-8 base=https://sub2api.laicai8.co"}
+{"ts": "2026-08-24T04:36:13.026690Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Symbols dropped (no usable price data): ['BAD']"}
+{"ts": "2026-08-24T04:36:13.028123Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Symbols dropped (no usable price data): ['X']"}
+{"ts": "2026-08-24T04:36:13.030047Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-01 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:36:13.030186Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-02 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:36:13.030279Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-03 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:36:13.030389Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-06 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:36:13.030507Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-07 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:36:13.030611Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-08 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:36:13.030732Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-09 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:36:13.030844Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-10 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:36:13.030946Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-13 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:36:13.031045Z", "level": "WARNING", "logger": "backtest.engines.base", "msg": "Rebalance failed for BAD at 2025-01-14 00:00:00: Simulated failure for BAD"}
+{"ts": "2026-08-24T04:36:13.057726Z", "level": "ERROR", "logger": "src.swarm.runtime", "msg": "Run r failed with exception", "exc": "Traceback (most recent call last):\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/src/swarm/runtime.py\", line 278, in _execute_run\n    layer_results = self._execute_layer(\n                    ^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/tests/test_error_path_redaction.py\", line 116, in boom\n    raise RuntimeError(f\"fatal: config missing under {_ABS_LEAK}/.venvs/cfg\")\nRuntimeError: fatal: config missing under /Users/yangqinfeng/.venvs/cfg"}
+{"ts": "2026-08-24T04:36:13.102539Z", "level": "WARNING", "logger": "backtest.loaders.futu", "msg": "Futu returned error for HK.00700: error message"}
+{"ts": "2026-08-24T04:36:13.119353Z", "level": "ERROR", "logger": "src.market_data", "msg": "market-data loader 'yfinance' failed for ['AAA.US', 'BBB.US']; codes fall through to _unresolved", "exc": "Traceback (most recent call last):\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/src/market_data.py\", line 96, in fetch_market_data\n    data_map = loader.fetch(src_codes, start_date, end_date, interval=interval)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/tests/test_get_market_data_unresolved.py\", line 51, in fetch\n    raise RuntimeError(\"simulated loader blow-up\")\nRuntimeError: simulated loader blow-up"}
+{"ts": "2026-08-24T04:36:13.121279Z", "level": "ERROR", "logger": "src.market_data", "msg": "market-data loader 'yfinance' failed for ['AAA.US', 'BBB.US']; codes fall through to _unresolved", "exc": "Traceback (most recent call last):\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/src/market_data.py\", line 96, in fetch_market_data\n    data_map = loader.fetch(src_codes, start_date, end_date, interval=interval)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/tests/test_get_market_data_unresolved.py\", line 51, in fetch\n    raise RuntimeError(\"simulated loader blow-up\")\nRuntimeError: simulated loader blow-up"}
+{"ts": "2026-08-24T04:36:13.136267Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:36:13.138779Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/99842ac2d28b/goal \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:36:13.141358Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:36:13.144009Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/2735c3ea1334/goal \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:36:13.146003Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/2735c3ea1334/goal/evidence \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:36:13.147477Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PATCH http://testserver/sessions/2735c3ea1334/goal/status \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:13.149601Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:36:13.151637Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/7b2e95d55985/goal \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:36:13.152922Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PATCH http://testserver/sessions/7b2e95d55985/goal/status \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:13.153865Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/7b2e95d55985/goal \"HTTP/1.1 404 Not Found\""}
+{"ts": "2026-08-24T04:36:13.155738Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:36:13.158074Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/7935510b4ae4/goal \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:36:13.159582Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PATCH http://testserver/sessions/7935510b4ae4/goal \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:13.240496Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:13.240649Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:13.252374Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:13.252477Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:13.265688Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): user said stop"}
+{"ts": "2026-08-24T04:36:13.265837Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch cleared (broker=*)"}
+{"ts": "2026-08-24T04:36:13.266753Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=robinhood, by=frontend): halt one broker"}
+{"ts": "2026-08-24T04:36:13.266876Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch cleared (broker=robinhood)"}
+{"ts": "2026-08-24T04:36:13.267778Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=robinhood, by=cli): broker only"}
+{"ts": "2026-08-24T04:36:13.267949Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): global"}
+{"ts": "2026-08-24T04:36:13.268012Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch cleared (broker=*)"}
+{"ts": "2026-08-24T04:36:13.270855Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=cli): first"}
+{"ts": "2026-08-24T04:36:13.271046Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=frontend): second"}
+{"ts": "2026-08-24T04:36:13.271718Z", "level": "WARNING", "logger": "src.live.halt", "msg": "halt observed for broker=robinhood but no preemptive action registered (cooperative gate still blocks future orders)"}
+{"ts": "2026-08-24T04:36:13.272340Z", "level": "WARNING", "logger": "src.live.halt", "msg": "running preemptive halt action for broker=robinhood"}
+{"ts": "2026-08-24T04:36:13.272962Z", "level": "WARNING", "logger": "src.live.halt", "msg": "running preemptive halt action for broker=robinhood"}
+{"ts": "2026-08-24T04:36:13.272998Z", "level": "WARNING", "logger": "src.live.halt", "msg": "running preemptive halt action for broker=alpaca"}
+{"ts": "2026-08-24T04:36:13.273603Z", "level": "WARNING", "logger": "src.live.halt", "msg": "halt observed for broker=robinhood but no preemptive action registered (cooperative gate still blocks future orders)"}
+{"ts": "2026-08-24T04:36:13.274302Z", "level": "WARNING", "logger": "src.live.halt", "msg": "running preemptive halt action for broker=robinhood"}
+{"ts": "2026-08-24T04:36:13.275259Z", "level": "WARNING", "logger": "src.live.halt", "msg": "running preemptive halt action for broker=robinhood"}
+{"ts": "2026-08-24T04:36:13.288648Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=file): test halt"}
+{"ts": "2026-08-24T04:36:13.289734Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=robinhood, by=cli): broker halt"}
+{"ts": "2026-08-24T04:36:13.290790Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=*, by=file): test halt"}
+{"ts": "2026-08-24T04:36:13.576904Z", "level": "WARNING", "logger": "backtest.loaders.base", "msg": "loader cache read failed for ca18b6478d2c7dffa346d7f98305f81edf4a28adbd1871d7bc201012ff25cb86.parquet: invalid load key, 'n'."}
+{"ts": "2026-08-24T04:36:13.706274Z", "level": "WARNING", "logger": "src.live.mandate.store", "msg": "live mandate for robinhood is unreadable/invalid JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)"}
+{"ts": "2026-08-24T04:36:13.707218Z", "level": "WARNING", "logger": "src.live.mandate.store", "msg": "live mandate for robinhood failed structural validation: 'hard_caps'"}
+{"ts": "2026-08-24T04:36:13.711683Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:13.711832Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:13.901829Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo-bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_db7329d5_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:36:13.901939Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo_bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_5d5f20e7_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:36:13.901983Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo_bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_5d5f20e7_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:36:13.902009Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo-bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_db7329d5_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:36:13.902368Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo-bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_db7329d5_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:36:13.902433Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo_bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_5d5f20e7_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:36:13.905136Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Disambiguated MCP tool name collision: price quote -> mcp_demo_price_quote_0e3c5d8c"}
+{"ts": "2026-08-24T04:36:13.905455Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Retrying MCP operation list_tools for server demo after transient failure: Connection closed"}
+{"ts": "2026-08-24T04:36:13.914213Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:13.914376Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:13.918195Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:13.918287Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:13.921808Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:13.921888Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:15.870481Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:15.870810Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:15.880560Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://127.0.0.1:49873/sse \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:15.882572Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49873/messages/?session_id=028e6a6ea29241fe824b801ace5b6c81 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:15.884407Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49873/messages/?session_id=028e6a6ea29241fe824b801ace5b6c81 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:15.885045Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49873/messages/?session_id=028e6a6ea29241fe824b801ace5b6c81 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:15.887047Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'fake_sse'"}
+{"ts": "2026-08-24T04:36:16.453248Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:16.453548Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:16.463378Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://127.0.0.1:49879/sse \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:16.465050Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49879/messages/?session_id=ab4ff5a53db94cfca37c15a7b77096f5 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:16.466234Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49879/messages/?session_id=ab4ff5a53db94cfca37c15a7b77096f5 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:16.466839Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49879/messages/?session_id=ab4ff5a53db94cfca37c15a7b77096f5 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:16.468784Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'fake_sse'"}
+{"ts": "2026-08-24T04:36:16.472522Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://127.0.0.1:49879/sse \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:16.473666Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49879/messages/?session_id=b54b38bb6df3445991f64d49bc564212 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:16.475392Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49879/messages/?session_id=b54b38bb6df3445991f64d49bc564212 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:16.476010Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49879/messages/?session_id=b54b38bb6df3445991f64d49bc564212 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:16.477793Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49879/messages/?session_id=b54b38bb6df3445991f64d49bc564212 \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:17.052443Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:17.052776Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:17.062376Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://127.0.0.1:49887/sse \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:17.064158Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49887/messages/?session_id=a7d8a595351d44eba3ed89da311c32ee \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:17.065376Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49887/messages/?session_id=a7d8a595351d44eba3ed89da311c32ee \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:17.066118Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49887/messages/?session_id=a7d8a595351d44eba3ed89da311c32ee \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:17.068009Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'fake_sse'"}
+{"ts": "2026-08-24T04:36:17.250872Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:17.251104Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:17.806166Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'fake'"}
+{"ts": "2026-08-24T04:36:17.810118Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:17.810302Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:18.251742Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'fake'"}
+{"ts": "2026-08-24T04:36:18.643267Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:18.643495Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:19.086564Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'fake'"}
+{"ts": "2026-08-24T04:36:19.673123Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:19.673338Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:20.070953Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'fake'"}
+{"ts": "2026-08-24T04:36:20.073073Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:20.073240Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:20.459928Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'fake'"}
+{"ts": "2026-08-24T04:36:20.462088Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:20.462231Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:20.472049Z", "level": "WARNING", "logger": "src.tools", "msg": "Skipped MCP server 'bad-server': Client failed to connect: [Errno 2] No such file or directory: '/this/binary/does/not/exist'"}
+{"ts": "2026-08-24T04:36:20.812110Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:20.812517Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:20.825814Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49912/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:20.825998Z", "level": "INFO", "logger": "mcp.client.streamable_http", "msg": "Received session ID: 2ec1adea7e5b40d7bc607b83777db79c"}
+{"ts": "2026-08-24T04:36:20.826295Z", "level": "INFO", "logger": "mcp.client.streamable_http", "msg": "Negotiated protocol version: 2025-11-25"}
+{"ts": "2026-08-24T04:36:20.827684Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49912/mcp \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:20.827887Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://127.0.0.1:49912/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:20.828801Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49912/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:20.830934Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: DELETE http://127.0.0.1:49912/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:20.831551Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'fake_http'"}
+{"ts": "2026-08-24T04:36:21.444712Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:21.444995Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:21.456593Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49921/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:21.456704Z", "level": "INFO", "logger": "mcp.client.streamable_http", "msg": "Received session ID: 43db5743d8a842b0b1f3dd6bf7f6e53a"}
+{"ts": "2026-08-24T04:36:21.456957Z", "level": "INFO", "logger": "mcp.client.streamable_http", "msg": "Negotiated protocol version: 2025-11-25"}
+{"ts": "2026-08-24T04:36:21.458950Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49921/mcp \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:21.459180Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://127.0.0.1:49921/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:21.460133Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49921/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:21.462252Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: DELETE http://127.0.0.1:49921/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:21.462860Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'fake_http'"}
+{"ts": "2026-08-24T04:36:21.466722Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49921/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:21.466777Z", "level": "INFO", "logger": "mcp.client.streamable_http", "msg": "Received session ID: ff508e469e1c467f93c73cbaea4728b6"}
+{"ts": "2026-08-24T04:36:21.466957Z", "level": "INFO", "logger": "mcp.client.streamable_http", "msg": "Negotiated protocol version: 2025-11-25"}
+{"ts": "2026-08-24T04:36:21.468146Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49921/mcp \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:21.468324Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://127.0.0.1:49921/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:21.469148Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49921/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:21.471497Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49921/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:21.473385Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: DELETE http://127.0.0.1:49921/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:22.037482Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:22.037792Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:22.048820Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49935/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:22.048929Z", "level": "INFO", "logger": "mcp.client.streamable_http", "msg": "Received session ID: 7b68b0732de34446911193e08d98b85f"}
+{"ts": "2026-08-24T04:36:22.049152Z", "level": "INFO", "logger": "mcp.client.streamable_http", "msg": "Negotiated protocol version: 2025-11-25"}
+{"ts": "2026-08-24T04:36:22.050310Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49935/mcp \"HTTP/1.1 202 Accepted\""}
+{"ts": "2026-08-24T04:36:22.050503Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://127.0.0.1:49935/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:22.051441Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://127.0.0.1:49935/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:22.053408Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: DELETE http://127.0.0.1:49935/mcp \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:22.053985Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'fake_http'"}
+{"ts": "2026-08-24T04:36:22.233146Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:22.233397Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:30.028272Z", "level": "WARNING", "logger": "src.tools", "msg": "Skipped MCP server 'bad-http': Client failed to connect: All connection attempts failed"}
+{"ts": "2026-08-24T04:36:30.085358Z", "level": "WARNING", "logger": "backtest.loaders.mootdx_loader", "msg": "mootdx: 北交所 (835174.BJ) not supported upstream; use akshare/tushare"}
+{"ts": "2026-08-24T04:36:30.085517Z", "level": "WARNING", "logger": "backtest.loaders.mootdx_loader", "msg": "mootdx: 北交所 (832000) not supported upstream; use akshare/tushare"}
+{"ts": "2026-08-24T04:36:30.127508Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:30.127761Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:30.155422Z", "level": "WARNING", "logger": "backtest.loaders.base", "msg": "invalid OKX_TIMEOUT_S='abc', using default 15"}
+{"ts": "2026-08-24T04:36:30.155516Z", "level": "WARNING", "logger": "backtest.loaders.base", "msg": "invalid OKX_FETCH_BUDGET_S='nope', using default 60.0"}
+{"ts": "2026-08-24T04:36:31.628490Z", "level": "WARNING", "logger": "src.agent.progress", "msg": "HeartbeatTimer interval 0.01 clamped to 0.5s"}
+{"ts": "2026-08-24T04:36:31.629637Z", "level": "WARNING", "logger": "src.agent.progress", "msg": "HeartbeatTimer interval 0.01 clamped to 0.5s"}
+{"ts": "2026-08-24T04:36:31.631420Z", "level": "WARNING", "logger": "src.agent.progress", "msg": "HeartbeatTimer interval 0.3 clamped to 0.5s"}
+{"ts": "2026-08-24T04:36:32.398702Z", "level": "INFO", "logger": "src.providers.llm", "msg": "Forcing temperature=1.0 for kimi-k2.6 (provider requirement)"}
+{"ts": "2026-08-24T04:36:32.400185Z", "level": "INFO", "logger": "src.providers.llm", "msg": "Forcing temperature=1.0 for kimi-k2.6 (provider requirement)"}
+{"ts": "2026-08-24T04:36:32.400554Z", "level": "INFO", "logger": "src.providers.llm", "msg": "Forcing temperature=1.0 for kimi-k2.6 (provider requirement)"}
+{"ts": "2026-08-24T04:36:32.414192Z", "level": "WARNING", "logger": "src.live.halt", "msg": "live kill switch tripped (broker=robinhood, by=test): reg-time halt"}
+{"ts": "2026-08-24T04:36:32.414875Z", "level": "WARNING", "logger": "src.live.registry", "msg": "live kill switch tripped for broker 'robinhood' — omitting order tool 'place_order' from the registry"}
+{"ts": "2026-08-24T04:36:32.415026Z", "level": "WARNING", "logger": "src.live.registry", "msg": "live kill switch tripped for broker 'robinhood' — omitting order tool 'cancel_order' from the registry"}
+{"ts": "2026-08-24T04:36:32.424550Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.424709Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.436632Z", "level": "INFO", "logger": "src.agent.loop", "msg": "ReAct iteration 1/3"}
+{"ts": "2026-08-24T04:36:32.453902Z", "level": "WARNING", "logger": "backtest.loaders.registry", "msg": "fake_unavailable is unavailable, falling back to fake_available for market a_share"}
+{"ts": "2026-08-24T04:36:32.454920Z", "level": "WARNING", "logger": "backtest.loaders.registry", "msg": "fake_init_error is unavailable, falling back to fake_available for market a_share"}
+{"ts": "2026-08-24T04:36:32.455269Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.455393Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.460459Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.460572Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.464819Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.464916Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.468293Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'demo'"}
+{"ts": "2026-08-24T04:36:32.469000Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.469077Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.472348Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 3 MCP tool(s) from server 'alpha'"}
+{"ts": "2026-08-24T04:36:32.472734Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.472804Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.476294Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo-bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_db7329d5_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:36:32.476379Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo_bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_5d5f20e7_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:36:32.476728Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'foo-bar'"}
+{"ts": "2026-08-24T04:36:32.476901Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'foo_bar'"}
+{"ts": "2026-08-24T04:36:32.477473Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.477551Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.480748Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'srv'"}
+{"ts": "2026-08-24T04:36:32.484229Z", "level": "WARNING", "logger": "src.tools", "msg": "Skipped MCP server 'broken': connection refused"}
+{"ts": "2026-08-24T04:36:32.484832Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.484903Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.488071Z", "level": "WARNING", "logger": "src.tools", "msg": "Skipped MCP server 'broken': refused"}
+{"ts": "2026-08-24T04:36:32.488126Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'good'"}
+{"ts": "2026-08-24T04:36:32.488427Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.488492Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.491424Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.491483Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.495341Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.495421Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.498225Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo-bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_db7329d5_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:36:32.498280Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo_bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_5d5f20e7_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:36:32.498572Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'foo-bar'"}
+{"ts": "2026-08-24T04:36:32.498725Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'foo_bar'"}
+{"ts": "2026-08-24T04:36:32.499164Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.499231Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:32.502101Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'alpha'"}
+{"ts": "2026-08-24T04:36:32.505337Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo-bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_db7329d5_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:36:32.505383Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo_bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_5d5f20e7_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:36:32.548434Z", "level": "WARNING", "logger": "backtest.loaders.base", "msg": "non-positive RSSHUB_FETCH_BUDGET_S='0', using default 60.0"}
+{"ts": "2026-08-24T04:36:38.558454Z", "level": "WARNING", "logger": "backtest.loaders.rsshub_events", "msg": "RSSHub feed 'news' for AAA unreachable within 60s budget (https://rsshub.local/stock/news/AAA); no items contributed from this feed"}
+{"ts": "2026-08-24T04:36:38.560568Z", "level": "WARNING", "logger": "backtest.loaders.base", "msg": "invalid RSSHUB_TIMEOUT_S='not-a-float', using default 15.0"}
+{"ts": "2026-08-24T04:36:38.563795Z", "level": "WARNING", "logger": "backtest.loaders.base", "msg": "invalid RSSHUB_FETCH_BUDGET_S='not-a-float', using default 60.0"}
+{"ts": "2026-08-24T04:36:38.607695Z", "level": "WARNING", "logger": "src.live.runtime.flatten", "msg": "live preemptive sweep (broker=robinhood): cancel-only, flatten not permitted"}
+{"ts": "2026-08-24T04:36:38.613959Z", "level": "WARNING", "logger": "src.live.runtime.flatten", "msg": "live preemptive sweep (broker=robinhood): cancel-only, flatten not permitted"}
+{"ts": "2026-08-24T04:36:38.617641Z", "level": "WARNING", "logger": "src.live.runtime.flatten", "msg": "live preemptive sweep (broker=robinhood): cancel-only, flatten not permitted"}
+{"ts": "2026-08-24T04:36:38.629068Z", "level": "ERROR", "logger": "src.live.runtime.jobstore", "msg": "job store /private/var/folders/yw/sk6r8lz53vlcgxy8m3tlg0mm0000gn/T/pytest-of-yangqinfeng/pytest-8/test_corrupt_store_quarantined0/live/runtime/jobs.json corrupt (Expecting property name enclosed in double quotes: line 1 column 3 (char 2)) — quarantined to /private/var/folders/yw/sk6r8lz53vlcgxy8m3tlg0mm0000gn/T/pytest-of-yangqinfeng/pytest-8/test_corrupt_store_quarantined0/live/runtime/jobs.json.corrupt-20260824T043638628984Z"}
+{"ts": "2026-08-24T04:36:38.630422Z", "level": "ERROR", "logger": "src.live.runtime.jobstore", "msg": "job store /private/var/folders/yw/sk6r8lz53vlcgxy8m3tlg0mm0000gn/T/pytest-of-yangqinfeng/pytest-8/test_corrupt_wrong_shape_also_0/live/runtime/jobs.json corrupt (store 'jobs' is missing or not a list) — quarantined to /private/var/folders/yw/sk6r8lz53vlcgxy8m3tlg0mm0000gn/T/pytest-of-yangqinfeng/pytest-8/test_corrupt_wrong_shape_also_0/live/runtime/jobs.json.corrupt-20260824T043638630352Z"}
+{"ts": "2026-08-24T04:36:38.631554Z", "level": "ERROR", "logger": "src.live.runtime.jobstore", "msg": "job store /private/var/folders/yw/sk6r8lz53vlcgxy8m3tlg0mm0000gn/T/pytest-of-yangqinfeng/pytest-8/test_corrupt_bad_job_field_ref0/live/runtime/jobs.json corrupt (job 'next_run_at' must be an int (epoch ms)) — quarantined to /private/var/folders/yw/sk6r8lz53vlcgxy8m3tlg0mm0000gn/T/pytest-of-yangqinfeng/pytest-8/test_corrupt_bad_job_field_ref0/live/runtime/jobs.json.corrupt-20260824T043638631489Z"}
+{"ts": "2026-08-24T04:36:38.642905Z", "level": "WARNING", "logger": "src.live.runtime.liveness", "msg": "reaped stale live runner heartbeat: stale"}
+{"ts": "2026-08-24T04:36:38.646216Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:36:38.647573Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:36:38.648754Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:36:38.648836Z", "level": "WARNING", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): UNSAFE — 1 halting delta(s); state NOT advanced"}
+{"ts": "2026-08-24T04:36:38.649823Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:36:38.649892Z", "level": "WARNING", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): UNSAFE — 1 halting delta(s); state NOT advanced"}
+{"ts": "2026-08-24T04:36:38.650956Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:36:38.652230Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:36:38.652297Z", "level": "WARNING", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): UNSAFE — 1 halting delta(s); state NOT advanced"}
+{"ts": "2026-08-24T04:36:38.653239Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:36:38.654212Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:36:38.655450Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:36:38.655515Z", "level": "WARNING", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): UNSAFE — 1 halting delta(s); state NOT advanced"}
+{"ts": "2026-08-24T04:36:38.656515Z", "level": "INFO", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): no committed mandate on file (provenance only)"}
+{"ts": "2026-08-24T04:36:38.656635Z", "level": "WARNING", "logger": "src.live.runtime.reconcile", "msg": "reconcile(robinhood): runtime_state.json unreadable (Expecting property name enclosed in double quotes: line 1 column 2 (char 1)); renamed to runtime_state.json.corrupt-1787546198, cold start"}
+{"ts": "2026-08-24T04:36:38.661499Z", "level": "WARNING", "logger": "src.live.runtime.runner", "msg": "live reconcile unsafe for robinhood — aborting tick"}
+{"ts": "2026-08-24T04:36:38.662064Z", "level": "WARNING", "logger": "src.live.runtime.runner", "msg": "live reconcile failed for robinhood: broker read timeout"}
+{"ts": "2026-08-24T04:36:38.662598Z", "level": "ERROR", "logger": "src.live.runtime.runner", "msg": "live agent invocation failed for robinhood", "exc": "Traceback (most recent call last):\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/src/live/runtime/runner.py\", line 500, in _invoke_and_audit\n    result = await self._agent_caller(self._session_id, prompt)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/tests/test_runtime_runner.py\", line 317, in _boom\n    raise RuntimeError(\"agent crashed\")\nRuntimeError: agent crashed"}
+{"ts": "2026-08-24T04:36:38.664201Z", "level": "INFO", "logger": "src.live.runtime.runner", "msg": "live runner started for robinhood with 1 job(s)"}
+{"ts": "2026-08-24T04:36:38.664434Z", "level": "WARNING", "logger": "src.live.runtime.runner", "msg": "live runner not starting for robinhood: no mandate"}
+{"ts": "2026-08-24T04:36:38.664675Z", "level": "WARNING", "logger": "src.live.runtime.runner", "msg": "live runner not starting for robinhood: mandate expired"}
+{"ts": "2026-08-24T04:36:38.665153Z", "level": "INFO", "logger": "src.live.runtime.runner", "msg": "live runner started for robinhood with 2 job(s)"}
+{"ts": "2026-08-24T04:36:38.665393Z", "level": "INFO", "logger": "src.live.runtime.runner", "msg": "live runner started for robinhood with 1 job(s)"}
+{"ts": "2026-08-24T04:36:38.665611Z", "level": "INFO", "logger": "src.live.runtime.runner", "msg": "live runner started for robinhood with 1 job(s)"}
+{"ts": "2026-08-24T04:36:38.665829Z", "level": "INFO", "logger": "src.live.runtime.runner", "msg": "live runner started for robinhood with 1 job(s)"}
+{"ts": "2026-08-24T04:36:38.670513Z", "level": "ERROR", "logger": "src.live.runtime.scheduler", "msg": "live scheduler on_fire failed for job bad", "exc": "Traceback (most recent call last):\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/src/live/runtime/scheduler.py\", line 321, in _fire_due\n    await self._on_fire(job)\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/tests/test_runtime_scheduler.py\", line 154, in on_fire\n    raise RuntimeError(\"boom\")\nRuntimeError: boom"}
+{"ts": "2026-08-24T04:36:38.705176Z", "level": "WARNING", "logger": "src.live.sdk_order_gate", "msg": "live place_order raised for alpaca: sdk boom"}
+{"ts": "2026-08-24T04:36:38.710926Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:36:38.712199Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/abcdef012345/goal \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:36:38.713115Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/abcdef012345/goal \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:36:38.714027Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/abcdef012345/goal/evidence \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:36:38.715858Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions \"HTTP/1.1 201 Created\""}
+{"ts": "2026-08-24T04:36:38.717784Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs \"HTTP/1.1 401 Unauthorized\""}
+{"ts": "2026-08-24T04:36:38.718628Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions \"HTTP/1.1 401 Unauthorized\""}
+{"ts": "2026-08-24T04:36:38.719378Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/abcdef012345/goal \"HTTP/1.1 401 Unauthorized\""}
+{"ts": "2026-08-24T04:36:38.720680Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/swarm/runs \"HTTP/1.1 401 Unauthorized\""}
+{"ts": "2026-08-24T04:36:38.724921Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:38.727286Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:38.728056Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs \"HTTP/1.1 401 Unauthorized\""}
+{"ts": "2026-08-24T04:36:38.729685Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:38.731351Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PUT http://testserver/settings/llm \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:36:38.733572Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PUT http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:38.735951Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PUT http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:38.736873Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:36:38.737904Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs \"HTTP/1.1 401 Unauthorized\""}
+{"ts": "2026-08-24T04:36:38.738856Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/start \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:36:38.740271Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/live/runner/start \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:38.741848Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/missing/events \"HTTP/1.1 401 Unauthorized\""}
+{"ts": "2026-08-24T04:36:38.743069Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/missing/events?api_key=secret \"HTTP/1.1 404 Not Found\""}
+{"ts": "2026-08-24T04:36:38.744542Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/swarm/runs \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:36:38.745407Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/abcdef012345/messages \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:36:38.747241Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/system/shutdown \"HTTP/1.1 401 Unauthorized\""}
+{"ts": "2026-08-24T04:36:38.748307Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/system/shutdown \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:36:38.749508Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/system/shutdown \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:38.754756Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/code \"HTTP/1.1 404 Not Found\""}
+{"ts": "2026-08-24T04:36:38.755908Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs/foo.bar/pine \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.756989Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs/foo%0A/pine \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.758385Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/runs/foo.bar \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.759620Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/foo.bar \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.760450Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: DELETE http://testserver/sessions/foo.bar \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.761487Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PATCH http://testserver/sessions/foo.bar \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.762537Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/foo.bar/messages \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.763390Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/foo.bar/messages \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.764209Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/foo.bar/cancel \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.765094Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/foo.bar/goal \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.765890Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/foo.bar/goal \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.766829Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/sessions/foo.bar/goal/evidence \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.767899Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/sessions/foo.bar/events \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.769025Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/swarm/runs/foo.bar \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.769986Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/swarm/runs/foo.bar/events \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.770784Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/swarm/runs/foo.bar/cancel \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.771660Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/swarm/runs/foo.bar/retry \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:38.773073Z", "level": "WARNING", "logger": "src.tools.web_search_tool", "msg": "web_search attempt 1/3 failed: temporary rate limit"}
+{"ts": "2026-08-24T04:36:39.087050Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:39.097040Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:39.103104Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:39.107239Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:39.112291Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PUT http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:39.115857Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/data-sources \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:39.119306Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:39.120634Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/data-sources \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:39.123348Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/llm \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:36:39.124669Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/data-sources \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:36:39.127692Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:39.129100Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET http://testserver/settings/llm \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:39.132301Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PUT http://testserver/settings/data-sources \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:39.134794Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: PUT http://testserver/settings/data-sources \"HTTP/1.1 403 Forbidden\""}
+{"ts": "2026-08-24T04:36:39.815446Z", "level": "INFO", "logger": "matplotlib.category", "msg": "Using categorical units to plot a list of strings that are all parsable as floats or dates. If these strings should be plotted as numbers, cast to the appropriate data type before plotting."}
+{"ts": "2026-08-24T04:36:39.815770Z", "level": "INFO", "logger": "matplotlib.category", "msg": "Using categorical units to plot a list of strings that are all parsable as floats or dates. If these strings should be plotted as numbers, cast to the appropriate data type before plotting."}
+{"ts": "2026-08-24T04:36:39.815925Z", "level": "INFO", "logger": "matplotlib.category", "msg": "Using categorical units to plot a list of strings that are all parsable as floats or dates. If these strings should be plotted as numbers, cast to the appropriate data type before plotting."}
+{"ts": "2026-08-24T04:36:39.966760Z", "level": "WARNING", "logger": "src.shadow_account.reporter", "msg": "weasyprint unavailable (cannot load library 'libgobject-2.0-0': dlopen(libgobject-2.0-0, 0x0002): tried: 'libgobject-2.0-0' (no such file), '/System/Volumes/Preboot/Cryptexes/OSlibgobject-2.0-0' (no such file), '/Users/yangqinfeng/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/libgobject-2.0-0' (no such file), '/usr/lib/libgobject-2.0-0' (no such file, not in dyld cache), 'libgobject-2.0-0' (no such file).  Additionally, ctypes.util.find_library() did not manage to locate a library called 'libgobject-2.0-0'); HTML-only output."}
+{"ts": "2026-08-24T04:36:39.985081Z", "level": "INFO", "logger": "matplotlib.category", "msg": "Using categorical units to plot a list of strings that are all parsable as floats or dates. If these strings should be plotted as numbers, cast to the appropriate data type before plotting."}
+{"ts": "2026-08-24T04:36:39.985319Z", "level": "INFO", "logger": "matplotlib.category", "msg": "Using categorical units to plot a list of strings that are all parsable as floats or dates. If these strings should be plotted as numbers, cast to the appropriate data type before plotting."}
+{"ts": "2026-08-24T04:36:39.985446Z", "level": "INFO", "logger": "matplotlib.category", "msg": "Using categorical units to plot a list of strings that are all parsable as floats or dates. If these strings should be plotted as numbers, cast to the appropriate data type before plotting."}
+{"ts": "2026-08-24T04:36:40.091357Z", "level": "WARNING", "logger": "src.shadow_account.reporter", "msg": "weasyprint unavailable (cannot load library 'libgobject-2.0-0': dlopen(libgobject-2.0-0, 0x0002): tried: 'libgobject-2.0-0' (no such file), '/System/Volumes/Preboot/Cryptexes/OSlibgobject-2.0-0' (no such file), '/Users/yangqinfeng/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/libgobject-2.0-0' (no such file), '/usr/lib/libgobject-2.0-0' (no such file, not in dyld cache), 'libgobject-2.0-0' (no such file).  Additionally, ctypes.util.find_library() did not manage to locate a library called 'libgobject-2.0-0'); HTML-only output."}
+{"ts": "2026-08-24T04:36:40.222106Z", "level": "WARNING", "logger": "src.shadow_account.reporter", "msg": "weasyprint unavailable (cannot load library 'libgobject-2.0-0': dlopen(libgobject-2.0-0, 0x0002): tried: 'libgobject-2.0-0' (no such file), '/System/Volumes/Preboot/Cryptexes/OSlibgobject-2.0-0' (no such file), '/Users/yangqinfeng/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/libgobject-2.0-0' (no such file), '/usr/lib/libgobject-2.0-0' (no such file, not in dyld cache), 'libgobject-2.0-0' (no such file).  Additionally, ctypes.util.find_library() did not manage to locate a library called 'libgobject-2.0-0'); HTML-only output."}
+{"ts": "2026-08-24T04:36:40.222880Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.223012Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.344436Z", "level": "ERROR", "logger": "src.swarm.runtime", "msg": "Worker for task t1 raised exception", "exc": "Traceback (most recent call last):\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/src/swarm/runtime.py\", line 601, in _execute_layer\n    results[tid] = future.result()\n                   ^^^^^^^^^^^^^^^\n  File \"/Users/yangqinfeng/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/concurrent/futures/_base.py\", line 449, in result\n    return self.__get_result()\n           ^^^^^^^^^^^^^^^^^^^\n  File \"/Users/yangqinfeng/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/concurrent/futures/_base.py\", line 401, in __get_result\n    raise self._exception\n  File \"/Users/yangqinfeng/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/concurrent/futures/thread.py\", line 59, in run\n    result = self.fn(*self.args, **self.kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/src/swarm/runtime.py\", line 694, in _run_worker_with_retries\n    result = run_worker(\n             ^^^^^^^^^^^\n  File \"/Users/yangqinfeng/Documents/Project/laicai/Vibe-Trading/agent/tests/test_swarm_error_surfacing.py\", line 89, in boom\n    raise RuntimeError(\"LANGCHAIN_MODEL_NAME is not set\")\nRuntimeError: LANGCHAIN_MODEL_NAME is not set"}
+{"ts": "2026-08-24T04:36:40.349320Z", "level": "INFO", "logger": "src.swarm.grounding", "msg": "grounding: no data returned for NOPE.US"}
+{"ts": "2026-08-24T04:36:40.349964Z", "level": "WARNING", "logger": "src.swarm.grounding", "msg": "grounding: invalid SWARM_GROUNDING_MAX_SYMBOLS='nope', using default 8"}
+{"ts": "2026-08-24T04:36:40.357459Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.357569Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.361654Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'kb'"}
+{"ts": "2026-08-24T04:36:40.365375Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'mcp_kb_search' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:36:40.368660Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'mcp_kb_search' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:36:40.369243Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.369312Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.372629Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 2 MCP tool(s) from server 'kb'"}
+{"ts": "2026-08-24T04:36:40.372983Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.373048Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.376707Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'kb'"}
+{"ts": "2026-08-24T04:36:40.377150Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo-bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_db7329d5_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:36:40.377211Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo_bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_5d5f20e7_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:36:40.377303Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo-bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_db7329d5_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:36:40.377336Z", "level": "WARNING", "logger": "src.tools.mcp", "msg": "Configured MCP server 'foo_bar' collides with another server after local name normalization. Using local tool prefix 'mcp_foo_bar_5d5f20e7_<tool>' to keep generated tool names unique. Rename the server in agent config if you want a different prefix."}
+{"ts": "2026-08-24T04:36:40.377373Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.377441Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.380731Z", "level": "INFO", "logger": "src.tools", "msg": "Registered 1 MCP tool(s) from server 'foo-bar'"}
+{"ts": "2026-08-24T04:36:40.381105Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.381173Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.384445Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.384510Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.395398Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.395494Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.398695Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'mcp_kb_search' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:36:40.404273Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.404365Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.407735Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'mcp_alpha_search' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:36:40.411975Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.412057Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.415042Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'mcp_beta_query' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:36:40.419708Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.419798Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.423046Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'mcp_kb_search' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:36:40.428515Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.428605Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:40.431918Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'mcp_kb_search' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:36:40.442914Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'mcp_attacker_evil_tool' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:36:40.960154Z", "level": "WARNING", "logger": "src.tools", "msg": "Requested tool 'bash' is unavailable and was dropped from the filtered registry (include_shell_tools=False); a preset that depends on it cannot execute it."}
+{"ts": "2026-08-24T04:36:46.328633Z", "level": "INFO", "logger": "src.tools.swarm_tool", "msg": "SwarmTool: resolved preset=demo, variables={'goal': 'analyze AAPL'} from prompt: analyze AAPL"}
+{"ts": "2026-08-24T04:36:46.328814Z", "level": "INFO", "logger": "src.tools.swarm_tool", "msg": "SwarmTool: started run r-web-chat (preset=demo)"}
+{"ts": "2026-08-24T04:36:46.329162Z", "level": "INFO", "logger": "src.tools.swarm_tool", "msg": "SwarmTool: resolved preset=demo, variables={'goal': 'analyze AAPL'} from prompt: analyze AAPL"}
+{"ts": "2026-08-24T04:36:46.329238Z", "level": "INFO", "logger": "src.tools.swarm_tool", "msg": "SwarmTool: started run r-no-session (preset=demo)"}
+{"ts": "2026-08-24T04:36:46.349873Z", "level": "WARNING", "logger": "src.swarm.worker", "msg": "Provider stream failed for agent=analyst task=t1 iteration=0 (provider=openrouter model=test-model); retrying once: provider_stream_error provider=openrouter model=test-model: ConnectionResetError: connection reset by peer"}
+{"ts": "2026-08-24T04:36:46.353954Z", "level": "WARNING", "logger": "src.swarm.worker", "msg": "Provider stream failed for agent=analyst task=t1 iteration=0 (provider=openrouter model=test-model); retrying once: provider_stream_error provider=openrouter model=test-model: ConnectionResetError: connection reset by peer"}
+{"ts": "2026-08-24T04:36:46.354109Z", "level": "WARNING", "logger": "src.swarm.worker", "msg": "LLM call failed at iteration 0: provider_stream_error provider=openrouter model=test-model: ConnectionResetError: connection reset by peer"}
+{"ts": "2026-08-24T04:36:46.357719Z", "level": "WARNING", "logger": "src.swarm.worker", "msg": "LLM call failed at iteration 0: boom"}
+{"ts": "2026-08-24T04:36:46.361922Z", "level": "WARNING", "logger": "src.swarm.worker", "msg": "LLM call failed at iteration 0: provider_stream_error provider=moonshot model=kimi-k2.6: Exception: invalid temperature: only 1 is allowed for this model"}
+{"ts": "2026-08-24T04:36:46.362410Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:46.362516Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:46.369179Z", "level": "WARNING", "logger": "src.agent.progress", "msg": "HeartbeatTimer interval 0.01 clamped to 0.5s"}
+{"ts": "2026-08-24T04:36:46.507900Z", "level": "WARNING", "logger": "src.agent.progress", "msg": "HeartbeatTimer interval 0.01 clamped to 0.5s"}
+{"ts": "2026-08-24T04:36:46.608076Z", "level": "INFO", "logger": "src.tools", "msg": "Tool background_run disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:46.608295Z", "level": "INFO", "logger": "src.tools", "msg": "Tool bash disabled by shell tool policy"}
+{"ts": "2026-08-24T04:36:46.614743Z", "level": "INFO", "logger": "src.tools", "msg": "robinhood live connector is available through trading_* tools; broker-specific MCP wrappers are hidden from the agent registry"}
+{"ts": "2026-08-24T04:36:46.631398Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:46.634349Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 200 OK\""}
+{"ts": "2026-08-24T04:36:46.637053Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 413 Request Entity Too Large\""}
+{"ts": "2026-08-24T04:36:46.639458Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:46.642142Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 500 Internal Server Error\""}
+{"ts": "2026-08-24T04:36:46.644981Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:46.647364Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:46.649566Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:46.651800Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:46.653950Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:46.656041Z", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: POST http://testserver/upload \"HTTP/1.1 400 Bad Request\""}
+{"ts": "2026-08-24T04:36:46.709794Z", "level": "WARNING", "logger": "src.tools.web_reader_tool", "msg": "read_url upstream HTTP 451: ParamValidationError: bad input"}
+{"ts": "2026-08-24T04:36:46.710174Z", "level": "WARNING", "logger": "src.tools.web_reader_tool", "msg": "read_url request failed: boom: connect failed (10.0.0.1)"}
+{"ts": "2026-08-24T04:36:46.716353Z", "level": "WARNING", "logger": "src.tools.web_search_tool", "msg": "web_search attempt 1/3 failed: Ratelimit 202"}
+{"ts": "2026-08-24T04:36:46.716870Z", "level": "WARNING", "logger": "src.tools.web_search_tool", "msg": "web_search attempt 1/3 failed: Ratelimit 429"}
+{"ts": "2026-08-24T04:36:46.716917Z", "level": "WARNING", "logger": "src.tools.web_search_tool", "msg": "web_search attempt 2/3 failed: Ratelimit 429"}
+{"ts": "2026-08-24T04:36:46.716946Z", "level": "WARNING", "logger": "src.tools.web_search_tool", "msg": "web_search attempt 3/3 failed: Ratelimit 429"}
