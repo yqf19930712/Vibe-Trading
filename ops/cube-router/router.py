@@ -166,6 +166,8 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
         ("VIBE_TRADING_DATA_CACHE", "1"),
         ("VIBE_TRADING_TOOL_TIMEOUT_SECONDS", "300"),
         ("SWARM_TIMEOUT", "600"),
+        # ddgs 9.x has no google/bing; "auto" rotates every engine it has.
+        ("VIBE_TRADING_SEARCH_BACKENDS", "auto"),
     ):
         env[key] = os.environ.get(key, default)
     # Whitelisted foreign egress: the launcher builds an in-guest SSH tunnel

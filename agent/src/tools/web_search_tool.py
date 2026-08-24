@@ -25,7 +25,11 @@ logger = logging.getLogger(__name__)
 # Free, no-key engines aggregated by ddgs, tried in order. A single engine
 # returning nothing or being rate-limited no longer fails the whole search.
 # Override (or pin to one engine) via VIBE_TRADING_SEARCH_BACKENDS.
-_DEFAULT_BACKENDS = "duckduckgo, google, bing, brave, mojeek, yahoo"
+# ddgs 9.x dropped the google/bing backends (requesting them logs a warning
+# and shrinks the pool), and datacenter egress IPs get refused by individual
+# engines unpredictably — "auto" lets ddgs rotate everything it has,
+# including the wikipedia/grokipedia fallbacks.
+_DEFAULT_BACKENDS = "auto"
 _MAX_ATTEMPTS = 3
 _BACKOFF_BASE_SECONDS = 0.8
 
