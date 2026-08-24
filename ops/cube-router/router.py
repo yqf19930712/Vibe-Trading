@@ -651,6 +651,16 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                         )
                     stats["session_ms"] = int((time.monotonic() - sess_t0) * 1000)
                     stats["attempt_id"] = attempt_id
+                    # Early meta frame: laicai uses it to stamp attempt_id /
+                    # session id onto its status=running placeholder row, so
+                    # the admin detail page can tail engine logs/trace while
+                    # the run is still in flight (not only after the terminal
+                    # frame). Consumers ignore unknown ev names, so this is
+                    # backward-compatible.
+                    yield _frame({
+                        "t": "progress", "ev": "attempt_meta",
+                        "data": {"attempt_id": attempt_id, "vibe_session_id": sid},
+                    })
 
                     answered = False
                     q: "asyncio.Queue[dict]" = asyncio.Queue()
