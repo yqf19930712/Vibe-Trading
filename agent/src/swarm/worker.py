@@ -50,21 +50,43 @@ def _heartbeat_interval_s() -> float:
 
 
 def _stream_retry_delay_s() -> float:
-    """Resolve the delay before the single stream retry, robust to garbage.
+    """Resolve the base delay for stream retries, robust to garbage.
 
     Returns:
-        Seconds to sleep between a failed ``stream_chat`` attempt and its one
-        retry. Configurable via ``SWARM_STREAM_RETRY_DELAY_S``; a bad value
-        falls back to 1.0s instead of crashing import.
+        Base seconds for the exponential backoff between failed
+        ``stream_chat`` attempts (delay = base × 4^attempt, capped at 60s).
+        Configurable via ``SWARM_STREAM_RETRY_DELAY_S``; a bad value falls
+        back to 2.0s instead of crashing import.
     """
     try:
-        return float(os.getenv("SWARM_STREAM_RETRY_DELAY_S", "1.0"))
+        return float(os.getenv("SWARM_STREAM_RETRY_DELAY_S", "2.0"))
     except ValueError:
-        return 1.0
+        return 2.0
+
+
+def _stream_retries() -> int:
+    """Resolve the in-place stream retry count, robust to garbage.
+
+    Incident 2026-08-24: the upstream proxy dropped opus streams in bursts
+    (ReadTimeout / RemoteProtocolError) — a single immediate retry landed
+    inside the same burst and the whole task failed at iteration 10+,
+    discarding all progress. Multiple backoff retries ride out the burst
+    without resetting the ReAct loop.
+
+    Returns:
+        Number of retries after the initial attempt (so N+1 attempts total).
+        Configurable via ``SWARM_STREAM_RETRIES``; bad values fall back to 3.
+    """
+    try:
+        return max(0, int(os.getenv("SWARM_STREAM_RETRIES", "3")))
+    except ValueError:
+        return 3
 
 
 _HEARTBEAT_INTERVAL_S = _heartbeat_interval_s()
 _STREAM_RETRY_DELAY_S = _stream_retry_delay_s()
+_STREAM_RETRIES = _stream_retries()
+_STREAM_RETRY_MAX_DELAY_S = 60.0
 _MAX_TOKEN_ESTIMATE = 60_000
 
 
@@ -501,28 +523,47 @@ def run_worker(
                         on_text_chunk=_on_text_chunk,
                     )
 
-            # A transient mid-stream hiccup (connection reset) used to be
-            # absorbed by ChatLLM's silent non-streaming fallback; it now
-            # surfaces as ProviderStreamError, so retry the stream exactly
-            # once before taking the existing failure path. Deterministic
-            # 4xx errors skip the retry and fail immediately.
-            try:
-                response = _stream_once()
-            except ProviderStreamError as stream_exc:
-                if not stream_exc.retryable:
-                    raise
-                logger.warning(
-                    "Provider stream failed for agent=%s task=%s iteration=%d "
-                    "(provider=%s model=%s); retrying once: %s",
-                    agent_id,
-                    task_id,
-                    iteration,
-                    stream_exc.provider,
-                    stream_exc.model,
-                    stream_exc,
-                )
-                time.sleep(_STREAM_RETRY_DELAY_S)
-                response = _stream_once()
+            # In-place recovery for transient stream failures (ReadTimeout,
+            # RemoteProtocolError, 5xx/429): retry the LLM call up to
+            # _STREAM_RETRIES times with exponential backoff WITHOUT resetting
+            # the ReAct loop — messages/iteration progress are preserved, only
+            # this one call repeats. Deterministic 4xx errors skip the retry
+            # and fail immediately; retries also stop when the worker's own
+            # deadline can't absorb the next backoff sleep.
+            for stream_attempt in range(1 + _STREAM_RETRIES):
+                try:
+                    response = _stream_once()
+                    break
+                except ProviderStreamError as stream_exc:
+                    if not stream_exc.retryable or stream_attempt >= _STREAM_RETRIES:
+                        raise
+                    delay = min(
+                        _STREAM_RETRY_DELAY_S * (4**stream_attempt),
+                        _STREAM_RETRY_MAX_DELAY_S,
+                    )
+                    remaining = timeout - (time.monotonic() - t0)
+                    if remaining <= delay + 15:
+                        raise
+                    logger.warning(
+                        "Provider stream failed for agent=%s task=%s iteration=%d "
+                        "(provider=%s model=%s), retry %d/%d in %.0fs: %s",
+                        agent_id,
+                        task_id,
+                        iteration,
+                        stream_exc.provider,
+                        stream_exc.model,
+                        stream_attempt + 1,
+                        _STREAM_RETRIES,
+                        delay,
+                        stream_exc,
+                    )
+                    _emit(
+                        event_callback, "llm_stream_retry", agent_id, task_id,
+                        {"iteration": iteration, "attempt": stream_attempt + 1,
+                         "max_retries": _STREAM_RETRIES, "delay_s": delay,
+                         "error": str(stream_exc)[:200]},
+                    )
+                    time.sleep(delay)
         except Exception as exc:
             error_msg = f"LLM call failed at iteration {iteration}: {exc}"
             logger.warning(error_msg)

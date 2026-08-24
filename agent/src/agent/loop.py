@@ -53,7 +53,13 @@ KEEP_RECENT = 3
 TOOL_RESULT_LIMIT = 10_000
 HEARTBEAT_INTERVAL_S = float(os.getenv("VT_HEARTBEAT_INTERVAL_S", "3.0"))
 REASONING_DELTA_MIN_INTERVAL_S = float(os.getenv("VT_REASONING_DELTA_MIN_INTERVAL_S", "1.0"))
-STREAM_RETRY_DELAY_S = float(os.getenv("VT_STREAM_RETRY_DELAY_S", "1.0"))
+STREAM_RETRY_DELAY_S = float(os.getenv("VT_STREAM_RETRY_DELAY_S", "2.0"))
+# In-place retries after the initial attempt (N+1 attempts total, exponential
+# backoff base×4^i capped at 60s). Same rationale as the swarm worker: upstream
+# proxies drop long opus streams in bursts; a single immediate retry lands
+# inside the same burst and kills the whole attempt (incident 2026-08-24).
+STREAM_RETRIES = max(0, int(os.getenv("VT_STREAM_RETRIES", "3")))
+STREAM_RETRY_MAX_DELAY_S = 60.0
 TOOL_TIMEOUT_SECONDS = float(os.getenv("VIBE_TRADING_TOOL_TIMEOUT_SECONDS", "1800"))
 # Batch 3: when an attempt deadline is bound, force the final text answer once
 # less than this many seconds (or ~1.2 avg iterations) remain — a partial
@@ -713,49 +719,60 @@ class AgentLoop:
                     trace.write({"type": "forced_text_only", "iter": current_iter})
 
                 llm_t0 = _time.perf_counter()
-                try:
-                    self._stats["llm_calls"] += 1
-                    response = self.llm.stream_chat(
-                        messages,
-                        tools=tool_defs,
-                        on_text_chunk=_on_text_chunk,
-                        on_reasoning_chunk=_on_reasoning_chunk,
-                        should_cancel=self._cancel_event.is_set,
-                    )
-                except ProviderStreamError as exc:
-                    # One retry for transient mid-stream failures (connection
-                    # reset, relay hiccup) — mirrors the swarm worker policy.
-                    # Deterministic 4xx errors fail immediately. Deltas from
-                    # the failed attempt are dropped so the trace does not
-                    # contain duplicated thinking text.
-                    if not exc.retryable:
-                        raise
-                    logger.warning(
-                        "Provider stream failed (iter %s), retrying once: %s",
-                        current_iter,
-                        exc,
-                    )
-                    self._emit(
-                        "stream_reset",
-                        {
-                            "iter": current_iter,
-                            "reason": "provider_stream_retry",
-                            "provider": exc.provider,
-                            "model": exc.model,
-                        },
-                    )
-                    thinking_chunks.clear()
-                    reasoning_chars = 0
-                    last_reasoning_emit = None
-                    _time.sleep(STREAM_RETRY_DELAY_S)
-                    self._stats["llm_calls"] += 1
-                    response = self.llm.stream_chat(
-                        messages,
-                        tools=tool_defs,
-                        on_text_chunk=_on_text_chunk,
-                        on_reasoning_chunk=_on_reasoning_chunk,
-                        should_cancel=self._cancel_event.is_set,
-                    )
+                # In-place recovery for transient mid-stream failures
+                # (ReadTimeout, connection reset, relay hiccup, 5xx/429):
+                # retry with exponential backoff WITHOUT resetting the loop —
+                # messages/iteration progress are preserved, only this call
+                # repeats. Mirrors the swarm worker policy. Deterministic 4xx
+                # errors fail immediately; retries stop when the attempt's
+                # remaining budget can't absorb the next backoff sleep. Deltas
+                # from a failed attempt are dropped so the trace does not
+                # contain duplicated thinking text.
+                for stream_attempt in range(1 + STREAM_RETRIES):
+                    try:
+                        self._stats["llm_calls"] += 1
+                        response = self.llm.stream_chat(
+                            messages,
+                            tools=tool_defs,
+                            on_text_chunk=_on_text_chunk,
+                            on_reasoning_chunk=_on_reasoning_chunk,
+                            should_cancel=self._cancel_event.is_set,
+                        )
+                        break
+                    except ProviderStreamError as exc:
+                        if not exc.retryable or stream_attempt >= STREAM_RETRIES:
+                            raise
+                        delay = min(
+                            STREAM_RETRY_DELAY_S * (4**stream_attempt),
+                            STREAM_RETRY_MAX_DELAY_S,
+                        )
+                        remaining = _budget.remaining_s()
+                        if remaining is not None and remaining <= delay + 30:
+                            raise
+                        logger.warning(
+                            "Provider stream failed (iter %s), retry %d/%d in %.0fs: %s",
+                            current_iter,
+                            stream_attempt + 1,
+                            STREAM_RETRIES,
+                            delay,
+                            exc,
+                        )
+                        self._emit(
+                            "stream_reset",
+                            {
+                                "iter": current_iter,
+                                "reason": "provider_stream_retry",
+                                "attempt": stream_attempt + 1,
+                                "max_retries": STREAM_RETRIES,
+                                "delay_s": delay,
+                                "provider": exc.provider,
+                                "model": exc.model,
+                            },
+                        )
+                        thinking_chunks.clear()
+                        reasoning_chars = 0
+                        last_reasoning_emit = None
+                        _time.sleep(delay)
                 self._stats["llm_ms"] += int((_time.perf_counter() - llm_t0) * 1000)
 
                 # Cancelled mid-stream: discard this turn's partial response and
