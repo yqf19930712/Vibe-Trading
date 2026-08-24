@@ -25,9 +25,32 @@ logger = logging.getLogger(__name__)
 # Free, no-key engines aggregated by ddgs, tried in order. A single engine
 # returning nothing or being rate-limited no longer fails the whole search.
 # Override (or pin to one engine) via VIBE_TRADING_SEARCH_BACKENDS.
-_DEFAULT_BACKENDS = "duckduckgo, google, bing, brave, mojeek, yahoo"
+# ddgs 9.x dropped the google/bing backends (requesting them logs a warning
+# and shrinks the pool), and datacenter egress IPs get refused by individual
+# engines unpredictably — "auto" lets ddgs rotate everything it has,
+# including the wikipedia/grokipedia fallbacks.
+_DEFAULT_BACKENDS = "auto"
 _MAX_ATTEMPTS = 3
 _BACKOFF_BASE_SECONDS = 0.8
+
+
+def _make_client(ddgs_cls, proxy: str | None):
+    """Build the DDGS client, passing the egress proxy when configured.
+
+    In restricted-egress deployments (multi-tenant sandboxes behind the
+    firewall) VIBE_TRADING_EGRESS_PROXY points at an in-guest encrypted
+    tunnel to a domain-whitelisted proxy; without it, foreign engines are
+    simply unreachable. Handles the proxy kwarg rename across ddgs versions.
+    """
+    if proxy:
+        try:
+            return ddgs_cls(proxy=proxy)
+        except TypeError:
+            try:
+                return ddgs_cls(proxies=proxy)
+            except TypeError:
+                logger.warning("ddgs client accepts no proxy kwarg; searching direct")
+    return ddgs_cls()
 
 
 class WebSearchTool(BaseTool):
@@ -99,10 +122,11 @@ class WebSearchTool(BaseTool):
                 )
             supports_backend = False
 
+        egress_proxy = os.getenv("VIBE_TRADING_EGRESS_PROXY", "").strip() or None
         last_error: Exception | None = None
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             try:
-                with DDGS() as client:
+                with _make_client(DDGS, egress_proxy) as client:
                     if supports_backend:
                         raw = list(client.text(query, max_results=max_results, backend=backends))
                     else:

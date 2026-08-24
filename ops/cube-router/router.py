@@ -29,6 +29,7 @@ router restart re-attaches to existing sandboxes instead of leaking them.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -88,6 +89,17 @@ FORWARD_ENV = [
     "TUSHARE_TOKEN", "VIBE_TRADING_SEARCH_BACKENDS",
 ]
 
+# In-guest egress tunnel credentials (optional): private key file on the host
+# + ssh destination (server B). Injected into each sandbox via launcher /boot.
+EGRESS_KEY_FILE = os.environ.get("VIBE_EGRESS_KEY_FILE", "")
+EGRESS_SSH_DEST = os.environ.get("VIBE_EGRESS_SSH_DEST", "")
+_EGRESS_KEY_B64 = ""
+if EGRESS_KEY_FILE:
+    try:
+        _EGRESS_KEY_B64 = base64.b64encode(Path(EGRESS_KEY_FILE).read_bytes()).decode()
+    except OSError as e:
+        logging.getLogger("cube-router").warning("egress key unreadable: %s", e)
+
 if not ROUTER_SECRET or not ROUTER_TOKEN:
     raise SystemExit("cube-router requires VIBE_ROUTER_SECRET and VIBE_ROUTER_TOKEN")
 if not TEMPLATE_ID:
@@ -146,6 +158,30 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
             "VIBE_TRADING_ENABLE_SHELL_TOOLS": "1",
         }
     )
+    # Tenant performance/reliability tier (batches 2+3). Router env overrides;
+    # incident 2026-08-24 showed the engine defaults (50 iters, 1800s tool and
+    # swarm timeouts) let a run outlive every caller budget.
+    for key, default in (
+        ("VIBE_MAX_ITERATIONS", "25"),
+        ("VIBE_TRADING_DATA_CACHE", "1"),
+        ("VIBE_TRADING_TOOL_TIMEOUT_SECONDS", "300"),
+        # Swarm committees legitimately run tens of minutes (multi-layer DAG ×
+        # multi-iteration workers). The wait is still clamped to the attempt's
+        # remaining budget (cap_timeout), so no inversion — the half-hour only
+        # materializes when laicai grants a matching timeoutS for swarm asks.
+        ("SWARM_TIMEOUT", "1800"),
+        # ddgs 9.x has no google/bing; "auto" rotates every engine it has.
+        ("VIBE_TRADING_SEARCH_BACKENDS", "auto"),
+    ):
+        env[key] = os.environ.get(key, default)
+    # Whitelisted foreign egress: the launcher builds an in-guest SSH tunnel
+    # to server B's loopback tinyproxy (domain filter there); web_search and
+    # the yfinance loader then use VIBE_TRADING_EGRESS_PROXY. Key material is
+    # consumed by the launcher and never enters the engine process env.
+    if _EGRESS_KEY_B64 and EGRESS_SSH_DEST:
+        env["VIBE_EGRESS_SSH_KEY_B64"] = _EGRESS_KEY_B64
+        env["VIBE_EGRESS_SSH_DEST"] = EGRESS_SSH_DEST
+        env.setdefault("VIBE_TRADING_EGRESS_PROXY", "http://127.0.0.1:8118")
     api_key = hashlib.sha256(os.urandom(16)).hexdigest()
     env["API_AUTH_KEY"] = api_key
     return env, api_key
@@ -413,8 +449,15 @@ async def _ensure_session(inst: Instance, vibe_session_id: Optional[str]) -> str
     return sid
 
 
-async def _post_turn(inst: Instance, sid: str, query: str) -> Optional[str]:
-    r = await _vibe(inst, "POST", f"/sessions/{sid}/messages", json={"content": query})
+async def _post_turn(
+    inst: Instance, sid: str, query: str, deadline_s: Optional[float] = None
+) -> Optional[str]:
+    payload: dict = {"content": query}
+    if deadline_s is not None:
+        # The engine finalizes with what it has before this budget runs out
+        # (batch 3) instead of grinding past the caller's timeout.
+        payload["deadline_s"] = round(deadline_s, 1)
+    r = await _vibe(inst, "POST", f"/sessions/{sid}/messages", json=payload)
     if r.status_code == 404:
         raise _SessionGone()
     r.raise_for_status()
@@ -582,16 +625,26 @@ async def _ask_stream(body: AskBody, timeout_s: int):
             try:
                 async with inst.lock:
                     sess_t0 = time.monotonic()
+                    # Engine-side budget = what's left of the caller's timeout
+                    # after queueing/boot, minus a margin for the answer poll.
+                    engine_deadline_s = max(
+                        60.0, timeout_s - (time.monotonic() - t_req) - 10.0
+                    )
                     sid = await _ensure_session(inst, body.vibeSessionId)
                     try:
-                        attempt_id = await _post_turn(inst, sid, body.query)
+                        attempt_id = await _post_turn(
+                            inst, sid, body.query, deadline_s=engine_deadline_s
+                        )
                     except _SessionGone:
                         stats["session_recovered"] = True
                         sid = await _ensure_session(inst, None)
-                        attempt_id = await _post_turn(inst, sid, body.query)
+                        attempt_id = await _post_turn(
+                            inst, sid, body.query, deadline_s=engine_deadline_s
+                        )
                     stats["session_ms"] = int((time.monotonic() - sess_t0) * 1000)
                     stats["attempt_id"] = attempt_id
 
+                    answered = False
                     q: "asyncio.Queue[dict]" = asyncio.Queue()
                     pump = asyncio.create_task(_pump_events(inst, sid, q))
                     waiter = asyncio.create_task(_wait_answer(inst, sid, attempt_id, timeout_s))
@@ -611,6 +664,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                             _grab_engine_stats(ev)
                             yield _frame({"t": "progress", **ev})
                         answer = await waiter
+                        answered = True
                         inst.last_activity = time.monotonic()
                         stats["outcome"] = "ok"
                         stats["total_ms"] = int((time.monotonic() - t_req) * 1000)
@@ -623,6 +677,23 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                     finally:
                         pump.cancel()
                         waiter.cancel()
+                        if not answered:
+                            # Timeout / client gone / internal error: tell the
+                            # engine to stop burning tokens on an answer nobody
+                            # will receive (incident 2026-08-24: a 504'd attempt
+                            # kept grinding and starved the tenant's retry).
+                            try:
+                                await _vibe(
+                                    inst, "POST", f"/sessions/{sid}/cancel",
+                                    timeout=10.0,
+                                )
+                                stats["engine_cancelled"] = True
+                                log.info(
+                                    "cancelled unfinished attempt (tenant %s, sid %s)",
+                                    tk[:8], sid,
+                                )
+                            except Exception as e:  # noqa: BLE001
+                                log.warning("cancel after unanswered ask failed: %s", e)
             finally:
                 inst.refcount -= 1
     except HTTPException as e:

@@ -1,6 +1,6 @@
 # PRODUCT_DESIGN — 多租户深度引擎架构与契约
 
-本文描述本 fork 的多租户生产架构（`ops/cube-router` + `ops/cube-engine`）与全部对外契约。部署步骤见 [README_CUSTOM.md](README_CUSTOM.md)；方案演进与已退役的 v1 进程版见 [docs/HISTORY.md](docs/HISTORY.md)；引擎本体功能见[上游文档](https://github.com/HKUDS/Vibe-Trading)。
+本文描述本 fork 的多租户生产架构（`ops/cube-router` + `ops/cube-engine`）与全部对外契约。部署步骤见 [README_CUSTOM.md](README_CUSTOM.md)；观测/预算/数据可靠性/出境代理的详细技术文档见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)；方案演进与已退役的 v1 进程版见 [docs/HISTORY.md](docs/HISTORY.md)；引擎本体功能见[上游文档](https://github.com/HKUDS/Vibe-Trading)。
 
 ## 目录
 
@@ -12,6 +12,7 @@
 6. [资源与网络边界](#6-资源与网络边界)
 7. [会话连续性](#7-会话连续性)
 8. [与 laicai 的对接](#8-与-laicai-的对接)
+9. [观测、预算与出境代理（概要）](#9-观测预算与出境代理概要)
 
 ## 1. 系统定位与拓扑
 
@@ -98,6 +99,11 @@ stateDiagram-v2
 | `VIBE_TRADING_TENANT_SAFE=1` | `build_registry` 排除**动钱红线**：`trading_*` 前缀全部工具 + `propose_mandate_profiles`。只读分析产品在任何配置下都不得触发真实下单/资金授权 |
 | `VIBE_TRADING_ENABLE_SHELL_TOOLS=1` | 放开 shell 类工具（上游默认关）——任意命令执行已被 MicroVM 圈住，视为安全 |
 | `API_AUTH_KEY=<随机>` | 引擎对非 loopback 调用方的 Bearer 鉴权 key，见 §5 |
+| `VIBE_MAX_ITERATIONS=25` | 租户档位：ReAct 迭代上限（引擎默认 50；router env 可覆盖） |
+| `VIBE_TRADING_TOOL_TIMEOUT_SECONDS=300` `SWARM_TIMEOUT=1800` | 租户档位：单工具/swarm 超时（引擎默认 1800；另被剩余预算动态钳制，见 §9） |
+| `VIBE_TRADING_DATA_CACHE=1` | 开启 loader parquet 缓存（落租户数据盘，跨会话/重建持久） |
+| `VIBE_TRADING_SEARCH_BACKENDS=auto` | ddgs 搜索后端（9.x 已无 google/bing，auto 轮询全部引擎） |
+| `VIBE_TRADING_EGRESS_PROXY=http://127.0.0.1:8118` | 仅配置了 egress key 时注入；web_search/yfinance 专用出境代理（沙箱内加密隧道，见 §9） |
 
 `run_swarm` / `session_search` / `background_*` 不裁剪：其状态已被 HOME + 沙箱盘限定在本租户内（如 `session_search` 索引 = 本租户自己的 `~/.vibe-trading/sessions.db`，只搜本人跨线程历史）。
 
@@ -127,20 +133,24 @@ stateDiagram-v2
 | `vibeSessionId` | string? | 引擎会话 id；有值则续聊复用，缺省新建 |
 | `model` | string? | 内置模型覆盖（如 `claude-sonnet-4-6`），白名单正则校验 |
 | `llm` | object? | BYOK 覆盖：`{provider, model, apiKey, baseUrl}`，见 §5；与 `model` 互斥时以 `llm` 为准 |
-| `timeoutS` | int? | 单问超时，默认 900 |
+| `timeoutS` | int? | 单问超时，默认 900。router 会把「扣除排队/冷启后的剩余预算 − 10s 余量」作为 `deadline_s` 随消息下发给引擎，引擎据此在预算内提前收敛（见 §9） |
 
 响应：`application/x-ndjson`，每行一帧：
 
 ```jsonc
 {"t":"progress","ev":"<引擎 SSE 事件名>","data":<payload>}   // 0..n 帧，实时转发引擎
                                                             // /sessions/<sid>/events（replay=active）
-{"t":"answer","answer":"<终答 markdown>","vibeSessionId":"<sid>"}   // 成功终帧
-{"t":"error","status":<HTTP 语义码>,"detail":"..."}                  // 失败终帧
+{"t":"answer","answer":"<终答 markdown>","vibeSessionId":"<sid>",
+ "stats":{"router":{...分段计时/outcome/attempt_id...},
+          "engine":{...引擎 attempt_stats 原文...}}}                 // 成功终帧
+{"t":"error","status":<HTTP 语义码>,"detail":"...","stats":{...}}    // 失败终帧（同样带 stats）
 ```
 
 语义要点：
 
 - **答案判定按 `attempt_id`**：router 发消息拿回本轮 `attempt_id`，轮询 `GET /sessions/<sid>/messages` 直到出现 `linked_attempt_id` 匹配且内容非空的 assistant 消息——复用会话时绝不会把上一轮答案当本轮返回。
+- **终帧携带 stats**：`stats.router` 是 router 分段计时（queue_wait/sandbox_ready/session/first_progress/total、cold_start/booted/session_recovered、attempt_id），`stats.engine` 是引擎 `attempt_stats` 事件原文（迭代/LLM 耗时/逐工具/tokens/data_fetches/data_gaps/early_finalize）——laicai 据此落 `deep_engine_runs`。字段明细见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)。
+- **未答即取消**：router 在拿不到答案的所有路径（504 超时、客户端断开、内部异常）对引擎 `POST /sessions/<sid>/cancel` 止损，避免孤儿 attempt 继续烧钱并阻塞同租户后续请求。
 - **会话失效自愈**：`vibeSessionId` 指向的会话在引擎侧 404（如沙箱曾被删除重建）→ router 透明新建会话、重发本问，终帧回传**新** `vibeSessionId`，laicai 应重绑线程。上下文丢失但长期记忆仍在（记忆在 HOME，不在 session）。
 - 常见错误：401 未鉴权；400 model/llm 参数非法；503 实例忙（在途请求持有不同 LLM 指纹，或 RUNNING 沙箱满且无可换出者）；502 沙箱创建/引擎 boot 失败；504 引擎超时。
 - 并发：全局同时处理的 `/ask` 数受 `VIBE_MAX_CONCURRENT_ACTIVE`（信号量）钳制，超出者排队等待。
@@ -151,12 +161,26 @@ stateDiagram-v2
 
 ### 3.3 `GET /healthz`
 
+Bearer 鉴权与其余端点一致（无豁免）。池状态之外含进程内 ask 计数器（重启清零；持久口径在 laicai `deep_engine_runs`）：
+
 ```jsonc
 {
   "instances": 2, "running": 1, "active": 0, "max_running": 3,
+  "asks": {"asks_total": 6, "asks_ok": 3, "asks_timeout": 1, "asks_busy": 0,
+           "asks_error": 2, "uptime_s": 15591, "p50_ms": 21276, "p95_ms": 580769, "window": 3},
   "tenants": [ {"tk8":"a1b2c3d4","sandbox":"sbx-...","paused":false,"refcount":0,"idle_s":42} ]
 }
 ```
+
+### 3.4 只读 `/obs/*` — 租户遥测在线回读
+
+laicai 管理端详情页（`/app/admin/deep-run/$id`）经这三个端点在浏览器里直接查看租户日志与 trace，排障不再需要 SSH。Bearer 鉴权同源；id 严格正则校验防路径穿越；只读尾部 4MB、单字段裁 600 字符：
+
+| 端点 | 参数 | 数据源 |
+|---|---|---|
+| `GET /obs/ask-log` | `uid`、`attempt_id?`、`limit≤200` | router `ask_log.jsonl` 按租户（tk8）过滤 |
+| `GET /obs/engine-log` | `uid`、`attempt_id?`、`limit≤2000` | 租户 `logs/engine.jsonl`（宿主 bind-mount 直读） |
+| `GET /obs/trace` | `uid`、`session_id`、`limit≤2000` | 租户 `sessions/<sid>/trace.jsonl` |
 
 ## 4. launcher 协议（router → 沙箱）
 
@@ -164,9 +188,11 @@ launcher（`ops/cube-engine/launcher.py`）是镜像的常驻进程与模板探�
 
 | 端点 | 语义 |
 |---|---|
-| `GET /health` | 200 `{"launcher":"ok","engine":"running"\|"starting"\|"stopped"}`。模板探针路径（`--probe 8898 --probe-path /health`）；router 也用它探活（失败 → resume 沙箱） |
-| `POST /boot` `{"env":{...}}` | 杀现引擎（SIGTERM→SIGKILL）→ 以 `os.environ + env` spawn `vibe-trading serve --host 0.0.0.0 --port 8899` → 等引擎 `/health` 就绪（预算 `VIBE_LAUNCHER_BOOT_TIMEOUT`，默认 120s）。**幂等换配置的唯一入口** |
+| `GET /health` | 200 `{"launcher":"ok","engine":"running"\|"starting"\|"stopped","egress_tunnel":"up"\|"down"\|"off"}`。模板探针路径（`--probe 8898 --probe-path /health`）；router 也用它探活（失败 → resume 沙箱）；顺带自愈重拉出境隧道（≥10s 间隔） |
+| `POST /boot` `{"env":{...}}` | 杀现引擎（SIGTERM→SIGKILL）→ **消费 `VIBE_EGRESS_*` 键（re）启动出境隧道（key 材料不进引擎 env）** → 以 `os.environ + 其余 env` spawn `vibe-trading serve --host 0.0.0.0 --port 8899` → 等引擎 `/health` 就绪（预算 `VIBE_LAUNCHER_BOOT_TIMEOUT`，默认 120s）。**幂等换配置的唯一入口** |
 | `POST /stop` | 杀引擎进程 |
+
+出境隧道：`/boot` env 携带 `VIBE_EGRESS_SSH_KEY_B64` + `VIBE_EGRESS_SSH_DEST` 时，launcher 在 guest 内拉起 `ssh -N -L 127.0.0.1:8118 → <B 服务器 loopback tinyproxy>`（跨境流量全程 SSH 加密——明文代理的 CONNECT 行会被按域名关键字重置）。私钥在 B 端被 `restrict,port-forwarding,permitopen` 强约束为「仅可转发到 tinyproxy」。详见 [docs/OBSERVABILITY.md §6](docs/OBSERVABILITY.md)。
 
 - 引擎绑 `0.0.0.0` 是刻意的：数据面经 cube-proxy 进来不是 loopback（guest 内也无外部暴露面——只有 cube-proxy 路由的端口可达）。
 - **引擎重启语义**：router 对比实例当前 LLM 指纹与本次请求的目标指纹，不同且实例空闲 → 仅 `/boot`（进程级重启，沙箱、盘、会话文件全部不动）；实例在途（`refcount>0`）且指纹不同 → 503 让调用方稍后重试。
@@ -220,4 +246,14 @@ flowchart LR
 
 ## 8. 与 laicai 的对接
 
-laicai 侧的桥接实现（触发词门控、NDJSON 消费、进度事件透传、会话绑定、用量记账）见主仓库 `app/src/server/vibe-trading.ts` 与 laicai 侧文档，此处不复述。
+laicai 侧的桥接实现（触发词门控、NDJSON 消费、进度事件透传、会话绑定、用量记账、`deep_engine_runs` 落库与 admin 观测面板）见主仓库 `app/src/server/vibe-trading.ts` 与 laicai 侧文档，此处不复述。
+
+## 9. 观测、预算与出境代理（概要）
+
+详细技术文档见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)，此处只列骨架：
+
+- **观测主干**：引擎 attempt 结束发 `attempt_stats` 事件（SSE + trace.jsonl 双写）→ router 连同自身分段计时放进 `/ask` 终帧 `stats` → laicai 落 `deep_engine_runs` → admin 面板。`attempt_id` 是全链路 trace id（`deep_engine_runs` / `ask_log.jsonl` / `engine.jsonl` / SSE 事件同键）。
+- **引擎结构化日志**：`logging_setup.py` JSONL 落 `<VIBE_DATA_DIR>/logs/engine.jsonl`（多租户下宿主 bind-mount 直读），contextvars 绑定 session/attempt id 并经 `copy_context` 穿透工具线程。
+- **预算体系**：`deadline_s` 沿 laicai timeoutS → router → messages API → AgentLoop 单向传递；剩余 <25% 注入收尾提示，剩余不足一轮（`max(60s, 1.2×平均迭代)`）强制出文本（`early_finalize`，明标未完成部分）；单工具/swarm/取数链的内部超时都被剩余预算钳制（`core/budget.py` 的 `cap_timeout`）；router 对未答请求兜底 cancel。
+- **数据可靠性**：主源异常**或单标的空结果**都会沿 `FALLBACK_CHAINS` 逐源降级（总预算 120s），耗尽才返回 `_gaps` 明细（限频标注 `rate_limited`）；tushare 进程内节流 + 重试；`socket.setdefaulttimeout` 兜底无超时 SDK；loader 缓存对租户默认开启；每次 loader 调用经 `core/fetch_stats.py` 计入 attempt_stats 的 `data_fetches`/`data_gaps`。
+- **出境代理**：沙箱内 SSH 隧道（launcher 管理）→ B 服务器 loopback tinyproxy（域名白名单 FilterDefaultDeny）；仅 `web_search` 与 yfinance loader 走 `VIBE_TRADING_EGRESS_PROXY`，国内源与 LLM 上游直连。

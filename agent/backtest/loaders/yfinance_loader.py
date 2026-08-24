@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict
 from typing import Dict, List, Optional, Union
 
@@ -93,14 +94,24 @@ def _download_history(
     Returns:
         Raw dataframe from ``yf.download``.
     """
-    return yf.download(
-        tickers,
+    kwargs = dict(
         start=start_date,
         end=end_date,
         interval=interval,
         auto_adjust=False,
         progress=False,
     )
+    # Restricted-egress deployments route yahoo through the whitelisted
+    # egress proxy (see web_search_tool). Domestic loaders stay direct.
+    proxy = os.getenv("VIBE_TRADING_EGRESS_PROXY", "").strip()
+    if proxy:
+        kwargs["proxy"] = proxy
+    try:
+        return yf.download(tickers, **kwargs)
+    except TypeError:
+        # Very new yfinance versions dropped the proxy kwarg.
+        kwargs.pop("proxy", None)
+        return yf.download(tickers, **kwargs)
 
 
 def _flatten_columns(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
