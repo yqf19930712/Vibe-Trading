@@ -3,7 +3,8 @@
 本仓库是 [HKUDS/Vibe-Trading](https://github.com/HKUDS/Vibe-Trading)（自然语言量化研究 agent，Python + LangChain + FastAPI）的 fork，在上游引擎之上增加一层**多租户生产运维层（`ops/`）**，作为 laicai（来财）「来财AI 深度引擎」的后端：laicai 的 AI 聊天把深度分析请求透传给本仓库部署的 cube-router，每个 laicai 用户在独立的 KVM MicroVM 沙箱里运行一个专属引擎实例。
 
 - 引擎本体的功能与用法（回测、因子、swarm、connector、MCP 等）见 [README.md](README.md)（上游自述，保持原样便于合并上游）与 [vibetrading.wiki](https://vibetrading.wiki/)，本文不复述。
-- 多租户架构与协议契约见 [PRODUCT_DESIGN.md](PRODUCT_DESIGN.md)。
+- 多租户架构与协议契约见 [PRODUCT_DESIGN.md](PRODUCT_DESIGN.md)；观测/预算/数据可靠性/出境代理见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)。
+- swarm 多智能体团队的 29 个 preset 清单与来财AI 触发策略见 [docs/SWARM-PRESETS.md](docs/SWARM-PRESETS.md)。
 - 方案演进、评审记录与已退役的 v1 进程版见 [docs/HISTORY.md](docs/HISTORY.md)。
 
 ## 仓库结构
@@ -114,7 +115,7 @@ systemctl daemon-reload && systemctl enable --now cube-router
 | `LANGCHAIN_NO_TEMPERATURE_MODELS` | | 逗号分隔的模型名子串，**追加**到 `llm.py` 内置的 `NO_TEMPERATURE_MODELS` 名单（追加而非替换，避免为了加新模型把已知的漏掉） |
 | `VIBE_ASK_LOG` | | 每次 `/ask` 一行的观测日志，默认 `/var/lib/cube-router/ask_log.jsonl`（20MB 轮转） |
 | `VIBE_EGRESS_KEY_FILE` / `VIBE_EGRESS_SSH_DEST` | | 沙箱出境隧道：宿主上的 SSH 私钥路径（如 `/root/vibe-egress-key`）+ 目的地（如 `root@<B服务器>`）。配了才会给引擎注入 `VIBE_TRADING_EGRESS_PROXY`；B 端该 key 必须 `restrict,port-forwarding,permitopen="127.0.0.1:8888"` |
-| 租户档位覆盖 | | `engine_env()` 会给每个租户注入默认档位：`VIBE_MAX_ITERATIONS=25`、`VIBE_TRADING_DATA_CACHE=1`、`VIBE_TRADING_TOOL_TIMEOUT_SECONDS=300`、`SWARM_TIMEOUT=600`、`VIBE_TRADING_SEARCH_BACKENDS=auto`——在 router.env 里设同名变量即可整体覆盖 |
+| 租户档位覆盖 | | `engine_env()` 会给每个租户注入默认档位：`VIBE_MAX_ITERATIONS=25`、`VIBE_TRADING_DATA_CACHE=1`、`VIBE_TRADING_TOOL_TIMEOUT_SECONDS=300`、`SWARM_TIMEOUT=1800`、`VIBE_TRADING_SEARCH_BACKENDS=auto`——在 router.env 里设同名变量即可整体覆盖 |
 
 laicai 侧只需在 `web.env` 配 `VIBE_ROUTER_URL=http://<宿主机>:8990` + `VIBE_ROUTER_TOKEN`。
 

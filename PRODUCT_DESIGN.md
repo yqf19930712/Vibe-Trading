@@ -100,7 +100,7 @@ stateDiagram-v2
 | `VIBE_TRADING_ENABLE_SHELL_TOOLS=1` | 放开 shell 类工具（上游默认关）——任意命令执行已被 MicroVM 圈住，视为安全 |
 | `API_AUTH_KEY=<随机>` | 引擎对非 loopback 调用方的 Bearer 鉴权 key，见 §5 |
 | `VIBE_MAX_ITERATIONS=25` | 租户档位：ReAct 迭代上限（引擎默认 50；router env 可覆盖） |
-| `VIBE_TRADING_TOOL_TIMEOUT_SECONDS=300` `SWARM_TIMEOUT=600` | 租户档位：单工具/swarm 超时（引擎默认 1800；另被剩余预算动态钳制，见 §9） |
+| `VIBE_TRADING_TOOL_TIMEOUT_SECONDS=300` `SWARM_TIMEOUT=1800` | 租户档位：单工具/swarm 超时（引擎默认 1800；另被剩余预算动态钳制，见 §9） |
 | `VIBE_TRADING_DATA_CACHE=1` | 开启 loader parquet 缓存（落租户数据盘，跨会话/重建持久） |
 | `VIBE_TRADING_SEARCH_BACKENDS=auto` | ddgs 搜索后端（9.x 已无 google/bing，auto 轮询全部引擎） |
 | `VIBE_TRADING_EGRESS_PROXY=http://127.0.0.1:8118` | 仅配置了 egress key 时注入；web_search/yfinance 专用出境代理（沙箱内加密隧道，见 §9） |
