@@ -1063,6 +1063,8 @@ class AgentLoop:
             fetches, gaps = collector.snapshot()
             stats["data_fetches"] = fetches
             stats["data_gaps"] = gaps
+            stats["skills"] = collector.snapshot_skills()
+            stats["swarm_runs"] = collector.snapshot_swarm()
         if reason:
             stats["reason"] = str(reason)[:500]
         try:

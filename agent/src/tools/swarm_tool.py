@@ -704,6 +704,16 @@ class SwarmTool(BaseTool):
         assert preset is not None
         variables = _build_variables(preset, prompt)
 
+        # Per-attempt swarm accounting (surfaces in attempt_stats.swarm_runs).
+        from src.core.fetch_stats import record_swarm
+
+        t_exec = time.monotonic()
+
+        def _record(status: str, rid: str | None = None, **extra: Any) -> None:
+            record_swarm(
+                preset, rid, status, int((time.monotonic() - t_exec) * 1000), **extra
+            )
+
         logger.info(
             "SwarmTool: resolved preset=%s, variables=%s from prompt: %s",
             preset,
@@ -751,16 +761,19 @@ class SwarmTool(BaseTool):
                 include_shell_tools=self.include_shell_tools,
             )
         except FileNotFoundError as exc:
+            _record("start_failed")
             return json.dumps(
                 {"status": "error", "error": f"Preset not found: {exc}"},
                 ensure_ascii=False,
             )
         except ValueError as exc:
+            _record("start_failed")
             return json.dumps(
                 {"status": "error", "error": f"Invalid DAG: {exc}"},
                 ensure_ascii=False,
             )
         except Exception as exc:
+            _record("start_failed")
             return json.dumps(
                 {"status": "error", "error": f"Failed to start swarm: {exc}"},
                 ensure_ascii=False,
@@ -768,6 +781,8 @@ class SwarmTool(BaseTool):
 
         run_id = run.id
         run_id_holder["run_id"] = run_id
+        run_agents = len(run.agents)
+        run_tasks = len(run.tasks)
         logger.info("SwarmTool: started run %s (preset=%s)", run_id, preset)
         self._emit_session_event(
             "swarm.started",
@@ -799,6 +814,7 @@ class SwarmTool(BaseTool):
 
             loaded = store.load_run(run_id)
             if loaded is None:
+                _record("error", run_id, agents=run_agents, tasks=run_tasks)
                 return json.dumps(
                     {"status": "error", "error": f"Run {run_id} disappeared"},
                     ensure_ascii=False,
@@ -806,6 +822,9 @@ class SwarmTool(BaseTool):
 
             reconciled = store.reconcile_run(loaded, write=True)
             if reconciled.status.value in ("completed", "failed", "cancelled"):
+                _record(
+                    reconciled.status.value, run_id, agents=run_agents, tasks=run_tasks
+                )
                 return _format_result(reconciled, preset, variables)
 
         # Wait budget elapsed but the run is still in flight. Do NOT cancel —
@@ -815,10 +834,14 @@ class SwarmTool(BaseTool):
         # whenever a preset legitimately ran past the budget.
         loaded = store.load_run(run_id)
         if loaded is not None:
+            _record(
+                "wait_budget_exhausted", run_id, agents=run_agents, tasks=run_tasks
+            )
             return _format_result(
                 store.reconcile_run(loaded, write=True), preset, variables, timed_out=True
             )
 
+        _record("timeout", run_id, agents=run_agents, tasks=run_tasks)
         return json.dumps(
             {"status": "timeout", "error": f"Swarm run {run_id} timed out after {_MAX_WAIT_SECONDS}s"},
             ensure_ascii=False,

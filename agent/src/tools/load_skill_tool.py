@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from src.agent.skills import SkillsLoader
 from src.agent.tools import BaseTool
+from src.core.fetch_stats import record_skill
 
 
 class LoadSkillTool(BaseTool):
@@ -41,8 +43,12 @@ class LoadSkillTool(BaseTool):
             Full skill documentation or an error message.
         """
         name = kwargs["name"]
+        t0 = time.monotonic()
         content = self._loader.get_content(name)
+        ok = not content.startswith("Error:")
+        # Per-attempt skill accounting (surfaces in attempt_stats.skills).
+        record_skill(name, ms=int((time.monotonic() - t0) * 1000), ok=ok)
         return json.dumps({
-            "status": "ok" if not content.startswith("Error:") else "error",
+            "status": "ok" if ok else "error",
             "content": content,
         }, ensure_ascii=False)
