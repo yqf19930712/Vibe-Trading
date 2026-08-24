@@ -29,6 +29,7 @@ router restart re-attaches to existing sandboxes instead of leaking them.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -87,6 +88,17 @@ FORWARD_ENV = [
     "LANGCHAIN_NO_TEMPERATURE_MODELS",
     "TUSHARE_TOKEN", "VIBE_TRADING_SEARCH_BACKENDS",
 ]
+
+# In-guest egress tunnel credentials (optional): private key file on the host
+# + ssh destination (server B). Injected into each sandbox via launcher /boot.
+EGRESS_KEY_FILE = os.environ.get("VIBE_EGRESS_KEY_FILE", "")
+EGRESS_SSH_DEST = os.environ.get("VIBE_EGRESS_SSH_DEST", "")
+_EGRESS_KEY_B64 = ""
+if EGRESS_KEY_FILE:
+    try:
+        _EGRESS_KEY_B64 = base64.b64encode(Path(EGRESS_KEY_FILE).read_bytes()).decode()
+    except OSError as e:
+        logging.getLogger("cube-router").warning("egress key unreadable: %s", e)
 
 if not ROUTER_SECRET or not ROUTER_TOKEN:
     raise SystemExit("cube-router requires VIBE_ROUTER_SECRET and VIBE_ROUTER_TOKEN")
@@ -156,6 +168,14 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
         ("SWARM_TIMEOUT", "600"),
     ):
         env[key] = os.environ.get(key, default)
+    # Whitelisted foreign egress: the launcher builds an in-guest SSH tunnel
+    # to server B's loopback tinyproxy (domain filter there); web_search and
+    # the yfinance loader then use VIBE_TRADING_EGRESS_PROXY. Key material is
+    # consumed by the launcher and never enters the engine process env.
+    if _EGRESS_KEY_B64 and EGRESS_SSH_DEST:
+        env["VIBE_EGRESS_SSH_KEY_B64"] = _EGRESS_KEY_B64
+        env["VIBE_EGRESS_SSH_DEST"] = EGRESS_SSH_DEST
+        env.setdefault("VIBE_TRADING_EGRESS_PROXY", "http://127.0.0.1:8118")
     api_key = hashlib.sha256(os.urandom(16)).hexdigest()
     env["API_AUTH_KEY"] = api_key
     return env, api_key

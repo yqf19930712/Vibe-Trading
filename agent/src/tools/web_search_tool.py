@@ -30,6 +30,25 @@ _MAX_ATTEMPTS = 3
 _BACKOFF_BASE_SECONDS = 0.8
 
 
+def _make_client(ddgs_cls, proxy: str | None):
+    """Build the DDGS client, passing the egress proxy when configured.
+
+    In restricted-egress deployments (multi-tenant sandboxes behind the
+    firewall) VIBE_TRADING_EGRESS_PROXY points at an in-guest encrypted
+    tunnel to a domain-whitelisted proxy; without it, foreign engines are
+    simply unreachable. Handles the proxy kwarg rename across ddgs versions.
+    """
+    if proxy:
+        try:
+            return ddgs_cls(proxy=proxy)
+        except TypeError:
+            try:
+                return ddgs_cls(proxies=proxy)
+            except TypeError:
+                logger.warning("ddgs client accepts no proxy kwarg; searching direct")
+    return ddgs_cls()
+
+
 class WebSearchTool(BaseTool):
     """Search the web via ddgs across several free engines and return top results."""
 
@@ -99,10 +118,11 @@ class WebSearchTool(BaseTool):
                 )
             supports_backend = False
 
+        egress_proxy = os.getenv("VIBE_TRADING_EGRESS_PROXY", "").strip() or None
         last_error: Exception | None = None
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             try:
-                with DDGS() as client:
+                with _make_client(DDGS, egress_proxy) as client:
                     if supports_backend:
                         raw = list(client.text(query, max_results=max_results, backend=backends))
                     else:

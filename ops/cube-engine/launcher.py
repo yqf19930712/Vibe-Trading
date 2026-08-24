@@ -12,6 +12,7 @@ Endpoints:
   POST /stop   -> kill the engine process.
 """
 
+import base64
 import json
 import os
 import signal
@@ -23,8 +24,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ENGINE_PORT = 8899
 LAUNCHER_PORT = 8898
 BOOT_TIMEOUT_SEC = int(os.environ.get("VIBE_LAUNCHER_BOOT_TIMEOUT", "120"))
+TUNNEL_LOCAL_PORT = int(os.environ.get("VIBE_EGRESS_LOCAL_PORT", "8118"))
 
 _engine = {"proc": None}
+# In-guest encrypted egress tunnel: sandbox -> ssh -> server B's loopback
+# tinyproxy (domain-whitelisted). A plaintext HTTP proxy across the border
+# gets keyword-reset on the CONNECT line for blocked domains; SSH does not.
+# The key is delivered via /boot env and is restricted server-side to
+# port-forwarding tinyproxy only (authorized_keys restrict,permitopen).
+_tunnel = {"proc": None, "cmd": None, "last_spawn": 0.0}
 
 
 def _engine_alive():
@@ -56,8 +64,66 @@ def _stop_engine():
     _engine["proc"] = None
 
 
+def _stop_tunnel():
+    proc = _tunnel["proc"]
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    _tunnel["proc"] = None
+
+
+def _configure_tunnel(extra_env):
+    """Consume VIBE_EGRESS_* from the boot env and (re)start the ssh tunnel.
+
+    Pops the key material so it is not passed into the engine process env.
+    Missing/empty config simply disables the tunnel.
+    """
+    key_b64 = str(extra_env.pop("VIBE_EGRESS_SSH_KEY_B64", "") or "")
+    dest = str(extra_env.pop("VIBE_EGRESS_SSH_DEST", "") or "")
+    remote = str(extra_env.pop("VIBE_EGRESS_REMOTE", "") or "127.0.0.1:8888")
+    _stop_tunnel()
+    _tunnel["cmd"] = None
+    if not key_b64 or not dest:
+        return
+    ssh_dir = os.path.expanduser("~/.ssh")
+    os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
+    key_path = os.path.join(ssh_dir, "egress_key")
+    with open(key_path, "wb") as f:
+        f.write(base64.b64decode(key_b64))
+    os.chmod(key_path, 0o600)
+    _tunnel["cmd"] = [
+        "ssh", "-i", key_path, "-N",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ExitOnForwardFailure=yes",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=3",
+        "-L", "127.0.0.1:%d:%s" % (TUNNEL_LOCAL_PORT, remote),
+        dest,
+    ]
+    _ensure_tunnel()
+
+
+def _ensure_tunnel():
+    """Respawn the tunnel if configured but dead (>=10s between attempts)."""
+    cmd = _tunnel["cmd"]
+    if not cmd:
+        return
+    proc = _tunnel["proc"]
+    if proc is not None and proc.poll() is None:
+        return
+    now = time.time()
+    if now - _tunnel["last_spawn"] < 10:
+        return
+    _tunnel["last_spawn"] = now
+    _tunnel["proc"] = subprocess.Popen(cmd, start_new_session=True)
+
+
 def _boot_engine(extra_env):
     _stop_engine()
+    _configure_tunnel(extra_env)
     env = dict(os.environ)
     env.update({str(k): str(v) for k, v in extra_env.items()})
     _engine["proc"] = subprocess.Popen(
@@ -87,10 +153,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
+            _ensure_tunnel()  # router probes before every ask -> self-heals egress
             state = "running" if (_engine_alive() and _engine_healthy()) else (
                 "starting" if _engine_alive() else "stopped"
             )
-            self._reply(200, {"launcher": "ok", "engine": state})
+            tunnel_proc = _tunnel["proc"]
+            tunnel = (
+                "off" if not _tunnel["cmd"]
+                else "up" if tunnel_proc is not None and tunnel_proc.poll() is None
+                else "down"
+            )
+            self._reply(200, {"launcher": "ok", "engine": state, "egress_tunnel": tunnel})
         else:
             self._reply(404, {"error": "not found"})
 
