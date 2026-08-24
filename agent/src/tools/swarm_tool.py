@@ -19,7 +19,7 @@ from src.agent.tools import BaseTool
 logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SECONDS = 5
-_MAX_WAIT_SECONDS = int(os.getenv("SWARM_TIMEOUT", "1800"))
+_MAX_WAIT_SECONDS = int(os.getenv("SWARM_TIMEOUT", "7200"))
 
 # Preset matching: (preset_name, keyword_patterns, weight_boost). Patterns match user intent (EN + ZH).
 _PRESET_KEYWORDS: list[tuple[str, list[str], float]] = [

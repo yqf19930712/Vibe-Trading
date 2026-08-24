@@ -165,11 +165,19 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
         ("VIBE_MAX_ITERATIONS", "25"),
         ("VIBE_TRADING_DATA_CACHE", "1"),
         ("VIBE_TRADING_TOOL_TIMEOUT_SECONDS", "300"),
-        # Swarm committees legitimately run tens of minutes (multi-layer DAG ×
-        # multi-iteration workers). The wait is still clamped to the attempt's
-        # remaining budget (cap_timeout), so no inversion — the half-hour only
-        # materializes when laicai grants a matching timeoutS for swarm asks.
-        ("SWARM_TIMEOUT", "1800"),
+        # Swarm committees legitimately run tens of minutes to hours (multi-
+        # layer DAG × multi-iteration workers). The wait is still clamped to
+        # the attempt's remaining budget (cap_timeout), so no inversion — the
+        # two hours only materialize when laicai grants a matching timeoutS
+        # for swarm asks.
+        ("SWARM_TIMEOUT", "7200"),
+        # LLM streaming read timeout (httpx). The engine default of 120s is
+        # too tight for long-context opus-class calls: incident 2026-08-24, a
+        # swarm worker's stream went silent >120s twice in a row (ReadTimeout
+        # at iteration 10 and again on the task retry), failing the whole
+        # investment_committee run. 300s rides out thinking pauses while a
+        # genuinely dead upstream still fails within one worker iteration.
+        ("TIMEOUT_SECONDS", "300"),
         # ddgs 9.x has no google/bing; "auto" rotates every engine it has.
         ("VIBE_TRADING_SEARCH_BACKENDS", "auto"),
     ):
