@@ -577,7 +577,14 @@ def run_worker(
 
                     record_stream_retry("swarm")
                     time.sleep(delay)
-            total_llm_ms += int((time.monotonic() - llm_t0) * 1000)
+            llm_elapsed_ms = int((time.monotonic() - llm_t0) * 1000)
+            total_llm_ms += llm_elapsed_ms
+            # Event ts = LLM call end; elapsed lets the gantt draw the exact
+            # segment ([ts - elapsed, ts]) on the worker lane.
+            _emit(
+                event_callback, "llm_call", agent_id, task_id,
+                {"iteration": iteration, "elapsed_ms": llm_elapsed_ms},
+            )
         except Exception as exc:
             total_llm_ms += int((time.monotonic() - llm_t0) * 1000)
             error_msg = f"LLM call failed at iteration {iteration}: {exc}"

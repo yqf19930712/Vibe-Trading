@@ -776,7 +776,17 @@ class AgentLoop:
                         reasoning_chars = 0
                         last_reasoning_emit = None
                         _time.sleep(delay)
-                self._stats["llm_ms"] += int((_time.perf_counter() - llm_t0) * 1000)
+                llm_elapsed_ms = int((_time.perf_counter() - llm_t0) * 1000)
+                self._stats["llm_ms"] += llm_elapsed_ms
+                # Persist the LLM call as a trace block (ts = end time) so the
+                # execution gantt can draw exact LLM segments instead of
+                # inferring them from gaps between tool calls.
+                try:
+                    trace.write(
+                        {"type": "llm_call", "iter": current_iter, "elapsed_ms": llm_elapsed_ms}
+                    )
+                except Exception:  # noqa: BLE001 - trace must never break the run
+                    logger.debug("llm_call trace write failed", exc_info=True)
 
                 # Cancelled mid-stream: discard this turn's partial response and
                 # end the run now, without executing any of its tool calls.
