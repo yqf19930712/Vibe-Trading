@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import os
 from urllib.parse import urlsplit
 
 import requests
@@ -16,7 +17,17 @@ from src.security.scanner import with_security_warnings
 logger = logging.getLogger(__name__)
 
 _JINA_PREFIX = "https://r.jina.ai/"
-_TIMEOUT = 30
+# (connect, read)：r.jina.ai 直连不可达时 30s 死等曾在单次调用里烧掉 90s
+# （2026-08-25 复盘 run #7/#10）——连接 5s 快败；读仍给 30s。
+_TIMEOUT = (5, 30)
+
+
+def _proxies() -> dict[str, str] | None:
+    """沙箱内 r.jina.ai 须经白名单出境隧道（同 web_search/yfinance）。"""
+    proxy = os.getenv("VIBE_TRADING_EGRESS_PROXY", "").strip()
+    if not proxy:
+        return None
+    return {"http": proxy, "https": proxy}
 _MAX_LENGTH = 8000
 _CACHED_MARKER = "Warning: This is a cached snapshot"
 
@@ -90,6 +101,7 @@ def read_url(url: str, no_cache: bool = False) -> str:
             f"{_JINA_PREFIX}{target_url}",
             headers=headers,
             timeout=_TIMEOUT,
+            proxies=_proxies(),
         )
         emit_progress("parsing", message="extracting markdown")
         if resp.status_code != 200:

@@ -599,6 +599,24 @@ def _auth(authorization: Optional[str]) -> None:
         raise HTTPException(401, "unauthorized")
 
 
+# In-flight attempts (attempt_id → (inst, sid)) so a graceful router shutdown
+# can tell engines to stop. Incident run #9 (2026-08-24): a deploy restart
+# killed the stream mid-run, the generator finally never ran, and the orphaned
+# attempt burned 27 minutes writing an answer nobody would read.
+_INFLIGHT: dict[str, tuple[Instance, str]] = {}
+
+
+@app.on_event("shutdown")
+async def _cancel_inflight_on_shutdown() -> None:
+    for attempt_id, (inst, sid) in list(_INFLIGHT.items()):
+        try:
+            await _vibe(inst, "POST", f"/sessions/{sid}/cancel", timeout=5.0)
+            log.info("shutdown: cancelled in-flight attempt %s (sid %s)", attempt_id, sid)
+        except Exception as e:  # noqa: BLE001 - best-effort during teardown
+            log.warning("shutdown cancel failed for %s: %s", attempt_id, e)
+    _INFLIGHT.clear()
+
+
 def _frame(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=False) + "\n"
 
@@ -661,6 +679,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                         )
                     stats["session_ms"] = int((time.monotonic() - sess_t0) * 1000)
                     stats["attempt_id"] = attempt_id
+                    _INFLIGHT[attempt_id] = (inst, sid)
                     # Early meta frame: laicai uses it to stamp attempt_id /
                     # session id onto its status=running placeholder row, so
                     # the admin detail page can tail engine logs/trace while
@@ -703,6 +722,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                             "stats": {"router": dict(stats), "engine": engine_stats},
                         })
                     finally:
+                        _INFLIGHT.pop(attempt_id, None)
                         pump.cancel()
                         waiter.cancel()
                         if not answered:

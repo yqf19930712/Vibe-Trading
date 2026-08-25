@@ -28,7 +28,7 @@ class _Resp:
 def captured(monkeypatch):
     box = {}
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, proxies=None):
         box["url"] = url
         box["headers"] = headers or {}
         r = box["resp"]
