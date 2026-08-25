@@ -22,7 +22,6 @@ from src.tools.redaction import is_sensitive_arg, redact_payload
         "passphrase",
         "secret",
         "headers",
-        "content",
         "env",
         "api_token",  # marker substring
         "access_token",  # marker substring
@@ -59,7 +58,9 @@ def test_is_sensitive_arg_matches_account_pii(key: str) -> None:
     assert is_sensitive_arg(key) is True
 
 
-@pytest.mark.parametrize("key", ["symbol", "side", "quantity", "url", "path", "query"])
+@pytest.mark.parametrize(
+    "key", ["symbol", "side", "quantity", "url", "path", "query", "content"]
+)
 def test_is_sensitive_arg_allows_benign_keys(key: str) -> None:
     assert is_sensitive_arg(key) is False
 
