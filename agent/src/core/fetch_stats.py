@@ -33,6 +33,14 @@ class FetchStatsCollector:
         # tool_ms and the budget clamp — record starts so attempt_stats can at
         # least surface count + final status (resolved at snapshot time).
         self._background: list[dict[str, Any]] = []
+        # LLM stream health: in-place retry counts (main loop / swarm workers)
+        # plus swarm stream attempts, so a retry RATE is computable —
+        # main-loop attempts are already counted by AgentLoop._stats.
+        self._stream: dict[str, int] = {
+            "main": 0,
+            "swarm": 0,
+            "swarm_llm_calls": 0,
+        }
 
     def record_fetch(
         self,
@@ -134,6 +142,22 @@ class FetchStatsCollector:
         with self._lock:
             return list(self._swarm_runs)
 
+    def record_stream_retry(self, source: str) -> None:
+        with self._lock:
+            if source in ("main", "swarm"):
+                self._stream[source] += 1
+
+    def record_swarm_llm_call(self) -> None:
+        with self._lock:
+            self._stream["swarm_llm_calls"] += 1
+
+    def snapshot_stream(self) -> Optional[dict[str, int]]:
+        """Return stream-retry counters, or None when nothing to report."""
+        with self._lock:
+            if not any(self._stream.values()):
+                return None
+            return dict(self._stream)
+
     def record_background(self, task_id: str, command: str) -> None:
         with self._lock:
             if len(self._background) < 20:
@@ -205,3 +229,15 @@ def record_background(task_id: str, command: str) -> None:
     collector = _COLLECTOR.get()
     if collector is not None:
         collector.record_background(task_id, command)
+
+
+def record_stream_retry(source: str) -> None:
+    collector = _COLLECTOR.get()
+    if collector is not None:
+        collector.record_stream_retry(source)
+
+
+def record_swarm_llm_call() -> None:
+    collector = _COLLECTOR.get()
+    if collector is not None:
+        collector.record_swarm_llm_call()

@@ -767,6 +767,7 @@ class AgentLoop:
                             "model": exc.model,
                         }
                         self._emit("stream_reset", reset_payload)
+                        _fetch_stats.record_stream_retry("main")
                         try:
                             trace.write({"type": "stream_reset", **reset_payload})
                         except Exception:  # noqa: BLE001 - trace must never break the run
@@ -1087,6 +1088,12 @@ class AgentLoop:
             background = collector.snapshot_background()
             if background:
                 stats["background_tasks"] = background
+            stream_retries = collector.snapshot_stream()
+            if stream_retries:
+                # Rate = (main + swarm) / (llm_calls + swarm_llm_calls);
+                # llm_calls above already counts main-loop attempts incl.
+                # retries, swarm attempts ride in this dict.
+                stats["stream_retries"] = stream_retries
         if reason:
             stats["reason"] = str(reason)[:500]
         try:

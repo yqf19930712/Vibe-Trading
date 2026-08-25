@@ -539,6 +539,9 @@ def run_worker(
             # deadline can't absorb the next backoff sleep.
             for stream_attempt in range(1 + _STREAM_RETRIES):
                 try:
+                    from src.core.fetch_stats import record_swarm_llm_call
+
+                    record_swarm_llm_call()
                     response = _stream_once()
                     break
                 except ProviderStreamError as stream_exc:
@@ -570,6 +573,9 @@ def run_worker(
                          "max_retries": _STREAM_RETRIES, "delay_s": delay,
                          "error": str(stream_exc)[:200]},
                     )
+                    from src.core.fetch_stats import record_stream_retry
+
+                    record_stream_retry("swarm")
                     time.sleep(delay)
             total_llm_ms += int((time.monotonic() - llm_t0) * 1000)
         except Exception as exc:
