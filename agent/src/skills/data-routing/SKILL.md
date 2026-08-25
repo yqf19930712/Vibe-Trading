@@ -11,8 +11,8 @@ description: Data source selection decision tree. Load this skill BEFORE any bac
 | tushare | A-shares, funds, futures, macro | Yes (`TUSHARE_TOKEN`) | China network | tushare |
 | akshare | A-shares, US, HK, futures, macro, forex | No | Unrestricted | akshare |
 | yfinance | US stocks, HK stocks, ETFs | No | Needs Yahoo Finance access | yfinance |
-| tickflow | US stocks (daily K only) | Yes (`TICKFLOW_API_KEY`) | China-direct, no proxy needed | — (runner-integrated) |
-| ifind | US & HK stocks (daily K only) | Yes (`IFIND_MCP_TOKEN`) | China-direct, no proxy needed | — (runner-integrated) |
+| tickflow | US stocks (daily K only) | Yes (`TICKFLOW_API_KEY`) | China-direct, no proxy needed | tickflow |
+| ifind | US & HK daily K + global-stock financials/events | Yes (`IFIND_MCP_TOKEN`) | China-direct, no proxy needed | ifind |
 | tencent | A-shares, HK stocks | No | China-direct | — (runner-integrated) |
 | okx | Crypto (OKX exchange) | No | Needs okx.com access | okx-market |
 | ccxt | Crypto (100+ exchanges) | No | Needs exchange access | ccxt |
@@ -56,15 +56,10 @@ backups that need no proxy (tickflow = structured REST, ifind = iFinD MCP).
 ### Using tickflow / ifind in analysis scripts
 
 Both are wired into `get_market_data` and the backtest runner (`source: "auto"`
-walks the chain; `source: "tickflow"` / `source: "ifind"` pin them). In a
-custom Python script prefer the loader classes over raw HTTP — they handle
-auth, sessions, parsing, and quirks (e.g. Cloudflare rejects the default
-Python User-Agent on api.tickflow.org):
-
-```python
-from backtest.loaders.tickflow_loader import DataLoader as TickFlow
-frames = TickFlow().fetch(["INTC.US"], "2026-06-01", "2026-08-25")  # {symbol: OHLCV df}
-```
+walks the chain; `source: "tickflow"` / `source: "ifind"` pin them). For
+scripts, load the dedicated skill for API details and quirks:
+`load_skill("tickflow")` / `load_skill("ifind")` — prefer the loader classes
+over raw HTTP (they handle auth, sessions, parsing, Cloudflare UA, retries).
 
 ## Symbol Format Reference
 
