@@ -41,6 +41,7 @@ VALID_SOURCES: set[str] = {
     "mootdx",
     "ccxt",
     "futu",
+    "ifind",
     "auto",
 }
 
@@ -87,6 +88,7 @@ def _ensure_registered() -> None:
             "backtest.loaders.mootdx_loader",
             "backtest.loaders.ccxt_loader",
             "backtest.loaders.futu",
+            "backtest.loaders.ifind_loader",
         ]
         import importlib
         for mod in _loader_modules:
@@ -110,8 +112,8 @@ def _ensure_registered() -> None:
 
 FALLBACK_CHAINS: dict[str, list[str]] = {
     "a_share":   ["tushare", "mootdx", "baostock", "tencent", "akshare"],
-    "us_equity": ["yfinance", "akshare"],
-    "hk_equity": ["yfinance", "tencent", "futu", "akshare"],
+    "us_equity": ["yfinance", "ifind", "akshare"],
+    "hk_equity": ["yfinance", "tencent", "futu", "ifind", "akshare"],
     "crypto":    ["okx", "ccxt", "yfinance"],
     "futures":   ["tushare", "akshare"],
     "fund":      ["tushare", "akshare"],
