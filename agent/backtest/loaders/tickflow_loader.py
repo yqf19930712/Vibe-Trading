@@ -4,6 +4,8 @@ Structured column-oriented kline API (https://docs.tickflow.org) — unlike the
 iFinD NL interface there is nothing to parse heuristically. Reachable from
 the mainland without the server-B egress tunnel (Aliyun direct, ~2s incl.
 TLS; verified live 2026-08-25 with INTC, values byte-identical to iFinD).
+Sits second in the us_equity/hk_equity chains, right after ifind (for .HK it
+no-ops under the current US-only plan and the chain moves on).
 
 Free-plan scope (this deployment's key): US equities only, klines rate-limited
 to 10 req/min at 1 symbol/req — a 429 gets one retry after the rate window

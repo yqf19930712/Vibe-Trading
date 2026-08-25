@@ -12,10 +12,11 @@ service. **China-direct endpoint** (`api-mcp.51ifind.com:8643`) — reachable
 without the egress proxy, which makes it a US/HK backup when yfinance is
 rate-limited. Two distinct uses:
 
-1. **OHLCV backup source** — the built-in DataLoader
+1. **Primary US/HK OHLCV source** — the built-in DataLoader
    (`backtest/loaders/ifind_loader.py`, `source: "ifind"`) serves US & HK
-   **daily** bars; part of the `auto` chains
-   (US: `yfinance → tickflow → ifind → akshare`; HK: `… → futu → ifind → akshare`).
+   **daily** bars and sits FIRST in the `auto` chains
+   (US: `ifind → tickflow → yfinance → akshare`;
+   HK: `ifind → tickflow → yfinance → tencent → futu → akshare`).
 2. **Beyond-OHLCV lookups** — natural-language tools for 港美股 profiles,
    financials (ROE/ROA/growth), and corporate events (IPO/回购/分红) that no
    other integrated source provides for US/HK.
@@ -108,4 +109,5 @@ covering A-share data — but tushare/akshare are preferred there.
 - The MCP session can expire; re-run `initialize` on 400/401/404 (the loader
   does this automatically).
 - The NL backend is slower (~3–8s per query) and less deterministic than
-  structured sources — for plain US daily OHLCV prefer `tickflow` first.
+  structured sources — if a query comes back unparsable, fall through to
+  `tickflow`/`yfinance` instead of rephrasing in a loop.

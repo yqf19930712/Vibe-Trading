@@ -114,8 +114,11 @@ def _ensure_registered() -> None:
 
 FALLBACK_CHAINS: dict[str, list[str]] = {
     "a_share":   ["tushare", "mootdx", "baostock", "tencent", "akshare"],
-    "us_equity": ["yfinance", "tickflow", "ifind", "akshare"],
-    "hk_equity": ["yfinance", "tencent", "futu", "ifind", "akshare"],
+    # 2026-08-25 运营决策：美/港股国内直连源优先（ifind > tickflow），
+    # yfinance 等原有顺序整体后移——出境隧道+Yahoo 限频只作兜底。
+    # tickflow 免费档目前仅美股，对 .HK 快速空跳过、留作升级位。
+    "us_equity": ["ifind", "tickflow", "yfinance", "akshare"],
+    "hk_equity": ["ifind", "tickflow", "yfinance", "tencent", "futu", "akshare"],
     "crypto":    ["okx", "ccxt", "yfinance"],
     "futures":   ["tushare", "akshare"],
     "fund":      ["tushare", "akshare"],

@@ -31,11 +31,12 @@ You do NOT need to specify a concrete data source in config.json unless the user
 2. Pick the source by priority:
 
 **A-shares**: tushare (if TUSHARE_TOKEN is set) > akshare (free fallback)
-**US stocks**: yfinance > tickflow > ifind > akshare — yfinance goes through the
-egress proxy and Yahoo rate-limits the shared exit IP, so when it returns empty
-or 429, do NOT retry it in a loop: tickflow and ifind are China-direct daily-K
-backups that need no proxy (tickflow = structured REST, ifind = iFinD MCP).
-**HK stocks**: yfinance > tencent > ifind > akshare
+**US stocks**: ifind > tickflow > yfinance > akshare — ifind and tickflow are
+China-direct (no egress proxy) and go first; yfinance rides the egress proxy
+and Yahoo rate-limits the shared exit IP, so it is a fallback only — when it
+returns empty or 429, do NOT retry it in a loop.
+**HK stocks**: ifind > tickflow > yfinance > tencent > akshare (tickflow's
+current plan is US-only — it no-ops for .HK and the chain moves on)
 **Crypto**: okx (single exchange) > ccxt (multi-exchange)
 **Futures**: tushare > akshare
 **Macro / economics**: akshare > tushare
@@ -79,13 +80,13 @@ The backtest runner implements automatic fallback at the market level:
 ```
 User requests INTC.US (US stock)
   -> detect market: us_equity
-  -> try yfinance: Yahoo rate-limited -> empty
-  -> try tickflow: TICKFLOW_API_KEY set -> use tickflow
+  -> try ifind: IFIND_MCP_TOKEN set -> use ifind
+  -> (if ifind empty/quota) try tickflow -> yfinance -> akshare
   -> success (zero config required)
 ```
 
-Current chains: us_equity = yfinance → tickflow → ifind → akshare;
-hk_equity = yfinance → tencent → futu → ifind → akshare;
+Current chains: us_equity = ifind → tickflow → yfinance → akshare;
+hk_equity = ifind → tickflow → yfinance → tencent → futu → akshare;
 a_share = tushare → mootdx → baostock → tencent → akshare.
 
 This is transparent to the user — they just see results.
