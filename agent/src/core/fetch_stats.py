@@ -29,6 +29,18 @@ class FetchStatsCollector:
         # skill name -> {"calls": n, "ms": total, "errors": n}
         self._skills: dict[str, dict[str, int]] = {}
         self._swarm_runs: list[dict[str, Any]] = []
+        # background_run launches: work happens on detached threads, outside
+        # tool_ms and the budget clamp — record starts so attempt_stats can at
+        # least surface count + final status (resolved at snapshot time).
+        self._background: list[dict[str, Any]] = []
+        # LLM stream health: in-place retry counts (main loop / swarm workers)
+        # plus swarm stream attempts, so a retry RATE is computable —
+        # main-loop attempts are already counted by AgentLoop._stats.
+        self._stream: dict[str, int] = {
+            "main": 0,
+            "swarm": 0,
+            "swarm_llm_calls": 0,
+        }
 
     def record_fetch(
         self,
@@ -78,6 +90,10 @@ class FetchStatsCollector:
         ms: int,
         agents: Optional[int] = None,
         tasks: Optional[int] = None,
+        llm_ms: Optional[int] = None,
+        tool_ms: Optional[int] = None,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
     ) -> None:
         with self._lock:
             if len(self._swarm_runs) < 20:  # bound for pathological loops
@@ -91,6 +107,16 @@ class FetchStatsCollector:
                     entry["agents"] = int(agents)
                 if tasks is not None:
                     entry["tasks"] = int(tasks)
+                # Cumulative worker effort split (parallel layers can make
+                # these exceed the run's wall-clock ms above).
+                if llm_ms is not None:
+                    entry["llm_ms"] = max(0, int(llm_ms))
+                if tool_ms is not None:
+                    entry["tool_ms"] = max(0, int(tool_ms))
+                if input_tokens is not None:
+                    entry["input_tokens"] = max(0, int(input_tokens))
+                if output_tokens is not None:
+                    entry["output_tokens"] = max(0, int(output_tokens))
                 self._swarm_runs.append(entry)
 
     def snapshot(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -115,6 +141,48 @@ class FetchStatsCollector:
     def snapshot_swarm(self) -> list[dict[str, Any]]:
         with self._lock:
             return list(self._swarm_runs)
+
+    def record_stream_retry(self, source: str) -> None:
+        with self._lock:
+            if source in ("main", "swarm"):
+                self._stream[source] += 1
+
+    def record_swarm_llm_call(self) -> None:
+        with self._lock:
+            self._stream["swarm_llm_calls"] += 1
+
+    def snapshot_stream(self) -> Optional[dict[str, int]]:
+        """Return stream-retry counters, or None when nothing to report."""
+        with self._lock:
+            if not any(self._stream.values()):
+                return None
+            return dict(self._stream)
+
+    def record_background(self, task_id: str, command: str) -> None:
+        with self._lock:
+            if len(self._background) < 20:
+                self._background.append(
+                    {"task_id": str(task_id)[:20], "command": str(command)[:120]}
+                )
+
+    def snapshot_background(self) -> list[dict[str, Any]]:
+        """Return recorded background launches with their CURRENT status,
+        resolved from the BackgroundManager singleton at snapshot time — a
+        task still running when the attempt ends shows as "running"."""
+        with self._lock:
+            entries = [dict(e) for e in self._background]
+        if not entries:
+            return entries
+        try:
+            from src.tools.background_tools import get_background_manager
+
+            tasks = get_background_manager().tasks
+            for e in entries:
+                t = tasks.get(e["task_id"])
+                e["status"] = (t or {}).get("status", "unknown")
+        except Exception:  # noqa: BLE001 - stats must never break the run
+            pass
+        return entries
 
 
 _COLLECTOR: contextvars.ContextVar[Optional[FetchStatsCollector]] = contextvars.ContextVar(
@@ -155,3 +223,21 @@ def record_swarm(preset: str, run_id: Optional[str], status: str, ms: int, **kwa
     collector = _COLLECTOR.get()
     if collector is not None:
         collector.record_swarm(preset, run_id, status, ms, **kwargs)
+
+
+def record_background(task_id: str, command: str) -> None:
+    collector = _COLLECTOR.get()
+    if collector is not None:
+        collector.record_background(task_id, command)
+
+
+def record_stream_retry(source: str) -> None:
+    collector = _COLLECTOR.get()
+    if collector is not None:
+        collector.record_stream_retry(source)
+
+
+def record_swarm_llm_call() -> None:
+    collector = _COLLECTOR.get()
+    if collector is not None:
+        collector.record_swarm_llm_call()

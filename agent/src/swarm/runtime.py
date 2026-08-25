@@ -7,6 +7,8 @@ with cancellation and event callback support.
 
 from __future__ import annotations
 
+import contextvars
+import functools
 import logging
 import os
 import threading
@@ -135,9 +137,16 @@ class SwarmRuntime:
             if live_callback is not None:
                 self._live_callbacks[run.id] = live_callback
 
+        # Propagate contextvars into the run thread — notably the per-attempt
+        # FetchStatsCollector bound by AgentLoop (src/core/fetch_stats.py), so
+        # worker load_skill / data-fetch accounting lands in the calling
+        # attempt's attempt_stats instead of a no-op. A plain Thread target
+        # does not inherit context; copy_context() at spawn time does.
+        run_ctx = contextvars.copy_context()
         thread = threading.Thread(
-            target=self._execute_run,
-            args=(run, cancel_event, include_shell_tools),
+            target=functools.partial(
+                run_ctx.run, self._execute_run, run, cancel_event, include_shell_tools
+            ),
             name=f"swarm-{run.id}",
             daemon=True,
         )
@@ -289,9 +298,11 @@ class SwarmRuntime:
 
                 # Process results
                 for tid, result in layer_results.items():
-                    # Accumulate token counts to run totals
+                    # Accumulate token counts / time split to run totals
                     run.total_input_tokens += result.input_tokens
                     run.total_output_tokens += result.output_tokens
+                    run.total_llm_ms += result.llm_ms
+                    run.total_tool_ms += result.tool_ms
 
                     if result.status == "completed":
                         task_summaries[tid] = result.summary
@@ -300,9 +311,11 @@ class SwarmRuntime:
                             tid,
                             TaskStatus.completed,
                             summary=result.summary,
-                            completed_at=now_iso,
+                            completed_at=result.finished_at or now_iso,
                             artifacts=result.artifact_paths,
                             worker_iterations=result.iterations,
+                            llm_ms=result.llm_ms,
+                            tool_ms=result.tool_ms,
                         )
                         resolve_dependencies(run_dir / "tasks", tid)
                         self._emit_event(
@@ -315,6 +328,9 @@ class SwarmRuntime:
                                     "iterations": result.iterations,
                                     "input_tokens": result.input_tokens,
                                     "output_tokens": result.output_tokens,
+                                    "llm_ms": result.llm_ms,
+                                    "tool_ms": result.tool_ms,
+                                    "finished_at": result.finished_at,
                                 },
                             ),
                         )
@@ -325,8 +341,11 @@ class SwarmRuntime:
                             TaskStatus.failed,
                             error=redact_internal_paths(result.error)
                             or f"worker did not complete (status={result.status})",
-                            completed_at=datetime.now(timezone.utc).isoformat(),
+                            completed_at=result.finished_at
+                            or datetime.now(timezone.utc).isoformat(),
                             worker_iterations=result.iterations,
+                            llm_ms=result.llm_ms,
+                            tool_ms=result.tool_ms,
                         )
                         self._emit_event(
                             run_id,
@@ -337,6 +356,7 @@ class SwarmRuntime:
                                     "error": redact_internal_paths(result.error),
                                     "input_tokens": result.input_tokens,
                                     "output_tokens": result.output_tokens,
+                                    "finished_at": result.finished_at,
                                 },
                             ),
                         )
@@ -572,17 +592,24 @@ class SwarmRuntime:
                     if source_task_id in task_summaries:
                         upstream[context_key] = task_summaries[source_task_id]
 
+                # Fresh context copy per submit (a Context can't be entered
+                # concurrently) so worker threads inherit the attempt's
+                # FetchStatsCollector — see the start_run spawn comment.
+                worker_ctx = contextvars.copy_context()
                 future = executor.submit(
-                    self._run_worker_with_retries,
-                    agent_spec=agent_spec,
-                    task=task,
-                    upstream_summaries=upstream,
-                    user_vars=run.user_vars,
-                    run_dir=run_dir,
-                    event_callback=_event_callback,
-                    run_id=run.id,
-                    include_shell_tools=include_shell_tools,
-                    grounding_block=grounding_block,
+                    worker_ctx.run,
+                    functools.partial(
+                        self._run_worker_with_retries,
+                        agent_spec=agent_spec,
+                        task=task,
+                        upstream_summaries=upstream,
+                        user_vars=run.user_vars,
+                        run_dir=run_dir,
+                        event_callback=_event_callback,
+                        run_id=run.id,
+                        include_shell_tools=include_shell_tools,
+                        grounding_block=grounding_block,
+                    ),
                 )
                 futures[future] = tid
                 per_task_budget = agent_spec.timeout_seconds * (agent_spec.max_retries + 1)
@@ -667,6 +694,8 @@ class SwarmRuntime:
         max_retries = agent_spec.max_retries
         cumulative_input_tokens = 0
         cumulative_output_tokens = 0
+        cumulative_llm_ms = 0
+        cumulative_tool_ms = 0
         result: WorkerResult | None = None
 
         for attempt in range(max_retries + 1):
@@ -702,9 +731,16 @@ class SwarmRuntime:
                 grounding_block=grounding_block,
                 agent_config=self._agent_config,
             )
+            # Real per-task completion time. The layer barrier persists task
+            # status much later (all tasks used to share one completed_at).
+            result = result.model_copy(
+                update={"finished_at": datetime.now(timezone.utc).isoformat()}
+            )
 
             cumulative_input_tokens += result.input_tokens
             cumulative_output_tokens += result.output_tokens
+            cumulative_llm_ms += result.llm_ms
+            cumulative_tool_ms += result.tool_ms
 
             if result.status != "failed":
                 # Success (or timeout/token_limit/completed) — no more retries
@@ -712,6 +748,8 @@ class SwarmRuntime:
                     update={
                         "input_tokens": cumulative_input_tokens,
                         "output_tokens": cumulative_output_tokens,
+                        "llm_ms": cumulative_llm_ms,
+                        "tool_ms": cumulative_tool_ms,
                     }
                 )
                 return result
@@ -722,6 +760,8 @@ class SwarmRuntime:
                 update={
                     "input_tokens": cumulative_input_tokens,
                     "output_tokens": cumulative_output_tokens,
+                    "llm_ms": cumulative_llm_ms,
+                    "tool_ms": cumulative_tool_ms,
                 }
             )
         return result  # type: ignore[return-value]

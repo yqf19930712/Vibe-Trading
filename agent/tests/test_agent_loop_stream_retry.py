@@ -171,15 +171,28 @@ def test_transient_stream_failure_is_retried_and_run_succeeds(
     assert reset["model"] == "deepseek-v4-pro"
 
 
-def test_double_stream_failure_fails_run(monkeypatch, tmp_path: Path) -> None:
-    """Two consecutive transient failures → failed run, no third attempt."""
-    llm = _FlakyLoopLLM([_transient_error(), _transient_error()], "Final answer.")
+def test_burst_of_stream_failures_is_ridden_out(monkeypatch, tmp_path: Path) -> None:
+    """A burst shorter than the retry budget recovers in place (2026-08-24)."""
+    llm = _FlakyLoopLLM(
+        [_transient_error(), _transient_error(), _transient_error()], "Final answer."
+    )
+
+    result = _run(monkeypatch, tmp_path, llm)
+
+    assert result["status"] == "success"
+    assert llm.calls == 4
+
+
+def test_stream_failures_beyond_retry_budget_fail_run(monkeypatch, tmp_path: Path) -> None:
+    """More consecutive failures than 1+STREAM_RETRIES → failed run."""
+    errors = [_transient_error()] * (1 + loop_mod.STREAM_RETRIES)
+    llm = _FlakyLoopLLM(errors, "Final answer.")
 
     result = _run(monkeypatch, tmp_path, llm)
 
     assert result["status"] == "failed"
     assert result["error_code"] == "provider_stream_error"
-    assert llm.calls == 2
+    assert llm.calls == 1 + loop_mod.STREAM_RETRIES
 
 
 def test_non_retryable_4xx_fails_without_retry(monkeypatch, tmp_path: Path) -> None:

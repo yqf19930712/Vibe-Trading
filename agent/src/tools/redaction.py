@@ -61,10 +61,15 @@ _PII_EXACT_KEYS = {
     "bank_account_number",
 }
 
+#: NOTE: ``content`` was removed from this set on 2026-08-25 — it blanket-hid
+#: every tool result body (skill docs, file writes, reports) from the
+#: admin-only observability surfaces (trace / swarm events / deep-trace page),
+#: which made them useless for debugging. Credentials/PII markers below still
+#: scrub nested fields inside content payloads; ``env`` / ``headers`` stay
+#: redacted because they habitually carry whole credential sets.
 _SENSITIVE_ARG_KEYS = {
     "api_key",
     "authorization",
-    "content",
     "env",
     "headers",
     "passphrase",

@@ -86,7 +86,7 @@ FORWARD_ENV = [
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
     "LANGCHAIN_PROVIDER", "LANGCHAIN_MODEL_NAME", "LANGCHAIN_TEMPERATURE",
     "LANGCHAIN_NO_TEMPERATURE_MODELS",
-    "TUSHARE_TOKEN", "VIBE_TRADING_SEARCH_BACKENDS",
+    "TUSHARE_TOKEN", "VIBE_TRADING_SEARCH_BACKENDS", "JINA_API_KEY",
 ]
 
 # In-guest egress tunnel credentials (optional): private key file on the host
@@ -165,13 +165,25 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
         ("VIBE_MAX_ITERATIONS", "25"),
         ("VIBE_TRADING_DATA_CACHE", "1"),
         ("VIBE_TRADING_TOOL_TIMEOUT_SECONDS", "300"),
-        # Swarm committees legitimately run tens of minutes (multi-layer DAG ×
-        # multi-iteration workers). The wait is still clamped to the attempt's
-        # remaining budget (cap_timeout), so no inversion — the half-hour only
-        # materializes when laicai grants a matching timeoutS for swarm asks.
-        ("SWARM_TIMEOUT", "1800"),
+        # Swarm committees legitimately run tens of minutes to hours (multi-
+        # layer DAG × multi-iteration workers). The wait is still clamped to
+        # the attempt's remaining budget (cap_timeout), so no inversion — the
+        # two hours only materialize when laicai grants a matching timeoutS
+        # for swarm asks.
+        ("SWARM_TIMEOUT", "7200"),
+        # LLM streaming read timeout (httpx). The engine default of 120s is
+        # too tight for long-context opus-class calls: incident 2026-08-24, a
+        # swarm worker's stream went silent >120s twice in a row (ReadTimeout
+        # at iteration 10 and again on the task retry), failing the whole
+        # investment_committee run. 300s rides out thinking pauses while a
+        # genuinely dead upstream still fails within one worker iteration.
+        ("TIMEOUT_SECONDS", "300"),
         # ddgs 9.x has no google/bing; "auto" rotates every engine it has.
         ("VIBE_TRADING_SEARCH_BACKENDS", "auto"),
+        # Models habitually download files to /tmp then read_document them;
+        # the sandbox is hardware-isolated so /tmp is safe to allow (run #10:
+        # a Meituan filing PDF at /tmp got rejected and cost a detour).
+        ("VIBE_TRADING_ALLOWED_FILE_ROOTS", "/tmp"),
     ):
         env[key] = os.environ.get(key, default)
     # Whitelisted foreign egress: the launcher builds an in-guest SSH tunnel
@@ -587,6 +599,24 @@ def _auth(authorization: Optional[str]) -> None:
         raise HTTPException(401, "unauthorized")
 
 
+# In-flight attempts (attempt_id → (inst, sid)) so a graceful router shutdown
+# can tell engines to stop. Incident run #9 (2026-08-24): a deploy restart
+# killed the stream mid-run, the generator finally never ran, and the orphaned
+# attempt burned 27 minutes writing an answer nobody would read.
+_INFLIGHT: dict[str, tuple[Instance, str]] = {}
+
+
+@app.on_event("shutdown")
+async def _cancel_inflight_on_shutdown() -> None:
+    for attempt_id, (inst, sid) in list(_INFLIGHT.items()):
+        try:
+            await _vibe(inst, "POST", f"/sessions/{sid}/cancel", timeout=5.0)
+            log.info("shutdown: cancelled in-flight attempt %s (sid %s)", attempt_id, sid)
+        except Exception as e:  # noqa: BLE001 - best-effort during teardown
+            log.warning("shutdown cancel failed for %s: %s", attempt_id, e)
+    _INFLIGHT.clear()
+
+
 def _frame(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=False) + "\n"
 
@@ -623,7 +653,13 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                 stats.update(meta)
             inst.refcount += 1
             try:
+                # Per-tenant serialization point: a second ask for the same
+                # tenant queues HERE while the first is running — previously
+                # invisible (incident run #9: 93 min of silent lock wait read
+                # as a giant first_progress). Measure it explicitly.
+                lock_t0 = time.monotonic()
                 async with inst.lock:
+                    stats["lock_wait_ms"] = int((time.monotonic() - lock_t0) * 1000)
                     sess_t0 = time.monotonic()
                     # Engine-side budget = what's left of the caller's timeout
                     # after queueing/boot, minus a margin for the answer poll.
@@ -643,6 +679,17 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                         )
                     stats["session_ms"] = int((time.monotonic() - sess_t0) * 1000)
                     stats["attempt_id"] = attempt_id
+                    _INFLIGHT[attempt_id] = (inst, sid)
+                    # Early meta frame: laicai uses it to stamp attempt_id /
+                    # session id onto its status=running placeholder row, so
+                    # the admin detail page can tail engine logs/trace while
+                    # the run is still in flight (not only after the terminal
+                    # frame). Consumers ignore unknown ev names, so this is
+                    # backward-compatible.
+                    yield _frame({
+                        "t": "progress", "ev": "attempt_meta",
+                        "data": {"attempt_id": attempt_id, "vibe_session_id": sid},
+                    })
 
                     answered = False
                     q: "asyncio.Queue[dict]" = asyncio.Queue()
@@ -675,6 +722,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                             "stats": {"router": dict(stats), "engine": engine_stats},
                         })
                     finally:
+                        _INFLIGHT.pop(attempt_id, None)
                         pump.cancel()
                         waiter.cancel()
                         if not answered:
@@ -866,6 +914,41 @@ async def obs_trace(
             out.append(_obs_clip(json.loads(line)))
         except Exception:
             continue
+    return {"entries": out[-limit:], "truncated": len(out) > limit}
+
+
+@app.get("/obs/swarm-events")
+async def obs_swarm_events(
+    uid: str,
+    run_id: str,
+    limit: int = 800,
+    skip_heartbeats: int = 0,
+    authorization: Optional[str] = Header(None),
+):
+    """Tail a swarm run's internal event log (worker tool calls, retries,
+    heartbeats) off the tenant bind-mount — the run_swarm counterpart of
+    /obs/trace, so the laicai detail page can render per-worker execution
+    without SSH. run_id comes from attempt_stats.swarm_runs[].run_id."""
+    _auth(authorization)
+    if not _OBS_ID_RE.fullmatch(run_id):
+        raise HTTPException(400, "invalid run_id")
+    limit = max(1, min(limit, 2000))
+    path = DATA_ROOT / tenant_key(uid) / ".swarm" / "runs" / run_id / "events.jsonl"
+    if not path.exists():
+        return {"entries": [], "truncated": False}
+    raw = await asyncio.to_thread(_obs_tail_lines, path)
+    out = []
+    for line in raw:
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        # Heartbeats are ~90% of a long run's event log; filtering BEFORE the
+        # limit keeps early task_started/tool events inside the tail window
+        # (the laicai gantt needs full-run coverage, not the last N ticks).
+        if skip_heartbeats and e.get("type") == "task_heartbeat":
+            continue
+        out.append(_obs_clip(e))
     return {"entries": out[-limit:], "truncated": len(out) > limit}
 
 

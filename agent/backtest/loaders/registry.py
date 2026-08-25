@@ -80,8 +80,19 @@ def _ensure_registered() -> None:
     for mod in _loader_modules:
         try:
             importlib.import_module(mod)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - optional dep missing is normal
+            # Not silent anymore: a cold-boot transient here starved a whole
+            # attempt of every data source (2026-08-25 smoke: first tool call
+            # saw an empty registry, "Unknown data source: yfinance").
+            logger.warning(
+                "loader module %s failed to import: %s", mod, str(exc)[:200]
+            )
+    if not LOADER_REGISTRY:
+        # Boot-time race left NOTHING registered — do not latch, so the next
+        # call retries the imports instead of running blind for the process
+        # lifetime.
+        logger.warning("loader registry empty after import pass; will retry")
+        _registered = False
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +102,7 @@ def _ensure_registered() -> None:
 FALLBACK_CHAINS: dict[str, list[str]] = {
     "a_share":   ["tushare", "mootdx", "baostock", "tencent", "akshare"],
     "us_equity": ["yfinance", "akshare"],
-    "hk_equity": ["yfinance", "futu", "akshare"],
+    "hk_equity": ["yfinance", "tencent", "futu", "akshare"],
     "crypto":    ["okx", "ccxt", "yfinance"],
     "futures":   ["tushare", "akshare"],
     "fund":      ["tushare", "akshare"],

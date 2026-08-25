@@ -68,6 +68,8 @@ def test_read_url_allows_public_http_targets(monkeypatch: pytest.MonkeyPatch) ->
         {
             "url": "https://r.jina.ai/https://example.com/docs?x=1",
             "headers": {"Accept": "text/markdown"},
-            "timeout": 30,
+            # (connect, read)：连接 5s 快败（2026-08-25），经 egress 代理透传
+            "timeout": (5, 30),
+            "proxies": None,
         }
     ]

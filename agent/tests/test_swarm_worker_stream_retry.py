@@ -143,17 +143,35 @@ def test_single_stream_failure_is_retried_and_worker_succeeds(monkeypatch, tmp_p
     assert llm.calls == 2
 
 
-def test_double_stream_failure_fails_worker(monkeypatch, tmp_path):
-    """Two consecutive ProviderStreamErrors → existing failure path (no 3rd try)."""
+def test_burst_of_stream_failures_is_ridden_out(monkeypatch, tmp_path):
+    """A burst shorter than the retry budget recovers in place (no task fail).
+
+    Incident 2026-08-24: two consecutive stream failures killed the task at
+    iteration 10+ under the retry-once policy. With _STREAM_RETRIES=3 the
+    worker now absorbs up to 3 consecutive failures per iteration.
+    """
     llm = _FlakyChatLLM(
-        [_stream_error(), _stream_error()], LLMResponse(content=FINAL_TEXT)
+        [_stream_error(), _stream_error(), _stream_error()],
+        LLMResponse(content=FINAL_TEXT),
     )
+
+    result = _run(monkeypatch, tmp_path, llm)
+
+    assert result.status == "completed"
+    assert result.error is None
+    assert llm.calls == 4
+
+
+def test_stream_failures_beyond_retry_budget_fail_worker(monkeypatch, tmp_path):
+    """More consecutive failures than 1+_STREAM_RETRIES → failure path."""
+    errors = [_stream_error()] * (1 + worker_mod._STREAM_RETRIES)
+    llm = _FlakyChatLLM(errors, LLMResponse(content=FINAL_TEXT))
 
     result = _run(monkeypatch, tmp_path, llm)
 
     assert result.status == "failed"
     assert "LLM call failed at iteration 0" in (result.error or "")
-    assert llm.calls == 2
+    assert llm.calls == 1 + worker_mod._STREAM_RETRIES
 
 
 def test_non_stream_error_is_not_retried(monkeypatch, tmp_path):

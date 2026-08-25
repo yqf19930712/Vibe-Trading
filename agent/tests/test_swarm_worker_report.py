@@ -66,7 +66,9 @@ def test_preview_tool_arguments_redacts_sensitive_values() -> None:
 
     assert preview == {
         "path": "report.md",
-        "content": "[redacted]",
+        # content is no longer blanket-redacted (2026-08-25) — observability
+        # needs tool bodies; credential keys inside still get scrubbed.
+        "content": "# very long confidential report",
         "headers": "[redacted]",
         "api_token": "[redacted]",
     }

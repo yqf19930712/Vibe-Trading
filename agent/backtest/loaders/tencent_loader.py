@@ -1,7 +1,9 @@
-"""Tencent Finance loader: free, no-auth A-share data via HTTP API.
+"""Tencent Finance loader: free, no-auth A-share & HK data via HTTP API.
 
 Uses Tencent's ifzq.gtimg.cn API which is not blocked by eastmoney's CDN.
-Covers: A-shares (SH/SZ).  No API token required.
+Covers: A-shares (SH/SZ) and HK equities (NNNNN.HK → hkNNNNN; verified live
+2026-08-25 with hk03690).  No API token required, reachable from mainland
+without egress.
 
 API format:
   https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh601595,day,2026-06-01,2026-06-13,500,qfq
@@ -23,16 +25,16 @@ logger = logging.getLogger(__name__)
 _BASE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 
 
-def _is_a_share(code: str) -> bool:
-    return code.upper().endswith((".SZ", ".SH"))
+def _is_supported(code: str) -> bool:
+    return code.upper().endswith((".SZ", ".SH", ".HK"))
 
 
 @register
 class DataLoader:
-    """Tencent Finance A-share OHLCV loader (free, HTTP, no auth)."""
+    """Tencent Finance A-share/HK OHLCV loader (free, HTTP, no auth)."""
 
     name = "tencent"
-    markets = {"a_share"}
+    markets = {"a_share", "hk_equity"}
     requires_auth = False
 
     def is_available(self) -> bool:
@@ -74,7 +76,7 @@ class DataLoader:
     def _fetch_one(
         self, code: str, start_date: str, end_date: str,
     ) -> Optional[pd.DataFrame]:
-        if not _is_a_share(code):
+        if not _is_supported(code):
             return None
 
         parts = code.upper().split(".")
@@ -85,6 +87,9 @@ class DataLoader:
             tencent_code = f"sh{symbol}"
         elif suffix == "SZ":
             tencent_code = f"sz{symbol}"
+        elif suffix == "HK":
+            # Tencent HK codes are 5-digit zero-padded: 03690.HK → hk03690.
+            tencent_code = f"hk{symbol.zfill(5)}"
         else:
             return None
 
