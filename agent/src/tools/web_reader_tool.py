@@ -91,6 +91,11 @@ def read_url(url: str, no_cache: bool = False) -> str:
 
     try:
         headers = {"Accept": "text/markdown"}
+        # Jina 对部分数据中心 ASN（含 server B 出口 AS20473）禁止匿名请求
+        # （401 AuthenticationRequiredError）；配置免费 API key 即可解除。
+        api_key = os.getenv("JINA_API_KEY", "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         if no_cache:
             headers["x-no-cache"] = "true"
         emit_progress(
