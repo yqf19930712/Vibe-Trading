@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -44,6 +45,22 @@ _PERIOD_MAP = {"1D": "1d", "D": "1d", "1DAY": "1d", "DAY": "1d"}
 
 def _api_key() -> str:
     return os.environ.get("TICKFLOW_API_KEY", "").strip()
+
+
+# Bare uppercase tickers (AVGO, SPY) reach the us_equity chain via
+# detect_market's bare-ticker route — normalize them to the API's TICKER.US
+# form instead of skipping (attempt f9b0c0cdcded: bare "AVGO" no-opped every
+# domestic source). Yahoo specials (GC=F, ^TNX, DX-Y.NYB) stay unsupported.
+_BARE_US_RE = re.compile(r"^[A-Z]{1,5}$")
+
+
+def _to_us_symbol(code: str) -> Optional[str]:
+    upper = code.strip().upper()
+    if upper.endswith(".US"):
+        return upper
+    if _BARE_US_RE.match(upper):
+        return f"{upper}.US"
+    return None
 
 
 def _to_ms(date_str: str) -> int:
@@ -155,10 +172,10 @@ class DataLoader:
     def _fetch_one(
         self, code: str, start_date: str, end_date: str,
     ) -> Optional[pd.DataFrame]:
-        upper = code.strip().upper()
-        if not upper.endswith(".US"):
+        symbol = _to_us_symbol(code)
+        if symbol is None:
             return None
-        payload = _get_klines(upper, start_date, end_date)
+        payload = _get_klines(symbol, start_date, end_date)
         if payload is None:
             return None
         return _to_frame(payload)

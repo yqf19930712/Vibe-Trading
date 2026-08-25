@@ -78,3 +78,27 @@ class TestLoader:
         monkeypatch.setenv("TICKFLOW_API_KEY", "tk_x")
         loader = DataLoader()
         assert loader._fetch_one("600036.SH", "2026-06-01", "2026-08-25") is None
+
+
+class TestToUsSymbol:
+    def test_suffixed_passthrough(self):
+        from backtest.loaders.tickflow_loader import _to_us_symbol
+
+        assert _to_us_symbol("INTC.US") == "INTC.US"
+        assert _to_us_symbol("intc.us") == "INTC.US"
+
+    def test_bare_ticker_normalized(self):
+        from backtest.loaders.tickflow_loader import _to_us_symbol
+
+        # attempt f9b0c0cdcded: bare "AVGO" must not no-op the loader.
+        assert _to_us_symbol("AVGO") == "AVGO.US"
+        assert _to_us_symbol("SPY") == "SPY.US"
+
+    def test_non_us_rejected(self):
+        from backtest.loaders.tickflow_loader import _to_us_symbol
+
+        assert _to_us_symbol("600036.SH") is None
+        assert _to_us_symbol("03690.HK") is None
+        assert _to_us_symbol("GC=F") is None
+        assert _to_us_symbol("^TNX") is None
+        assert _to_us_symbol("BTC-USDT") is None

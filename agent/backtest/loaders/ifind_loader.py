@@ -238,6 +238,12 @@ def _parse_answer_table(answer: str) -> Optional[pd.DataFrame]:
     return None
 
 
+# Bare uppercase tickers (AVGO, SPY) reach the us_equity chain via
+# detect_market's bare-ticker route — treat them as US instead of skipping
+# (attempt f9b0c0cdcded: bare "AVGO" no-opped every domestic source).
+_BARE_US_RE = re.compile(r"^[A-Z]{1,5}$")
+
+
 def _build_query(code: str, start_date: str, end_date: str) -> Optional[str]:
     upper = code.strip().upper()
     start = start_date.replace("-", "")
@@ -246,6 +252,8 @@ def _build_query(code: str, start_date: str, end_date: str) -> Optional[str]:
         market, symbol = "美股", upper[:-3]
     elif upper.endswith(".HK"):
         market, symbol = "港股", upper[:-3].lstrip("0") or "0"
+    elif _BARE_US_RE.match(upper):
+        market, symbol = "美股", upper
     else:
         return None
     return (

@@ -84,9 +84,17 @@ class TestBuildQuery:
         assert q is not None
         assert "港股3690" in q
 
+    def test_bare_us_ticker(self):
+        # attempt f9b0c0cdcded: bare "AVGO" must not no-op the loader.
+        q = _build_query("AVGO", "2026-06-01", "2026-08-25")
+        assert q is not None
+        assert "美股AVGO" in q
+
     def test_unsupported_market(self):
         assert _build_query("600036.SH", "2026-06-01", "2026-08-25") is None
         assert _build_query("BTC-USDT", "2026-06-01", "2026-08-25") is None
+        assert _build_query("GC=F", "2026-06-01", "2026-08-25") is None
+        assert _build_query("^TNX", "2026-06-01", "2026-08-25") is None
 
 
 class TestLoader:
