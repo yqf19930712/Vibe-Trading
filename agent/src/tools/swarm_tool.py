@@ -669,6 +669,28 @@ class SwarmTool(BaseTool):
         self.include_shell_tools = include_shell_tools
         self._event_callback = event_callback
 
+    def _emit_swarm_usage(self, run_id: str, run_obj: Any) -> None:
+        """Report swarm worker token totals through the same ``llm_usage``
+        event channel the main loop uses. Without this the caller's billing /
+        daily-quota accounting only ever saw main-loop usage — swarm-heavy
+        attempts under-reported by orders of magnitude (incident 2026-08-25:
+        run #8 recorded 21k output tokens while its two swarm runs burned
+        hundreds of thousands)."""
+        tin = int(getattr(run_obj, "total_input_tokens", 0) or 0)
+        tout = int(getattr(run_obj, "total_output_tokens", 0) or 0)
+        if tin <= 0 and tout <= 0:
+            return
+        self._emit_session_event(
+            "llm_usage",
+            {
+                "input_tokens": tin,
+                "output_tokens": tout,
+                "total_tokens": tin + tout,
+                "source": "swarm",
+                "run_id": run_id,
+            },
+        )
+
     def _emit_session_event(self, event_type: str, data: dict[str, Any]) -> None:
         """Forward swarm status to the hosting session SSE channel if present."""
         if self._event_callback is None:
@@ -825,7 +847,10 @@ class SwarmTool(BaseTool):
                 _record(
                     reconciled.status.value, run_id, agents=run_agents, tasks=run_tasks,
                     llm_ms=reconciled.total_llm_ms, tool_ms=reconciled.total_tool_ms,
+                    input_tokens=reconciled.total_input_tokens,
+                    output_tokens=reconciled.total_output_tokens,
                 )
+                self._emit_swarm_usage(run_id, reconciled)
                 return _format_result(reconciled, preset, variables)
 
         # Wait budget elapsed but the run is still in flight. Do NOT cancel —
@@ -838,7 +863,12 @@ class SwarmTool(BaseTool):
             _record(
                 "wait_budget_exhausted", run_id, agents=run_agents, tasks=run_tasks,
                 llm_ms=loaded.total_llm_ms, tool_ms=loaded.total_tool_ms,
+                input_tokens=loaded.total_input_tokens,
+                output_tokens=loaded.total_output_tokens,
             )
+            # Tokens burned so far still get billed; the run keeps burning in
+            # the background and that tail is knowingly under-reported.
+            self._emit_swarm_usage(run_id, loaded)
             return _format_result(
                 store.reconcile_run(loaded, write=True), preset, variables, timed_out=True
             )

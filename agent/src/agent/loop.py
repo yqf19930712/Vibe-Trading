@@ -757,18 +757,20 @@ class AgentLoop:
                             delay,
                             exc,
                         )
-                        self._emit(
-                            "stream_reset",
-                            {
-                                "iter": current_iter,
-                                "reason": "provider_stream_retry",
-                                "attempt": stream_attempt + 1,
-                                "max_retries": STREAM_RETRIES,
-                                "delay_s": delay,
-                                "provider": exc.provider,
-                                "model": exc.model,
-                            },
-                        )
+                        reset_payload = {
+                            "iter": current_iter,
+                            "reason": "provider_stream_retry",
+                            "attempt": stream_attempt + 1,
+                            "max_retries": STREAM_RETRIES,
+                            "delay_s": delay,
+                            "provider": exc.provider,
+                            "model": exc.model,
+                        }
+                        self._emit("stream_reset", reset_payload)
+                        try:
+                            trace.write({"type": "stream_reset", **reset_payload})
+                        except Exception:  # noqa: BLE001 - trace must never break the run
+                            logger.debug("stream_reset trace write failed", exc_info=True)
                         thinking_chunks.clear()
                         reasoning_chars = 0
                         last_reasoning_emit = None
@@ -1082,6 +1084,9 @@ class AgentLoop:
             stats["data_gaps"] = gaps
             stats["skills"] = collector.snapshot_skills()
             stats["swarm_runs"] = collector.snapshot_swarm()
+            background = collector.snapshot_background()
+            if background:
+                stats["background_tasks"] = background
         if reason:
             stats["reason"] = str(reason)[:500]
         try:

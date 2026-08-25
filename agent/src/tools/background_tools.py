@@ -89,7 +89,19 @@ class BackgroundRunTool(BaseTool):
     is_readonly = False
 
     def execute(self, **kw: Any) -> str:
-        return _BG.run(kw["command"])
+        result = _BG.run(kw["command"])
+        # Surface the launch in attempt_stats: the actual work runs on a
+        # detached thread, outside tool_ms and the budget clamp, and would
+        # otherwise be invisible to observability.
+        try:
+            from src.core.fetch_stats import record_background
+
+            task_id = json.loads(result).get("task_id", "")
+            if task_id:
+                record_background(task_id, kw["command"])
+        except Exception:
+            pass
+        return result
 
 
 class CheckBackgroundTool(BaseTool):

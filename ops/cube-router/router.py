@@ -631,7 +631,13 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                 stats.update(meta)
             inst.refcount += 1
             try:
+                # Per-tenant serialization point: a second ask for the same
+                # tenant queues HERE while the first is running — previously
+                # invisible (incident run #9: 93 min of silent lock wait read
+                # as a giant first_progress). Measure it explicitly.
+                lock_t0 = time.monotonic()
                 async with inst.lock:
+                    stats["lock_wait_ms"] = int((time.monotonic() - lock_t0) * 1000)
                     sess_t0 = time.monotonic()
                     # Engine-side budget = what's left of the caller's timeout
                     # after queueing/boot, minus a margin for the answer poll.

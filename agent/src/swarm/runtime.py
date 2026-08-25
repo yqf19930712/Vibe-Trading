@@ -311,9 +311,11 @@ class SwarmRuntime:
                             tid,
                             TaskStatus.completed,
                             summary=result.summary,
-                            completed_at=now_iso,
+                            completed_at=result.finished_at or now_iso,
                             artifacts=result.artifact_paths,
                             worker_iterations=result.iterations,
+                            llm_ms=result.llm_ms,
+                            tool_ms=result.tool_ms,
                         )
                         resolve_dependencies(run_dir / "tasks", tid)
                         self._emit_event(
@@ -328,6 +330,7 @@ class SwarmRuntime:
                                     "output_tokens": result.output_tokens,
                                     "llm_ms": result.llm_ms,
                                     "tool_ms": result.tool_ms,
+                                    "finished_at": result.finished_at,
                                 },
                             ),
                         )
@@ -338,8 +341,11 @@ class SwarmRuntime:
                             TaskStatus.failed,
                             error=redact_internal_paths(result.error)
                             or f"worker did not complete (status={result.status})",
-                            completed_at=datetime.now(timezone.utc).isoformat(),
+                            completed_at=result.finished_at
+                            or datetime.now(timezone.utc).isoformat(),
                             worker_iterations=result.iterations,
+                            llm_ms=result.llm_ms,
+                            tool_ms=result.tool_ms,
                         )
                         self._emit_event(
                             run_id,
@@ -350,6 +356,7 @@ class SwarmRuntime:
                                     "error": redact_internal_paths(result.error),
                                     "input_tokens": result.input_tokens,
                                     "output_tokens": result.output_tokens,
+                                    "finished_at": result.finished_at,
                                 },
                             ),
                         )
@@ -723,6 +730,11 @@ class SwarmRuntime:
                 include_shell_tools=include_shell_tools,
                 grounding_block=grounding_block,
                 agent_config=self._agent_config,
+            )
+            # Real per-task completion time. The layer barrier persists task
+            # status much later (all tasks used to share one completed_at).
+            result = result.model_copy(
+                update={"finished_at": datetime.now(timezone.utc).isoformat()}
             )
 
             cumulative_input_tokens += result.input_tokens

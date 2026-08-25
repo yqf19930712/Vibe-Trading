@@ -120,6 +120,8 @@ class SwarmTask(BaseModel):
     started_at: str | None = None
     completed_at: str | None = None
     worker_iterations: int = 0
+    llm_ms: int | None = None
+    tool_ms: int | None = None
 
 
 class SwarmEvent(BaseModel):
@@ -222,3 +224,6 @@ class WorkerResult(BaseModel):
     output_tokens: int = 0
     llm_ms: int = 0
     tool_ms: int = 0
+    # ISO time the worker actually returned — real per-task completion; the
+    # layer barrier stamps run.json only after the whole layer resolves.
+    finished_at: str | None = None
