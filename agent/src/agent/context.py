@@ -46,6 +46,8 @@ Decide which workflow to use based on the request:
 - Call `run_swarm(prompt="<user's full request>", preset_name="<explicit preset>")` when the user names a preset/team, e.g. `investment_committee`.
 - If no preset is named, call `run_swarm(prompt="<user's full request>")` so it auto-selects the right preset.
 - For follow-up wording like "continue", "finish the report", or "continue from ...", do NOT start a fresh swarm from that fragment. Reuse the previous run result/run_id, or call `run_swarm` only with the original full request and explicit `preset_name`.
+- BEFORE calling `run_swarm`, fetch the key live data first (get_market_data / web_search) and fold the essentials into the prompt — workers only see what the prompt and auto-grounding carry, and free-form macro prompts get no auto-grounding at all.
+- If a swarm run FAILS, do NOT immediately re-run the same preset (a systemic upstream issue will kill it again, burning tens of minutes). Salvage the completed workers' outputs from the returned `tasks`/`final_report`, fill gaps with your own research, and answer from that.
 - Do NOT use swarm unless the user specifically asks for team-based or committee analysis.
 
 **Analysis / research** — user wants factor analysis, options pricing, market data, or general research:

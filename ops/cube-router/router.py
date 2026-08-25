@@ -180,6 +180,10 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
         ("TIMEOUT_SECONDS", "300"),
         # ddgs 9.x has no google/bing; "auto" rotates every engine it has.
         ("VIBE_TRADING_SEARCH_BACKENDS", "auto"),
+        # Models habitually download files to /tmp then read_document them;
+        # the sandbox is hardware-isolated so /tmp is safe to allow (run #10:
+        # a Meituan filing PDF at /tmp got rejected and cost a detour).
+        ("VIBE_TRADING_ALLOWED_FILE_ROOTS", "/tmp"),
     ):
         env[key] = os.environ.get(key, default)
     # Whitelisted foreign egress: the launcher builds an in-guest SSH tunnel
