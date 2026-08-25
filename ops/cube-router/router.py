@@ -887,6 +887,34 @@ async def obs_trace(
     return {"entries": out[-limit:], "truncated": len(out) > limit}
 
 
+@app.get("/obs/swarm-events")
+async def obs_swarm_events(
+    uid: str,
+    run_id: str,
+    limit: int = 800,
+    authorization: Optional[str] = Header(None),
+):
+    """Tail a swarm run's internal event log (worker tool calls, retries,
+    heartbeats) off the tenant bind-mount — the run_swarm counterpart of
+    /obs/trace, so the laicai detail page can render per-worker execution
+    without SSH. run_id comes from attempt_stats.swarm_runs[].run_id."""
+    _auth(authorization)
+    if not _OBS_ID_RE.fullmatch(run_id):
+        raise HTTPException(400, "invalid run_id")
+    limit = max(1, min(limit, 2000))
+    path = DATA_ROOT / tenant_key(uid) / ".swarm" / "runs" / run_id / "events.jsonl"
+    if not path.exists():
+        return {"entries": [], "truncated": False}
+    raw = await asyncio.to_thread(_obs_tail_lines, path)
+    out = []
+    for line in raw:
+        try:
+            out.append(_obs_clip(json.loads(line)))
+        except Exception:
+            continue
+    return {"entries": out[-limit:], "truncated": len(out) > limit}
+
+
 @app.get("/healthz")
 async def healthz(authorization: Optional[str] = Header(None)):
     _auth(authorization)  # docs always said Bearer; the check was simply missing
