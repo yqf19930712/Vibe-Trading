@@ -898,6 +898,7 @@ async def obs_swarm_events(
     uid: str,
     run_id: str,
     limit: int = 800,
+    skip_heartbeats: int = 0,
     authorization: Optional[str] = Header(None),
 ):
     """Tail a swarm run's internal event log (worker tool calls, retries,
@@ -915,9 +916,15 @@ async def obs_swarm_events(
     out = []
     for line in raw:
         try:
-            out.append(_obs_clip(json.loads(line)))
+            e = json.loads(line)
         except Exception:
             continue
+        # Heartbeats are ~90% of a long run's event log; filtering BEFORE the
+        # limit keeps early task_started/tool events inside the tail window
+        # (the laicai gantt needs full-run coverage, not the last N ticks).
+        if skip_heartbeats and e.get("type") == "task_heartbeat":
+            continue
+        out.append(_obs_clip(e))
     return {"entries": out[-limit:], "truncated": len(out) > limit}
 
 
