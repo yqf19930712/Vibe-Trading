@@ -27,7 +27,7 @@
 - **LLM 兼容性**（`agent/src/providers/llm.py`）：模型名含 `opus-4-8` / `fable` / `mythos` 时省略 `temperature` 字段（这些模型经 OpenAI-compat 代理会拒绝该参数）；流式默认带 `stream_options.include_usage`（`LANGCHAIN_STREAM_USAGE=0` 可关），否则 `llm_usage` 事件恒空。
 - **可观测性**（详见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)）：`src/core/logging_setup.py` 结构化 JSONL 日志（contextvars 绑 session/attempt id，穿透工具线程）；AgentLoop 收口发 `attempt_stats` 事件（迭代/LLM·工具耗时/tokens/逐工具/数据源统计，SSE + trace 双写）；数据链路 print 改结构化 logger。
 - **预算与提前收敛**：messages API 增 `deadline_s`；`src/core/budget.py` deadline contextvar + `cap_timeout`；AgentLoop 剩余 <25% 注入收尾提示、不足一轮强制出文本（`early_finalize`）；单工具/swarm 超时被剩余预算钳制；`VIBE_MAX_ITERATIONS` env 化。
-- **数据可靠性**：`market_data` 空结果/异常沿 `FALLBACK_CHAINS` 逐源降级并输出 `_gaps` 明细；`src/core/fetch_stats.py` attempt 级数据源记账；tushare 进程内节流（`TUSHARE_MAX_PER_MIN`）+ 重试；启动 `socket.setdefaulttimeout` 兜底无超时 SDK。美/港股日线备源 `ifind`（同花顺 iFinD MCP，国内端点不走隧道，`IFIND_MCP_TOKEN` 鉴权；自然语言 quotes 工具 → markdown 表头驱动解析，仅日频，见 `backtest/loaders/ifind_loader.py`）。
+- **数据可靠性**：`market_data` 空结果/异常沿 `FALLBACK_CHAINS` 逐源降级并输出 `_gaps` 明细；`src/core/fetch_stats.py` attempt 级数据源记账；tushare 进程内节流（`TUSHARE_MAX_PER_MIN`）+ 重试；启动 `socket.setdefaulttimeout` 兜底无超时 SDK。美/港股日线备源 `ifind`（同花顺 iFinD MCP，国内端点不走隧道，`IFIND_MCP_TOKEN` 鉴权；自然语言 quotes 工具 → markdown 表头驱动解析，仅日频，见 `backtest/loaders/ifind_loader.py`）；美股日线备源 `tickflow`（api.tickflow.org 结构化 REST，`TICKFLOW_API_KEY` 经 `x-api-key` 头，前复权列式 K 线，免费档 10 次/分·1 标的/次，429 单次重试，见 `backtest/loaders/tickflow_loader.py`）——us_equity 链 = yfinance→tickflow→ifind→akshare。
 - **出境代理**：`web_search`（ddgs `proxy` 参数）与 yfinance loader 读 `VIBE_TRADING_EGRESS_PROXY`；搜索后端默认 `auto`（ddgs 9.x 已无 google/bing）；`ops/cube-engine/launcher.py` 按 `/boot` env 在 guest 内拉起 SSH 隧道（镜像 +openssh-client）。
 
 ## 生产拓扑（速览）
@@ -110,7 +110,7 @@ systemctl daemon-reload && systemctl enable --now cube-router
 | `VIBE_MAX_CONCURRENT_ACTIVE` | | 并发 `/ask` 处理上限，默认 2 |
 | `VIBE_IDLE_TTL_S` | | 空闲 pause 阈值，默认 1200 |
 | `VIBE_READY_TIMEOUT_S` / `VIBE_POLL_INTERVAL_S` / `VIBE_ASK_TIMEOUT_S` | | 就绪预算 180s / 轮询间隔 3s / 单问默认超时 900s |
-| `OPENAI_*` `ANTHROPIC_*` `LANGCHAIN_*` `TUSHARE_TOKEN` `IFIND_MCP_TOKEN` `VIBE_TRADING_SEARCH_BACKENDS` | | 内置默认 LLM 凭据与数据源配置，经 launcher `/boot` 转发进每个租户引擎（完整清单见 `router.py` 的 `FORWARD_ENV`） |
+| `OPENAI_*` `ANTHROPIC_*` `LANGCHAIN_*` `TUSHARE_TOKEN` `IFIND_MCP_TOKEN` `TICKFLOW_API_KEY` `VIBE_TRADING_SEARCH_BACKENDS` | | 内置默认 LLM 凭据与数据源配置，经 launcher `/boot` 转发进每个租户引擎（完整清单见 `router.py` 的 `FORWARD_ENV`） |
 | `LANGCHAIN_TEMPERATURE` | | `none` / `off` / 空 = 任何模型都不发 `temperature`；否则按数值发。填了非数字会 warning 后回落 `0.0` |
 | `LANGCHAIN_NO_TEMPERATURE_MODELS` | | 逗号分隔的模型名子串，**追加**到 `llm.py` 内置的 `NO_TEMPERATURE_MODELS` 名单（追加而非替换，避免为了加新模型把已知的漏掉） |
 | `VIBE_ASK_LOG` | | 每次 `/ask` 一行的观测日志，默认 `/var/lib/cube-router/ask_log.jsonl`（20MB 轮转） |
