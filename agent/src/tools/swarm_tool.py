@@ -823,7 +823,8 @@ class SwarmTool(BaseTool):
             reconciled = store.reconcile_run(loaded, write=True)
             if reconciled.status.value in ("completed", "failed", "cancelled"):
                 _record(
-                    reconciled.status.value, run_id, agents=run_agents, tasks=run_tasks
+                    reconciled.status.value, run_id, agents=run_agents, tasks=run_tasks,
+                    llm_ms=reconciled.total_llm_ms, tool_ms=reconciled.total_tool_ms,
                 )
                 return _format_result(reconciled, preset, variables)
 
@@ -835,7 +836,8 @@ class SwarmTool(BaseTool):
         loaded = store.load_run(run_id)
         if loaded is not None:
             _record(
-                "wait_budget_exhausted", run_id, agents=run_agents, tasks=run_tasks
+                "wait_budget_exhausted", run_id, agents=run_agents, tasks=run_tasks,
+                llm_ms=loaded.total_llm_ms, tool_ms=loaded.total_tool_ms,
             )
             return _format_result(
                 store.reconcile_run(loaded, write=True), preset, variables, timed_out=True
@@ -885,6 +887,12 @@ def _format_result(
         "token_usage": {
             "total_input_tokens": run.total_input_tokens,
             "total_output_tokens": run.total_output_tokens,
+        },
+        # Cumulative worker effort (layers run in parallel, so these can
+        # exceed the run's wall-clock).
+        "time_split_ms": {
+            "llm": run.total_llm_ms,
+            "tools": run.total_tool_ms,
         },
     }
     return json.dumps(result, ensure_ascii=False, indent=2)

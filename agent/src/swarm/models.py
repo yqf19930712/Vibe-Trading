@@ -188,6 +188,11 @@ class SwarmRun(BaseModel):
     final_report: str | None = None
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    # Cumulative wall-clock split across all workers (ms): LLM streaming
+    # (incl. in-place retries) vs tool execution. Layers run in parallel, so
+    # these can exceed the run's own wall-clock — they measure worker effort.
+    total_llm_ms: int = 0
+    total_tool_ms: int = 0
     provider: str | None = None
     model: str | None = None
     grounding_data: dict[str, list[dict]] | None = None
@@ -204,6 +209,8 @@ class WorkerResult(BaseModel):
         error: Error message on failure.
         input_tokens: Cumulative input tokens (exact or estimated).
         output_tokens: Cumulative output tokens (exact or estimated).
+        llm_ms: Wall-clock ms spent in LLM streaming (incl. in-place retries).
+        tool_ms: Wall-clock ms spent executing tools.
     """
 
     status: WorkerStatus
@@ -213,3 +220,5 @@ class WorkerResult(BaseModel):
     error: str | None = None
     input_tokens: int = 0
     output_tokens: int = 0
+    llm_ms: int = 0
+    tool_ms: int = 0

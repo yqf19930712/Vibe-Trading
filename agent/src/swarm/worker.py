@@ -407,6 +407,8 @@ def run_worker(
     summary = ""
     total_input_tokens = 0
     total_output_tokens = 0
+    total_llm_ms = 0
+    total_tool_ms = 0
 
     # Threshold for injecting a "wrap up" nudge (80% of budget)
     wrap_up_at = max(1, int(max_iterations * 0.8))
@@ -439,6 +441,8 @@ def run_worker(
                 iterations=iteration,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
+                llm_ms=total_llm_ms,
+                tool_ms=total_tool_ms,
             )
 
         # Check token estimate
@@ -455,6 +459,8 @@ def run_worker(
                 iterations=iteration,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
+                llm_ms=total_llm_ms,
+                tool_ms=total_tool_ms,
             )
 
         # Inject wrap-up nudge when approaching iteration limit
@@ -475,6 +481,7 @@ def run_worker(
 
         # Stream the LLM — moonshot/kimi non-streaming invoke is unreliable
         # (issue #42), and streaming also feeds dashboard live progress.
+        llm_t0 = time.monotonic()
         try:
             def _on_text_chunk(delta: str) -> None:
                 _emit(event_callback, "worker_text", agent_id, task_id,
@@ -564,7 +571,9 @@ def run_worker(
                          "error": str(stream_exc)[:200]},
                     )
                     time.sleep(delay)
+            total_llm_ms += int((time.monotonic() - llm_t0) * 1000)
         except Exception as exc:
+            total_llm_ms += int((time.monotonic() - llm_t0) * 1000)
             error_msg = f"LLM call failed at iteration {iteration}: {exc}"
             logger.warning(error_msg)
             _emit(event_callback, "worker_failed", agent_id, task_id, {"error": error_msg})
@@ -576,6 +585,8 @@ def run_worker(
                 error=error_msg,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
+                llm_ms=total_llm_ms,
+                tool_ms=total_tool_ms,
             )
 
         # Accumulate token counts
@@ -609,6 +620,8 @@ def run_worker(
                     error=f"output contract not met: {reason}",
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
+                    llm_ms=total_llm_ms,
+                    tool_ms=total_tool_ms,
                 )
             _emit(event_callback, "worker_completed", agent_id, task_id, {"iterations": iteration + 1})
             return WorkerResult(
@@ -618,6 +631,8 @@ def run_worker(
                 iterations=iteration + 1,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
+                llm_ms=total_llm_ms,
+                tool_ms=total_tool_ms,
             )
 
         # Append assistant message with tool calls
@@ -663,6 +678,7 @@ def run_worker(
             if tc.name != "load_skill" and not _is_error_result(result):
                 data_tool_calls += 1
             tc_elapsed = time.monotonic() - tc_start
+            total_tool_ms += int(tc_elapsed * 1000)
             _emit(
                 event_callback, "tool_result", agent_id, task_id,
                 {"tool": tc.name, "elapsed_ms": int(tc_elapsed * 1000),
@@ -696,6 +712,8 @@ def run_worker(
             error=f"hit iteration limit without a valid deliverable: {reason}",
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
+            llm_ms=total_llm_ms,
+            tool_ms=total_tool_ms,
         )
     _emit(event_callback, "worker_iteration_limit", agent_id, task_id)
     return WorkerResult(
@@ -705,6 +723,8 @@ def run_worker(
         iterations=max_iterations,
         input_tokens=total_input_tokens,
         output_tokens=total_output_tokens,
+        llm_ms=total_llm_ms,
+        tool_ms=total_tool_ms,
     )
 
 

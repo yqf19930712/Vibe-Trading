@@ -78,6 +78,8 @@ class FetchStatsCollector:
         ms: int,
         agents: Optional[int] = None,
         tasks: Optional[int] = None,
+        llm_ms: Optional[int] = None,
+        tool_ms: Optional[int] = None,
     ) -> None:
         with self._lock:
             if len(self._swarm_runs) < 20:  # bound for pathological loops
@@ -91,6 +93,12 @@ class FetchStatsCollector:
                     entry["agents"] = int(agents)
                 if tasks is not None:
                     entry["tasks"] = int(tasks)
+                # Cumulative worker effort split (parallel layers can make
+                # these exceed the run's wall-clock ms above).
+                if llm_ms is not None:
+                    entry["llm_ms"] = max(0, int(llm_ms))
+                if tool_ms is not None:
+                    entry["tool_ms"] = max(0, int(tool_ms))
                 self._swarm_runs.append(entry)
 
     def snapshot(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:

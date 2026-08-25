@@ -298,9 +298,11 @@ class SwarmRuntime:
 
                 # Process results
                 for tid, result in layer_results.items():
-                    # Accumulate token counts to run totals
+                    # Accumulate token counts / time split to run totals
                     run.total_input_tokens += result.input_tokens
                     run.total_output_tokens += result.output_tokens
+                    run.total_llm_ms += result.llm_ms
+                    run.total_tool_ms += result.tool_ms
 
                     if result.status == "completed":
                         task_summaries[tid] = result.summary
@@ -324,6 +326,8 @@ class SwarmRuntime:
                                     "iterations": result.iterations,
                                     "input_tokens": result.input_tokens,
                                     "output_tokens": result.output_tokens,
+                                    "llm_ms": result.llm_ms,
+                                    "tool_ms": result.tool_ms,
                                 },
                             ),
                         )
@@ -683,6 +687,8 @@ class SwarmRuntime:
         max_retries = agent_spec.max_retries
         cumulative_input_tokens = 0
         cumulative_output_tokens = 0
+        cumulative_llm_ms = 0
+        cumulative_tool_ms = 0
         result: WorkerResult | None = None
 
         for attempt in range(max_retries + 1):
@@ -721,6 +727,8 @@ class SwarmRuntime:
 
             cumulative_input_tokens += result.input_tokens
             cumulative_output_tokens += result.output_tokens
+            cumulative_llm_ms += result.llm_ms
+            cumulative_tool_ms += result.tool_ms
 
             if result.status != "failed":
                 # Success (or timeout/token_limit/completed) — no more retries
@@ -728,6 +736,8 @@ class SwarmRuntime:
                     update={
                         "input_tokens": cumulative_input_tokens,
                         "output_tokens": cumulative_output_tokens,
+                        "llm_ms": cumulative_llm_ms,
+                        "tool_ms": cumulative_tool_ms,
                     }
                 )
                 return result
@@ -738,6 +748,8 @@ class SwarmRuntime:
                 update={
                     "input_tokens": cumulative_input_tokens,
                     "output_tokens": cumulative_output_tokens,
+                    "llm_ms": cumulative_llm_ms,
+                    "tool_ms": cumulative_tool_ms,
                 }
             )
         return result  # type: ignore[return-value]
