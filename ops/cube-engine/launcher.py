@@ -16,7 +16,9 @@ import base64
 import json
 import os
 import signal
+import socket
 import subprocess
+import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -121,6 +123,47 @@ def _ensure_tunnel():
     _tunnel["proc"] = subprocess.Popen(cmd, start_new_session=True)
 
 
+def _tunnel_port_open(timeout=1.0):
+    try:
+        with socket.create_connection(("127.0.0.1", TUNNEL_LOCAL_PORT), timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_tunnel_ready(deadline_s):
+    """Bounded wait until the local forward accepts connections.
+
+    Cold boot spawns ssh and immediately serves the first ask; if that ssh dies
+    (guest network not up yet) every proxied tool call in the run fails with
+    ECONNREFUSED (2026-08-25, attempt 88e080ef0a46). Best-effort: on timeout we
+    proceed anyway — the keeper thread keeps retrying in the background.
+    """
+    if not _tunnel["cmd"]:
+        return True
+    deadline = time.time() + deadline_s
+    while time.time() < deadline:
+        if _tunnel_port_open():
+            return True
+        _ensure_tunnel()
+        time.sleep(1)
+    return _tunnel_port_open()
+
+
+def _tunnel_keeper():
+    """Respawn a dead tunnel DURING runs, not only on /health probes.
+
+    The router only probes /health before an ask, so a tunnel that died
+    mid-run used to stay dead for the whole run.
+    """
+    while True:
+        time.sleep(10)
+        try:
+            _ensure_tunnel()
+        except Exception:  # noqa: BLE001 - keeper must never die
+            pass
+
+
 def _boot_engine(extra_env):
     _stop_engine()
     _configure_tunnel(extra_env)
@@ -137,7 +180,11 @@ def _boot_engine(extra_env):
         if not _engine_alive():
             return False, "engine process exited during boot"
         if _engine_healthy():
+            # Engine is up; give the egress tunnel a bounded head start so the
+            # first ask doesn't run its whole data-collection phase proxyless.
+            _wait_tunnel_ready(15)
             return True, "ok"
+        _ensure_tunnel()
         time.sleep(1)
     return False, f"engine not healthy after {BOOT_TIMEOUT_SEC}s"
 
@@ -158,9 +205,12 @@ class Handler(BaseHTTPRequestHandler):
                 "starting" if _engine_alive() else "stopped"
             )
             tunnel_proc = _tunnel["proc"]
+            ssh_alive = tunnel_proc is not None and tunnel_proc.poll() is None
+            # "up" requires the forward to actually accept connections — an
+            # alive ssh with a dead forward is what starved run 88e080ef0a46.
             tunnel = (
                 "off" if not _tunnel["cmd"]
-                else "up" if tunnel_proc is not None and tunnel_proc.poll() is None
+                else "up" if ssh_alive and _tunnel_port_open()
                 else "down"
             )
             self._reply(200, {"launcher": "ok", "engine": state, "egress_tunnel": tunnel})
@@ -191,4 +241,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    threading.Thread(target=_tunnel_keeper, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", LAUNCHER_PORT), Handler).serve_forever()
