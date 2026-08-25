@@ -12,10 +12,10 @@ service. **China-direct endpoint** (`api-mcp.51ifind.com:8643`) — reachable
 without the egress proxy, which makes it a US/HK backup when yfinance is
 rate-limited. Two distinct uses:
 
-1. **Primary US/HK OHLCV source** — the built-in DataLoader
+1. **US/HK OHLCV source** — the built-in DataLoader
    (`backtest/loaders/ifind_loader.py`, `source: "ifind"`) serves US & HK
-   **daily** bars and sits FIRST in the `auto` chains
-   (US: `ifind → tickflow → yfinance → akshare`;
+   **daily** bars: FIRST in the HK `auto` chain, second (after tickflow) in
+   the US one (US: `tickflow → ifind → yfinance → akshare`;
    HK: `ifind → tickflow → yfinance → tencent → futu → akshare`).
 2. **Beyond-OHLCV lookups** — natural-language tools for 港美股 profiles,
    financials (ROE/ROA/growth), and corporate events (IPO/回购/分红) that no

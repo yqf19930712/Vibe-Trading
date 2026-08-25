@@ -1,9 +1,10 @@
 """iFinD (同花顺) MCP loader: US & HK daily OHLCV via the 51ifind MCP service.
 
 Domestic endpoint (``api-mcp.51ifind.com:8643``) — reachable from mainland
-without the server-B egress tunnel. Since 2026-08-25 this is the PRIMARY
-us_equity/hk_equity source (chain: ifind → tickflow → yfinance → …) — the
-tunnel-dependent, Yahoo-rate-limited yfinance is demoted to fallback.
+without the server-B egress tunnel. Since 2026-08-25 it leads the hk_equity
+chain and backs tickflow in us_equity (US: tickflow → ifind → …;
+HK: ifind → …) — the tunnel-dependent, Yahoo-rate-limited yfinance is
+demoted to fallback in both.
 
 Protocol: MCP streamable-HTTP JSON-RPC against the ``global_stock`` server
 (``initialize`` -> ``Mcp-Session-Id`` header -> ``tools/call``). The only

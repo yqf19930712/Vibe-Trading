@@ -18,8 +18,8 @@ also offers A-shares/HK/minute data on paid tiers). Key properties:
 - **Forward-adjusted** (`adjust=forward`) daily bars with full history.
 
 The project has a built-in DataLoader (`backtest/loaders/tickflow_loader.py`),
-registered as `source: "tickflow"` and part of the `auto` US-equity chain
-(`ifind → tickflow → yfinance → akshare` — second, right after ifind).
+registered as `source: "tickflow"` and FIRST in the `auto` US-equity chain
+(`tickflow → ifind → yfinance → akshare`).
 
 ## Quick Start
 
@@ -75,7 +75,7 @@ with 400/401/403/404/429.
   already sets one; raw `urllib`/`requests` scripts must too.
 - **Rate limit (free tier)**: 10 kline requests/min, 1 symbol per request.
   The loader retries a 429 once after ~6.5s. For >10 symbols expect the fetch
-  to be throttled — don't hammer in a loop; `yfinance` picks up the remainder.
+  to be throttled — don't hammer in a loop; `ifind` picks up the remainder.
 - **Daily-K only** here: for intraday/minute US data this source cannot help.
 - Check availability with the `TICKFLOW_API_KEY` env var. On persistent
   401/403 the key may have expired — report it instead of retrying.
