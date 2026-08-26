@@ -553,6 +553,45 @@ def _build_native_anthropic(model: str, callbacks: Any = None) -> Any:
             "LANGCHAIN_PROVIDER=anthropic requires the langchain-anthropic package"
         ) from exc
 
+    class _DictShim:
+        """Duck-types ``model_dump()`` over a plain dict.
+
+        Gateway relays (api-direct) serialize ``context_management`` /
+        ``container`` stream-event fields in shapes the anthropic SDK doesn't
+        type, so they surface as plain dicts; langchain-anthropic 1.6.x calls
+        ``.model_dump()`` on them unconditionally and dies mid-stream
+        (AttributeError on every message_delta). Wrap instead of dropping so
+        the metadata still lands in response_metadata.
+        """
+
+        def __init__(self, payload: dict) -> None:
+            self._payload = payload
+
+        def model_dump(self, **_kwargs: Any) -> dict:
+            return self._payload
+
+    class ChatAnthropicCompat(ChatAnthropic):
+        """ChatAnthropic tolerant of relay-serialized stream-event fields."""
+
+        def _make_message_chunk_from_anthropic_event(self, event: Any, *args: Any, **kwargs: Any) -> Any:
+            for holder in (event, getattr(event, "message", None)):
+                if holder is None:
+                    continue
+                for field in ("context_management", "container"):
+                    value = getattr(holder, field, None)
+                    if isinstance(value, dict):
+                        try:
+                            setattr(holder, field, _DictShim(value))
+                        except Exception:  # noqa: BLE001 - best-effort shim
+                            pass
+                delta = getattr(holder, "delta", None)
+                if delta is not None and isinstance(getattr(delta, "container", None), dict):
+                    try:
+                        delta.container = _DictShim(delta.container)
+                    except Exception:  # noqa: BLE001
+                        pass
+            return super()._make_message_chunk_from_anthropic_event(event, *args, **kwargs)
+
     api_key = os.getenv("ANTHROPIC_AUTH_TOKEN", "").strip() or os.getenv(
         "ANTHROPIC_API_KEY", ""
     ).strip()
@@ -582,7 +621,7 @@ def _build_native_anthropic(model: str, callbacks: Any = None) -> Any:
         "Native Anthropic channel: model=%s base_url=%s thinking=%s",
         model, base_url or "(default)", thinking_mode,
     )
-    return ChatAnthropic(**kwargs)
+    return ChatAnthropicCompat(**kwargs)
 
 
 def _sync_provider_env() -> None:
