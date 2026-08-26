@@ -424,7 +424,12 @@ def run_worker(
             for msg in tool_msgs[:-_KEEP_RECENT_TOOLS]:
                 content = msg.get("content", "")
                 if isinstance(content, str) and len(content) > 100:
-                    msg["content"] = "[cleared]"
+                    # Same informative placeholder as the main loop's
+                    # _microcompact — a bare "[cleared]" once made a model
+                    # retract real fetched numbers as hallucinations.
+                    from src.agent.loop import _CLEARED_PLACEHOLDER
+
+                    msg["content"] = _CLEARED_PLACEHOLDER
 
         # Check timeout
         elapsed = time.monotonic() - t0
