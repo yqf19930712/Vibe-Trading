@@ -95,3 +95,38 @@ class TestFetchMarketDataBelt:
         )
         # No TypeError; the unknown symbol lands in gaps instead.
         assert "NOSUCH.US" in out.get("_unresolved", [])
+
+
+class TestMissingRequiredArgs:
+    """Truncation detection for cleanly-cut tool-call streams (2026-08-26)."""
+
+    def _registry(self):
+        reg = ToolRegistry()
+        reg.register(_EchoTool())
+        return reg
+
+    def test_missing_trailing_required(self):
+        # write_file-style truncation: path survived, content dropped.
+        reg = self._registry()
+        assert reg.missing_required_args("echo_types", {"max_rows": 1}) == ["codes"]
+
+    def test_complete_args_pass(self):
+        reg = self._registry()
+        assert reg.missing_required_args("echo_types", {"codes": ["A"]}) == []
+
+    def test_unknown_tool_returns_empty(self):
+        reg = self._registry()
+        assert reg.missing_required_args("nope", {}) == []
+
+    def test_non_dict_arguments(self):
+        reg = self._registry()
+        assert reg.missing_required_args("echo_types", None) == ["codes"]
+
+    def test_synthetic_stream_error_is_retryable(self):
+        # The retry path relies on status-code-less errors being retryable.
+        from src.providers.chat import ProviderStreamError
+
+        exc = ProviderStreamError(
+            provider="openai", model="m", original=RuntimeError("truncated")
+        )
+        assert exc.retryable is True

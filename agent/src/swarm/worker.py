@@ -548,6 +548,34 @@ def run_worker(
 
                     record_swarm_llm_call()
                     response = _stream_once()
+                    # A cleanly-cut stream leaves tool calls whose trailing
+                    # required args were dropped by partial-JSON salvage
+                    # (2026-08-26 risk_officer: write_file with path but no
+                    # content, repeatedly, while writing the final report).
+                    # Treat as a stream failure and retry in place; after the
+                    # retries are spent fall through and execute so the tool
+                    # error lets the model self-correct as a last resort.
+                    truncated = [
+                        f"{tc.name} missing {miss}"
+                        for tc in response.tool_calls
+                        if (miss := registry.missing_required_args(tc.name, tc.arguments))
+                    ]
+                    if truncated:
+                        if stream_attempt < _STREAM_RETRIES:
+                            raise ProviderStreamError(
+                                provider=os.getenv("LANGCHAIN_PROVIDER", "openai"),
+                                model=agent_spec.model_name or "",
+                                original=RuntimeError(
+                                    "truncated tool call arguments: " + "; ".join(truncated)
+                                ),
+                            )
+                        logger.warning(
+                            "agent=%s truncated tool call args persist after %d retries, "
+                            "executing anyway: %s",
+                            agent_id,
+                            _STREAM_RETRIES,
+                            "; ".join(truncated),
+                        )
                     break
                 except ProviderStreamError as stream_exc:
                     if not stream_exc.retryable or stream_attempt >= _STREAM_RETRIES:

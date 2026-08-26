@@ -116,6 +116,26 @@ class ToolRegistry:
         """Return all tools in OpenAI function calling format."""
         return [t.to_openai_schema() for t in self._tools.values()]
 
+    def missing_required_args(self, name: str, arguments: Any) -> List[str]:
+        """Schema-required params absent from a tool call's arguments.
+
+        A stream that dies while the arguments JSON is still being emitted is
+        salvaged by langchain's partial-JSON parsing into a VALID dict that
+        simply lacks the trailing keys (2026-08-26: report-writing streams cut
+        mid-arguments produced ``write_file(path=...)`` with no ``content``,
+        which then executed as half a call). Callers treat a non-empty result
+        as a stream failure and retry the LLM call instead of executing the
+        truncated call. Unknown tool names return [] — the execute path
+        already reports those properly.
+        """
+        tool = self._tools.get(name)
+        if tool is None:
+            return []
+        required = (tool.parameters or {}).get("required") or []
+        if not isinstance(arguments, dict):
+            return [str(k) for k in required]
+        return [str(k) for k in required if k not in arguments]
+
     def execute(self, name: str, params: Dict[str, Any]) -> str:
         """Execute a tool and guarantee a valid JSON return value."""
         tool = self._tools.get(name)

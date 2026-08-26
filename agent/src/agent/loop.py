@@ -767,6 +767,32 @@ class AgentLoop:
                             on_reasoning_chunk=_on_reasoning_chunk,
                             should_cancel=self._cancel_event.is_set,
                         )
+                        # A cleanly-cut stream leaves tool calls whose trailing
+                        # required args were dropped by partial-JSON salvage
+                        # (write_file with path but no content). Treat that as
+                        # a stream failure and retry in place; only after the
+                        # retries are spent fall through and execute (the tool
+                        # error then lets the model self-correct as before).
+                        truncated = [
+                            f"{tc.name} missing {miss}"
+                            for tc in response.tool_calls
+                            if (miss := self.registry.missing_required_args(tc.name, tc.arguments))
+                        ]
+                        if truncated:
+                            if stream_attempt < STREAM_RETRIES:
+                                raise ProviderStreamError(
+                                    provider=os.getenv("LANGCHAIN_PROVIDER", "openai"),
+                                    model=getattr(self.llm, "model_name", "") or "",
+                                    original=RuntimeError(
+                                        "truncated tool call arguments: " + "; ".join(truncated)
+                                    ),
+                                )
+                            logger.warning(
+                                "Truncated tool call args persist after %d retries, "
+                                "executing anyway: %s",
+                                STREAM_RETRIES,
+                                "; ".join(truncated),
+                            )
                         break
                     except ProviderStreamError as exc:
                         if not exc.retryable or stream_attempt >= STREAM_RETRIES:
