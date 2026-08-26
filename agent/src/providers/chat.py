@@ -12,6 +12,51 @@ from typing import Any, Callable, Dict, List, Optional
 from src.providers.llm import build_llm
 
 
+def _content_text(content: Any) -> str:
+    """Flatten message content to plain text.
+
+    OpenAI-compat models return ``str``; the native Anthropic channel returns
+    a list of typed blocks (thinking / text / tool_use). The engine's message
+    history, trace, and answer paths all expect ``str`` — extract only the
+    ``text`` blocks and drop thinking/tool_use (tool calls surface via
+    ``.tool_calls``, thinking via ``reasoning_content``).
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+        return "".join(parts)
+    return "" if content is None else str(content)
+
+
+def _content_thinking(content: Any) -> str:
+    """Extract thinking text from native-Anthropic block-list content."""
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        str(block.get("thinking") or "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "thinking"
+    )
+
+
+# Native Anthropic stop_reason → OpenAI-style finish_reason the ReAct loop
+# already understands (it compares against "tool_calls"/"stop"/"length").
+_ANTHROPIC_STOP_REASON_MAP = {
+    "end_turn": "stop",
+    "tool_use": "tool_calls",
+    "max_tokens": "length",
+    "stop_sequence": "stop",
+    "pause_turn": "stop",
+    "refusal": "stop",
+}
+
+
 def _dedupe_finish_reason(raw: str) -> str:
     """Relays (OpenRouter) emit finish_reason per chunk; AIMessageChunk.__add__
     concatenates into 'stopstop', 'tool_callstool_calls', etc. Return the
@@ -187,10 +232,16 @@ class ChatLLM:
             for chunk in llm.stream(messages, config=config):
                 if should_cancel and should_cancel():
                     break
-                if chunk.content and on_text_chunk:
-                    on_text_chunk(chunk.content)
-                reasoning = getattr(chunk, "additional_kwargs", {}).get("reasoning_content")
-                if reasoning and not chunk.content and on_reasoning_chunk:
+                # Native Anthropic chunks carry block-list content; flatten to
+                # text/thinking deltas so callers keep receiving plain strings.
+                text_delta = _content_text(chunk.content) if chunk.content else ""
+                if text_delta and on_text_chunk:
+                    on_text_chunk(text_delta)
+                reasoning = (
+                    getattr(chunk, "additional_kwargs", {}).get("reasoning_content")
+                    or _content_thinking(chunk.content)
+                )
+                if reasoning and not text_delta and on_reasoning_chunk:
                     on_reasoning_chunk(reasoning)
                 accumulated = chunk if accumulated is None else accumulated + chunk
             if accumulated is None:
@@ -254,8 +305,16 @@ class ChatLLM:
         thought_signatures_by_id, thought_signatures_by_index = (
             ChatLLM._tool_call_thought_signature_maps(ai_message)
         )
+        # finish_reason: OpenAI channels set response_metadata["finish_reason"];
+        # the native Anthropic channel sets "stop_reason" instead — map it to
+        # the OpenAI vocabulary the ReAct loop compares against.
+        meta = getattr(ai_message, "response_metadata", {}) or {}
+        raw_finish = meta.get("finish_reason")
+        if not raw_finish:
+            stop_reason = meta.get("stop_reason")
+            raw_finish = _ANTHROPIC_STOP_REASON_MAP.get(stop_reason, stop_reason or "stop")
         return LLMResponse(
-            content=ai_message.content,
+            content=_content_text(ai_message.content),
             tool_calls=[
                 ToolCallRequest(
                     id=tc["id"],
@@ -266,9 +325,10 @@ class ChatLLM:
                 )
                 for index, tc in enumerate(ai_message.tool_calls)
             ],
-            reasoning_content=ai_message.additional_kwargs.get("reasoning_content"),
-            finish_reason=_dedupe_finish_reason(
-                ai_message.response_metadata.get("finish_reason", "stop")
+            reasoning_content=(
+                ai_message.additional_kwargs.get("reasoning_content")
+                or (_content_thinking(ai_message.content) or None)
             ),
+            finish_reason=_dedupe_finish_reason(raw_finish),
             usage_metadata=usage,
         )

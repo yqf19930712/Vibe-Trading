@@ -525,6 +525,66 @@ def _normalize_ollama_base_url(base_url: str) -> str:
     return f"{url}/v1"
 
 
+def _build_native_anthropic(model: str, callbacks: Any = None) -> Any:
+    """Build a native Anthropic Messages API client (LANGCHAIN_PROVIDER=anthropic).
+
+    Motivation (2026-08-26): the OpenAI-compat conversion path swallowed
+    Anthropic's SSE pings — long opus thinking left the stream byte-silent for
+    minutes and stateful middleboxes reaped the "idle" connection (clean
+    truncation incidents fc2710/5d3bea33). The native ``/v1/messages`` channel
+    forwards pings end-to-end and has typed stream events, removing two
+    protocol conversion layers.
+
+    Config:
+        ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY — credential (first wins).
+        ANTHROPIC_BASE_URL — gateway origin, e.g. https://api-direct.laicai8.co
+        VIBE_ANTHROPIC_MAX_TOKENS — max output tokens (default 32000).
+        VIBE_ANTHROPIC_THINKING — "adaptive" (default for *-5 family models),
+            or "off" to disable. Budget-based thinking is deliberately not
+            wired: opus-5-family rejects it and BYOK models fall back to
+            provider defaults with "off".
+        Temperature is never sent — thinking-enabled Claude models reject
+        non-default temperatures.
+    """
+    try:
+        from langchain_anthropic import ChatAnthropic
+    except ImportError as exc:  # pragma: no cover - packaging error
+        raise RuntimeError(
+            "LANGCHAIN_PROVIDER=anthropic requires the langchain-anthropic package"
+        ) from exc
+
+    api_key = os.getenv("ANTHROPIC_AUTH_TOKEN", "").strip() or os.getenv(
+        "ANTHROPIC_API_KEY", ""
+    ).strip()
+    if not api_key:
+        raise RuntimeError(
+            "LANGCHAIN_PROVIDER=anthropic requires ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY"
+        )
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "max_tokens": int(os.getenv("VIBE_ANTHROPIC_MAX_TOKENS", "32000")),
+        "timeout": int(os.getenv("TIMEOUT_SECONDS", "120")),
+        "max_retries": int(os.getenv("MAX_RETRIES", "2")),
+        "api_key": api_key,
+        "callbacks": callbacks,
+    }
+    base_url = os.getenv("ANTHROPIC_BASE_URL", "").strip()
+    if base_url:
+        kwargs["base_url"] = base_url
+    thinking_mode = os.getenv("VIBE_ANTHROPIC_THINKING", "").strip().lower()
+    if not thinking_mode:
+        # Adaptive thinking exists only on the *-5 generation; older Claude
+        # models (BYOK) reject it at request validation, so default them off.
+        thinking_mode = "adaptive" if "-5" in model.lower() else "off"
+    if thinking_mode != "off":
+        kwargs["thinking"] = {"type": thinking_mode}
+    logger.info(
+        "Native Anthropic channel: model=%s base_url=%s thinking=%s",
+        model, base_url or "(default)", thinking_mode,
+    )
+    return ChatAnthropic(**kwargs)
+
+
 def _sync_provider_env() -> None:
     """Map provider-specific env vars to OPENAI_* for ChatOpenAI.
 
@@ -540,6 +600,12 @@ def _sync_provider_env() -> None:
         os.environ["OPENAI_API_BASE"] = codex_url
         os.environ["OPENAI_BASE_URL"] = codex_url
         os.environ.pop("OPENAI_API_KEY", None)
+        return
+
+    if provider == "anthropic":
+        # Native Messages API channel — ChatAnthropic reads ANTHROPIC_* env
+        # directly; do NOT fold them into OPENAI_* (that would poison any
+        # OpenAI-compat fallback path in the same process).
         return
 
     key_env, base_env = provider_env_names(provider, os.getenv("LANGCHAIN_MODEL_NAME", ""))
@@ -655,6 +721,9 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
             timeout=int(os.getenv("TIMEOUT_SECONDS", "120")),
             reasoning_effort=effort or None,
         )
+
+    if provider == "anthropic":
+        return _build_native_anthropic(name, callbacks=callbacks)
 
     if provider == "deepseek":
         adapter_mode = _deepseek_adapter_mode()
