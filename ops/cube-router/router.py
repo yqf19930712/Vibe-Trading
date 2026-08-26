@@ -162,8 +162,11 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
     # Tenant performance/reliability tier (batches 2+3). Router env overrides;
     # incident 2026-08-24 showed the engine defaults (50 iters, 1800s tool and
     # swarm timeouts) let a run outlive every caller budget.
+    # 2026-08-26: iterations back to 50 (operator decision) — 25 starved
+    # swarm-intent runs whose data-collection phase alone ate ~20 iterations
+    # (attempt c5810ef14c1e); wall-clock deadlines remain the hard stop.
     for key, default in (
-        ("VIBE_MAX_ITERATIONS", "25"),
+        ("VIBE_MAX_ITERATIONS", "50"),
         ("VIBE_TRADING_DATA_CACHE", "1"),
         ("VIBE_TRADING_TOOL_TIMEOUT_SECONDS", "300"),
         # Swarm committees legitimately run tens of minutes to hours (multi-
