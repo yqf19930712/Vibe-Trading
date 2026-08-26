@@ -160,6 +160,21 @@ def fetch_market_data(
     """
     from backtest.loaders.registry import FALLBACK_CHAINS, LOADER_REGISTRY, _ensure_registered
 
+    # Belt-and-braces for callers that bypass the registry's schema coercion
+    # (gateway/MCP direct calls): stringified numerics/arrays must not blow up
+    # deep in cap_rows (attempt 052d98f52286: max_rows "0" → TypeError).
+    if isinstance(max_rows, str):
+        try:
+            max_rows = int(max_rows.strip(), 10)
+        except ValueError:
+            max_rows = DEFAULT_MAX_ROWS
+    if isinstance(codes, str):
+        try:
+            parsed = json.loads(codes)
+            codes = parsed if isinstance(parsed, list) else [codes]
+        except ValueError:
+            codes = [c.strip() for c in codes.split(",") if c.strip()]
+
     results: dict[str, Any] = {}
     tried: dict[str, list[str]] = {code: [] for code in codes}
     last_error: dict[str, str] = {}

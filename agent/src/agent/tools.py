@@ -51,6 +51,53 @@ class BaseTool(ABC):
         }
 
 
+def _coerce_params(schema: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
+    """Best-effort coercion of LLM-emitted args toward the declared schema.
+
+    OpenAI-compatible channels intermittently stringify argument values —
+    attempt 052d98f52286 sent ``max_rows: "0"`` and even a JSON-encoded
+    string for an array param (``codes: "[\\"CBRS.US\\"]"``), which blew up
+    deep inside the tool (``'<' not supported between str and int``) and
+    burned four identical retries. Coercion is lossless-only: values that
+    don't parse cleanly pass through unchanged so the tool's own validation
+    still owns the final word.
+    """
+    props = (schema or {}).get("properties")
+    if not isinstance(props, dict) or not isinstance(params, dict):
+        return params
+    out: Dict[str, Any] = {}
+    for key, value in params.items():
+        spec = props.get(key)
+        declared = spec.get("type") if isinstance(spec, dict) else None
+        out[key] = _coerce_value(declared, value)
+    return out
+
+
+def _coerce_value(declared: Any, value: Any) -> Any:
+    if not isinstance(value, str) or not isinstance(declared, str):
+        return value
+    text = value.strip()
+    try:
+        if declared == "integer":
+            return int(text, 10)
+        if declared == "number":
+            return float(text)
+        if declared == "boolean":
+            if text.lower() in ("true", "1"):
+                return True
+            if text.lower() in ("false", "0"):
+                return False
+        elif declared in ("array", "object"):
+            parsed = json.loads(text)
+            if (declared == "array" and isinstance(parsed, list)) or (
+                declared == "object" and isinstance(parsed, dict)
+            ):
+                return parsed
+    except (ValueError, TypeError):
+        pass
+    return value
+
+
 class ToolRegistry:
     """Tool registry."""
 
@@ -75,7 +122,7 @@ class ToolRegistry:
         if not tool:
             return json.dumps({"status": "error", "error": f"Tool '{name}' not found"}, ensure_ascii=False)
         try:
-            return tool.execute(**params)
+            return tool.execute(**_coerce_params(tool.parameters, params))
         except Exception as exc:
             logger.exception("Tool %s failed", name)
             return json.dumps({
