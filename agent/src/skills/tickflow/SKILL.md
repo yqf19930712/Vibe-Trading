@@ -47,6 +47,22 @@ for symbol, df in data.items():
     print(symbol, df.tail())   # index=trade_date, columns=open/high/low/close/volume
 ```
 
+## Realtime Quotes
+
+US realtime snapshots are served by the dedicated **`get_realtime_quotes`
+tool** (last price, change vs prev close, OHLC, volume, session; covers
+recent IPOs that Tencent's qt.gtimg.cn lacks — e.g. CBRS). Use the tool, not
+bash curls:
+
+```json
+{"codes": ["INTC.US", "NVDA", "CBRS"]}
+```
+
+Free-tier realtime limits: 10 requests/min, 5 symbols per request (the tool
+batches and retries a single 429 automatically). Raw endpoint if ever needed:
+`GET /v1/quotes?symbols=INTC.US,NVDA.US` with the same `x-api-key` + explicit
+`User-Agent` headers.
+
 ## Symbol Format
 
 Identical to the project convention — no conversion needed: `AAPL.US`,

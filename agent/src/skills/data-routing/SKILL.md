@@ -55,6 +55,12 @@ current plan is US-only, so ifind leads for HK; tickflow no-ops for .HK)
 - **yfinance / okx / ccxt / akshare**: free but may have network restrictions
 - If the user reports "connection timeout" or "cannot access", switch to the same-market fallback
 
+### US realtime quotes
+
+For US realtime snapshots use the **`get_realtime_quotes` tool** (TickFlow
+`/v1/quotes`: last price, change, OHLC, volume; includes recent IPOs that
+Tencent's endpoint lacks). Do NOT bash-curl quote websites for US symbols.
+
 ### Using tickflow / ifind in analysis scripts
 
 Both are wired into `get_market_data` and the backtest runner (`source: "auto"`
