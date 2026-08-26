@@ -650,15 +650,43 @@ class AgentLoop:
                 # context as the most recent user message.
                 if iteration == wrap_up_at and 1 < iteration < self.max_iterations:
                     remaining = self.max_iterations - iteration
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"[SYSTEM] You have {remaining} iterations remaining out of "
-                            f"{self.max_iterations}. Please wrap up your work. "
-                            "Stop calling tools and provide your final answer as plain text. "
-                            "If you have partial results, summarize what you have so far."
-                        ),
-                    })
+                    # Swarm-aware nudge: the iteration counter is NOT the wall
+                    # clock. If the user explicitly requested a team/committee
+                    # analysis and run_swarm never ran, a blanket "stop calling
+                    # tools" here forecloses it even with hours of budget left
+                    # (attempt c5810ef14c1e: 20 iterations of data collection,
+                    # nudge at 20/25, swarm skipped with 6800s remaining).
+                    swarm_available = self.registry.get("run_swarm") is not None
+                    swarm_ran = "run_swarm" in self._stats.get("tools", {})
+                    wall_left_s = (
+                        deadline - _time.monotonic() if deadline is not None else None
+                    )
+                    wall_ample = wall_left_s is None or wall_left_s > 900
+                    if swarm_available and not swarm_ran and wall_ample:
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"[SYSTEM] You have {remaining} iterations remaining out of "
+                                f"{self.max_iterations}. Stop gathering data. If the user "
+                                "explicitly requested a team/committee (swarm) analysis "
+                                "and you have not launched it yet, call run_swarm NOW as "
+                                "your next action — one run_swarm call counts as a single "
+                                "iteration and the wall-clock budget is still ample, so "
+                                "the iteration limit is NOT a reason to skip it. "
+                                "Otherwise wrap up and provide your final answer as "
+                                "plain text."
+                            ),
+                        })
+                    else:
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"[SYSTEM] You have {remaining} iterations remaining out of "
+                                f"{self.max_iterations}. Please wrap up your work. "
+                                "Stop calling tools and provide your final answer as plain text. "
+                                "If you have partial results, summarize what you have so far."
+                            ),
+                        })
 
                 # Batch 3 — wall-clock budget management. Two escalations:
                 # (a) <25% of the budget left → one wrap-up nudge, independent
