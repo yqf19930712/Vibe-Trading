@@ -89,7 +89,8 @@ class RealtimeQuoteTool(BaseTool):
     repeatable = True  # quotes are volatile by nature — re-calls are legitimate
     is_readonly = True
 
-    def check_available(self) -> bool:
+    @classmethod
+    def check_available(cls) -> bool:
         return bool(os.environ.get("TICKFLOW_API_KEY", "").strip())
 
     def execute(self, **kwargs: Any) -> str:
