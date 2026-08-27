@@ -225,8 +225,8 @@ flowchart LR
 |---|---|---|
 | 沙箱规格 | 2C / 2G（模板默认） | MicroVM 硬隔离，租户内 runaway 不外溢 |
 | writable layer | 4G | 租户全部落盘状态（记忆/会话/上传/runs）的容量上限 |
-| RUNNING 沙箱上限 | `VIBE_MAX_INSTANCES`（默认 3） | 8G 宿主机：OS + CubeSandbox 控制面 ≈2.5G，余量 ≈3 个 RUNNING；满则 pause LRU 空闲者，全忙 503 |
-| 并发 `/ask` | `VIBE_MAX_CONCURRENT_ACTIVE`（默认 2） | 信号量排队 |
+| RUNNING 沙箱上限 | `VIBE_MAX_INSTANCES`（默认 3；**生产现配 4**，配合 laicai 作战室四份专业报告并行，宿主已加 2G swap） | 8G 宿主机：OS + CubeSandbox 控制面 ≈2.5G，余量 ≈3 个 RUNNING；满则 pause LRU 空闲者，全忙 503 |
+| 并发 `/ask` | `VIBE_MAX_CONCURRENT_ACTIVE`（默认 2；**生产现配 4**） | 信号量排队 |
 | 空闲 pause | `VIBE_IDLE_TTL_S`（默认 20min） | pause 不占 CPU/内存调度，盘保留 |
 | router 自身 | systemd `MemoryMax=1G` | router 只做编排，不承载引擎负载 |
 
