@@ -264,6 +264,14 @@ async def sbx_info(sandbox_id: str) -> Optional[dict]:
     r = await api.get(f"/sandboxes/{sandbox_id}")
     if r.status_code == 404:
         return None
+    # Half-deleted sandbox (2026-08-27 incident): cubelet already reaped the
+    # task but the CubeAPI/cubemaster record lingers, answering 500 with
+    # "NotFoundAtCubelet". Treat it as gone so callers take the same
+    # rebuild path as a clean 404 instead of erroring forever.
+    if r.status_code >= 500 and "NotFoundAtCubelet" in r.text:
+        log.warning("sandbox %s half-deleted (NotFoundAtCubelet); treating as gone",
+                    sandbox_id[:12])
+        return None
     r.raise_for_status()
     return r.json()
 
@@ -376,7 +384,18 @@ async def _ensure_ready(
             await asyncio.sleep(1.5)
             h = await _launcher_health(inst)
         if h is None:
-            raise HTTPException(502, "sandbox unreachable after resume")
+            # 2026-08-27 incident: resume reported success but the VM never
+            # came up; cubelet then reaped the failed task, leaving a
+            # half-deleted record (sbx_info 500 NotFoundAtCubelet) that the
+            # 404-only self-heal never clears. Tear the sandbox down and drop
+            # the mapping HERE so the tenant's next ask cold-rebuilds cleanly.
+            log.warning("tenant %s sandbox %s unreachable after resume; discarding",
+                        inst.tk[:8], inst.sandbox_id[:12])
+            await sbx_delete(inst.sandbox_id)
+            pool.pop(inst.tk, None)
+            state.pop(inst.tk, None)
+            _save_state()
+            raise HTTPException(502, "sandbox unreachable after resume; rebuilt on next request")
     inst.paused = False
     if h.get("engine") == "running" and inst.llm_fp == fp and inst.api_key:
         return
@@ -402,6 +421,10 @@ async def get_or_create(
             if st and st.get("sandbox_id"):
                 info = await sbx_info(st["sandbox_id"])
                 if info is None:
+                    # Best-effort cleanup of a possibly half-deleted record
+                    # (NotFoundAtCubelet residue) before rebuilding; a plain
+                    # 404 delete is a harmless no-op.
+                    await sbx_delete(st["sandbox_id"])
                     state.pop(tk, None)
                     _save_state()
                 elif st.get("template_id") != TEMPLATE_ID:
