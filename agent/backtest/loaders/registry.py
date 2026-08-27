@@ -10,6 +10,7 @@ of import order.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Type
 
 from backtest.loaders.base import NoAvailableSourceError
@@ -40,6 +41,8 @@ VALID_SOURCES: set[str] = {
     "mootdx",
     "ccxt",
     "futu",
+    "ifind",
+    "tickflow",
     "auto",
 }
 
@@ -53,46 +56,56 @@ def register(cls: Type[Any]) -> Type[Any]:
     return cls
 
 
+_registry_lock = threading.Lock()
+
+
 def _ensure_registered() -> None:
     """Import every known loader module so ``@register`` decorators fire.
 
     Safe to call multiple times — only runs the imports once.
     Loaders whose dependencies are missing (e.g. ``akshare`` not installed)
-    are silently skipped.
+    are logged and skipped.
+
+    Thread-safe: parallel tool calls at cold boot must BLOCK until the import
+    pass finishes. The flag is only set after the imports complete — setting it
+    up-front let a concurrent caller read a half-filled registry and fail with
+    "Unknown data source: yfinance" while the first caller was still importing
+    (2026-08-25, attempt 88e080ef0a46).
     """
     global _registered
     if _registered:
         return
-    _registered = True
+    with _registry_lock:
+        if _registered:
+            return
 
-    _loader_modules = [
-        "backtest.loaders.tushare",
-        "backtest.loaders.okx",
-        "backtest.loaders.yfinance_loader",
-        "backtest.loaders.akshare_loader",
-        "backtest.loaders.baostock_loader",
-        "backtest.loaders.tencent_loader",
-        "backtest.loaders.mootdx_loader",
-        "backtest.loaders.ccxt_loader",
-        "backtest.loaders.futu",
-    ]
-    import importlib
-    for mod in _loader_modules:
-        try:
-            importlib.import_module(mod)
-        except Exception as exc:  # noqa: BLE001 - optional dep missing is normal
-            # Not silent anymore: a cold-boot transient here starved a whole
-            # attempt of every data source (2026-08-25 smoke: first tool call
-            # saw an empty registry, "Unknown data source: yfinance").
-            logger.warning(
-                "loader module %s failed to import: %s", mod, str(exc)[:200]
-            )
-    if not LOADER_REGISTRY:
-        # Boot-time race left NOTHING registered — do not latch, so the next
-        # call retries the imports instead of running blind for the process
-        # lifetime.
-        logger.warning("loader registry empty after import pass; will retry")
-        _registered = False
+        _loader_modules = [
+            "backtest.loaders.tushare",
+            "backtest.loaders.okx",
+            "backtest.loaders.yfinance_loader",
+            "backtest.loaders.akshare_loader",
+            "backtest.loaders.baostock_loader",
+            "backtest.loaders.tencent_loader",
+            "backtest.loaders.mootdx_loader",
+            "backtest.loaders.ccxt_loader",
+            "backtest.loaders.futu",
+            "backtest.loaders.ifind_loader",
+            "backtest.loaders.tickflow_loader",
+        ]
+        import importlib
+        for mod in _loader_modules:
+            try:
+                importlib.import_module(mod)
+            except Exception as exc:  # noqa: BLE001 - optional dep missing is normal
+                logger.warning(
+                    "loader module %s failed to import: %s", mod, str(exc)[:200]
+                )
+        if LOADER_REGISTRY:
+            _registered = True
+        else:
+            # Every import failed — do not latch, so the next call retries the
+            # imports instead of running blind for the process lifetime.
+            logger.warning("loader registry empty after import pass; will retry")
 
 
 # ---------------------------------------------------------------------------
@@ -101,8 +114,13 @@ def _ensure_registered() -> None:
 
 FALLBACK_CHAINS: dict[str, list[str]] = {
     "a_share":   ["tushare", "mootdx", "baostock", "tencent", "akshare"],
-    "us_equity": ["yfinance", "akshare"],
-    "hk_equity": ["yfinance", "tencent", "futu", "akshare"],
+    # 2026-08-25 运营决策：美/港股国内直连源优先，yfinance 等原有顺序整体
+    # 后移——出境隧道+Yahoo 限频只作兜底。美股 tickflow 首位（结构化、快）、
+    # ifind 次位；港股 ifind 首位——tickflow 免费档无港股权限，若放港股首位
+    # 会让 resolve_loader 单选路径（如 correlation）拿到空结果直接丢标的，
+    # 故其在港股链居次位仅作升级位。
+    "us_equity": ["tickflow", "ifind", "yfinance", "akshare"],
+    "hk_equity": ["ifind", "tickflow", "yfinance", "tencent", "futu", "akshare"],
     "crypto":    ["okx", "ccxt", "yfinance"],
     "futures":   ["tushare", "akshare"],
     "fund":      ["tushare", "akshare"],

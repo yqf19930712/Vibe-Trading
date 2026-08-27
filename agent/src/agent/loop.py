@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -205,6 +206,28 @@ def estimate_tokens(messages: list) -> int:
     return len(json.dumps(messages, default=str, ensure_ascii=False)) // 4
 
 
+# Placeholder for pruned tool results. MUST tell the model the data was
+# dropped and can be re-fetched — the bare "[cleared]" marker plus the
+# name-level duplicate guard once dead-locked an attempt into retracting
+# REAL numbers as hallucinations (dea1222743ef, 2026-08-25: result pruned,
+# every re-fetch refused with "already succeeded").
+_CLEARED_PREFIX = "[cleared"
+_CLEARED_PLACEHOLDER = (
+    "[cleared — this old tool result was pruned to keep the context small. "
+    "The call DID succeed earlier; if you need the data again, re-call the "
+    "tool with the same arguments.]"
+)
+
+
+def _tool_call_key(name: str, arguments: Any) -> str:
+    """Duplicate-guard key: tool name + canonicalized arguments."""
+    try:
+        args_repr = json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        args_repr = repr(arguments)
+    return f"{name}:{hashlib.sha1(args_repr.encode('utf-8', 'replace')).hexdigest()}"
+
+
 def _microcompact(messages: list) -> None:
     """Layer 1: silently prune old tool results, keeping the most recent N intact.
 
@@ -217,7 +240,7 @@ def _microcompact(messages: list) -> None:
     for msg in tool_msgs[:-KEEP_RECENT]:
         content = msg.get("content", "")
         if isinstance(content, str) and len(content) > 100:
-            msg["content"] = "[cleared]"
+            msg["content"] = _CLEARED_PLACEHOLDER
 
 
 def _context_collapse(messages: list) -> None:
@@ -235,7 +258,7 @@ def _context_collapse(messages: list) -> None:
         content = msg.get("content")
         if not isinstance(content, str) or len(content) <= COLLAPSE_TEXT_MIN:
             continue
-        if content == "[cleared]":
+        if content.startswith(_CLEARED_PREFIX):
             continue
         head = content[:COLLAPSE_HEAD]
         tail = content[-COLLAPSE_TAIL:]
@@ -473,7 +496,13 @@ class AgentLoop:
         self.memory = memory or WorkspaceMemory()
         self._event_callback = event_callback
         self.max_iterations = max_iterations
-        self._called_ok: set[str] = set()
+        # call_key -> the appended tool-result message dict. Keyed by
+        # (name, args) — a name-level guard once refused every follow-up
+        # get_market_data with different symbols (dea1222743ef). The message
+        # ref lets the guard see whether _microcompact pruned the result:
+        # a pruned result means the model no longer has the data, so an
+        # identical re-fetch must be allowed through.
+        self._called_ok: Dict[str, Dict[str, Any]] = {}
         self._cancel_event = threading.Event()
         self._previous_summary: str = ""
         self._persistent_memory = persistent_memory
@@ -511,7 +540,7 @@ class AgentLoop:
         """
         # Reset per-run state (safe for reuse across multiple run() calls)
         self._cancel_event.clear()
-        self._called_ok = set()
+        self._called_ok = {}
         self._previous_summary = ""
         self._stats = _new_run_stats()
         run_t0 = _time.perf_counter()
@@ -1155,9 +1184,15 @@ class AgentLoop:
 
             tool_def = self.registry.get(tc.name)
             is_repeatable = tool_def.repeatable if tool_def else False
-            if tc.name in self._called_ok and not is_repeatable:
-                logger.warning(f"Blocked duplicate call: {tc.name} (already succeeded)")
-                skip_msg = json.dumps({"skipped": True, "reason": f"{tc.name} already completed successfully. Use the previous result."})
+            prior = self._called_ok.get(_tool_call_key(tc.name, tc.arguments))
+            prior_intact = (
+                prior is not None
+                and isinstance(prior.get("content"), str)
+                and not prior["content"].startswith(_CLEARED_PREFIX)
+            )
+            if prior_intact and not is_repeatable:
+                logger.warning(f"Blocked duplicate call: {tc.name} (identical args already succeeded)")
+                skip_msg = json.dumps({"skipped": True, "reason": f"An identical {tc.name} call (same arguments) already succeeded above — use that result. To fetch different data, change the arguments."})
                 messages.append(context.format_tool_result(tc.id, tc.name, skip_msg))
                 trace.write({"type": "tool_skipped", "iter": iteration, "tool": tc.name})
                 react_trace.append({"type": "tool_skipped", "tool": tc.name})
@@ -1508,8 +1543,6 @@ class AgentLoop:
         self._update_memory(tc.name)
 
         success = _is_tool_success(result)
-        if success:
-            self._called_ok.add(tc.name)
 
         tool_stats = self._stats.setdefault("tools", {}).setdefault(
             tc.name, {"calls": 0, "ms": 0, "errors": 0}
@@ -1521,7 +1554,12 @@ class AgentLoop:
 
         status = "ok" if success else "error"
         truncated = result[:TOOL_RESULT_LIMIT]
-        messages.append(context.format_tool_result(tc.id, tc.name, truncated))
+        result_msg = context.format_tool_result(tc.id, tc.name, truncated)
+        messages.append(result_msg)
+        if success:
+            # Keep the message REF so the duplicate guard can tell whether
+            # _microcompact has since pruned this result (pruned -> re-allow).
+            self._called_ok[_tool_call_key(tc.name, tc.arguments)] = result_msg
 
         trace_result = _redact_trace_result(result)
         trace.write_tool_result(

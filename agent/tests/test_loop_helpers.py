@@ -18,6 +18,9 @@ from src.agent.loop import (
     _fix_tool_pairs,
     _is_tool_success,
     _normalize_tool_run_dir,
+    _CLEARED_PLACEHOLDER,
+    _CLEARED_PREFIX,
+    _tool_call_key,
 )
 
 
@@ -60,11 +63,14 @@ class TestMicrocompact:
         _microcompact(messages)
 
         tool_msgs = [m for m in messages if m.get("role") == "tool"]
-        # Old ones should be [cleared]
-        cleared = [m for m in tool_msgs if m["content"] == "[cleared]"]
-        preserved = [m for m in tool_msgs if m["content"] != "[cleared]"]
+        # Old ones should carry the informative cleared placeholder
+        cleared = [m for m in tool_msgs if m["content"] == _CLEARED_PLACEHOLDER]
+        preserved = [m for m in tool_msgs if m["content"] != _CLEARED_PLACEHOLDER]
         assert len(cleared) == 5
         assert len(preserved) == KEEP_RECENT
+        # The placeholder must explain re-fetching is allowed (dea1222743ef)
+        assert _CLEARED_PLACEHOLDER.startswith(_CLEARED_PREFIX)
+        assert "re-call" in _CLEARED_PLACEHOLDER
 
     def test_preserves_short_content(self) -> None:
         messages = [
@@ -87,7 +93,27 @@ class TestMicrocompact:
             {"role": "tool", "content": "x" * 200, "tool_call_id": "tc_0"},
         ]
         _microcompact(messages)
-        assert messages[0]["content"] != "[cleared]"
+        assert messages[0]["content"] == "x" * 200
+
+
+class TestToolCallKey:
+    """Duplicate-guard keys must be (name, args)-scoped — the old name-level
+    guard refused every follow-up get_market_data with different symbols
+    (attempt dea1222743ef)."""
+
+    def test_same_name_different_args_differ(self) -> None:
+        a = _tool_call_key("get_market_data", {"codes": ["INTC.US"]})
+        b = _tool_call_key("get_market_data", {"codes": ["AVGO.US"]})
+        assert a != b
+
+    def test_same_args_stable_regardless_of_key_order(self) -> None:
+        a = _tool_call_key("t", {"x": 1, "y": 2})
+        b = _tool_call_key("t", {"y": 2, "x": 1})
+        assert a == b
+
+    def test_unserializable_args_do_not_raise(self) -> None:
+        key = _tool_call_key("t", {"f": object()})
+        assert key.startswith("t:")
 
     def test_does_not_touch_non_tool(self) -> None:
         messages = [
