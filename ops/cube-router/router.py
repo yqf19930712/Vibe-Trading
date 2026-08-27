@@ -945,6 +945,53 @@ async def obs_trace(
     return {"entries": out[-limit:], "truncated": len(out) > limit}
 
 
+_OBS_PROMPT_CAP = 65536
+
+
+@app.get("/obs/prompt")
+async def obs_prompt(
+    uid: str,
+    session_id: str,
+    authorization: Optional[str] = Header(None),
+):
+    """Full engine-input prompts of a session's attempts, UNCLIPPED.
+
+    /obs/trace clips every field at 600 chars; the call-input viewer on the
+    laicai trace page needs the whole prompt. A continuity session holds one
+    ``start`` trace event per attempt — all are returned with their ts so the
+    caller matches the right attempt by time (start events carry no
+    attempt_id). Per-prompt cap 64KB.
+    """
+    _auth(authorization)
+    if not _OBS_ID_RE.fullmatch(session_id):
+        raise HTTPException(400, "invalid session_id")
+    path = DATA_ROOT / tenant_key(uid) / "sessions" / session_id / "trace.jsonl"
+    if not path.exists():
+        return {"starts": []}
+
+    def _read_starts() -> list[dict[str, Any]]:
+        starts: list[dict[str, Any]] = []
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"start"' not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if e.get("type") != "start":
+                    continue
+                prompt = str(e.get("prompt") or "")
+                starts.append({
+                    "ts": e.get("ts"),
+                    "prompt": prompt[:_OBS_PROMPT_CAP],
+                    "truncated": len(prompt) > _OBS_PROMPT_CAP,
+                })
+        return starts[-20:]
+
+    return {"starts": await asyncio.to_thread(_read_starts)}
+
+
 @app.get("/obs/swarm-events")
 async def obs_swarm_events(
     uid: str,
