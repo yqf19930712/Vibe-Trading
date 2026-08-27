@@ -37,6 +37,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import time
 from collections import deque
 from pathlib import Path
@@ -1000,12 +1001,116 @@ async def _reaper():
             v.paused = True
 
 
+# ── Startup sweep: destroy stale-template sandboxes, then delete old templates ─
+CUBEMASTERCLI = os.environ.get("VIBE_CUBEMASTERCLI", "/usr/local/bin/cubemastercli")
+SWEEP_STALE = os.environ.get(
+    "VIBE_SWEEP_STALE_TEMPLATES", "1"
+).strip().lower() not in {"0", "false", "no"}
+
+
+def _vibe_template_ids() -> set[str]:
+    """Template ids whose image is a vibe-engine build (never touch others)."""
+    try:
+        out = subprocess.run(
+            [CUBEMASTERCLI, "tpl", "list"],
+            capture_output=True, text=True, timeout=60,
+        ).stdout
+    except Exception as e:  # noqa: BLE001 - sweep is best-effort
+        log.warning("sweep: tpl list failed: %s", e)
+        return set()
+    ids: set[str] = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0].startswith("tpl-") and "vibe-engine" in parts[4]:
+            ids.add(parts[0])
+    return ids
+
+
+async def _sweep_stale_templates() -> None:
+    """One-shot cleanup after a template switch (2026-08-27 operator policy).
+
+    A template switch always involves a router restart with no in-flight asks,
+    so any old-template sandbox found here serves nobody. For each sandbox
+    whose template is not the current one: running instances are paused first
+    (graceful quiesce), then deleted (the delete helper resumes paused ones —
+    a CubeAPI quirk); finally every superseded vibe-engine template is removed.
+    Covers both state.json tenants and orphans state no longer tracks (the v3
+    fossil that pinned its template for days). Non-vibe templates (e.g. the
+    sandbox-code base) are never touched. Disable with
+    VIBE_SWEEP_STALE_TEMPLATES=0.
+    """
+    vibe_tpls = await asyncio.to_thread(_vibe_template_ids)
+    doomed: list[str] = []
+
+    # 1. state.json tenants pinned to superseded templates.
+    changed = False
+    for tk, st in list(state.items()):
+        sid = st.get("sandbox_id")
+        if not sid or st.get("template_id") == TEMPLATE_ID:
+            continue
+        log.info("sweep: tenant %s sandbox %s on stale template %s",
+                 tk[:8], sid[:12], st.get("template_id"))
+        doomed.append(sid)
+        state.pop(tk, None)
+        changed = True
+    if changed:
+        _save_state()
+
+    # 2. Orphan sandboxes unknown to state (only ones built from vibe images).
+    try:
+        r = await api.get("/sandboxes")
+        payload = r.json() if r.status_code == 200 else []
+        items = payload if isinstance(payload, list) else (
+            payload.get("sandboxes") or payload.get("data") or []
+        )
+        known = {st.get("sandbox_id") for st in state.values()}
+        for s in items:
+            sid = s.get("sandboxID") or s.get("sandboxId") or s.get("id")
+            tpl = s.get("templateID") or s.get("templateId")
+            if not sid or sid in known or sid in doomed:
+                continue
+            if tpl == TEMPLATE_ID or tpl not in vibe_tpls:
+                continue
+            log.info("sweep: orphan sandbox %s on stale template %s", sid[:12], tpl)
+            doomed.append(sid)
+    except Exception as e:  # noqa: BLE001
+        log.warning("sweep: sandbox enumeration failed: %s", e)
+
+    # 3. Pause running instances, then destroy.
+    for sid in doomed:
+        try:
+            info = await sbx_info(sid)
+            status = str((info or {}).get("status") or (info or {}).get("state") or "").lower()
+            if status == "running":
+                await sbx_pause(sid)
+            await sbx_delete(sid)
+            log.info("sweep: destroyed sandbox %s", sid[:12])
+        except Exception as e:  # noqa: BLE001
+            log.warning("sweep: destroy %s failed: %s", sid[:12], e)
+
+    # 4. Delete every superseded vibe-engine template ("still in use" failures
+    #    are left for the next sweep once their sandboxes are gone).
+    for tpl in sorted(vibe_tpls - {TEMPLATE_ID}):
+        try:
+            res = await asyncio.to_thread(
+                subprocess.run,
+                [CUBEMASTERCLI, "tpl", "delete", "--template-id", tpl],
+                capture_output=True, text=True, timeout=120,
+            )
+            msg = (res.stdout + res.stderr).strip().splitlines()
+            log.info("sweep: tpl delete %s -> %s", tpl, msg[-1] if msg else res.returncode)
+        except Exception as e:  # noqa: BLE001
+            log.warning("sweep: tpl delete %s failed: %s", tpl, e)
+
+
 @app.on_event("startup")
 async def _startup():
     global state
     state = _load_state()
     log.info("loaded %d tenant mappings from %s", len(state), STATE_FILE)
     asyncio.create_task(_reaper())
+    if SWEEP_STALE:
+        asyncio.create_task(_sweep_stale_templates())
 
 
 @app.on_event("shutdown")
