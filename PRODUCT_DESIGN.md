@@ -182,6 +182,8 @@ laicai 管理端详情页（`/app/admin/deep-run/$id`）经这三个端点在浏
 | `GET /obs/engine-log` | `uid`、`attempt_id?`、`limit≤2000` | 租户 `logs/engine.jsonl`（宿主 bind-mount 直读） |
 | `GET /obs/trace` | `uid`、`session_id`、`limit≤2000` | 租户 `sessions/<sid>/trace.jsonl` |
 
+另有两个长期记忆端点（laicai「更多 → 来财AI → 深度引擎记忆」页，2026-08-27）：`GET /memory?uid=`（列出租户 `memory/*.md` 全文，排除 MEMORY.md 索引，按 mtime 倒序，单文件裁 64KB）与 `POST /memory/delete {uid,name}`（物理删文件 + 清 MEMORY.md 索引行；文件名防穿越校验、禁删 MEMORY.md）。宿主直读直删，无需沙箱在跑；与引擎并发写的竞态可接受（引擎容忍悬空索引行）。
+
 ## 4. launcher 协议（router → 沙箱）
 
 launcher（`ops/cube-engine/launcher.py`）是镜像的常驻进程与模板探针目标，监听 `:8898`；引擎 `:8899` 是它的子进程。一个模板即可服务所有租户与所有 LLM 配置——差异全部由 `/boot` 的 env 表达。

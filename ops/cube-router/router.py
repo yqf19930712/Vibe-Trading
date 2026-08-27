@@ -1027,6 +1027,99 @@ async def obs_swarm_events(
     return {"entries": out[-limit:], "truncated": len(out) > limit}
 
 
+# ── Tenant long-term memory (laicai「更多 → 来财AI → 深度引擎记忆」page) ─────
+# The engine's remember/auto-recall store lives on the host bind-mount at
+# <tenant>/memory/*.md (one markdown file per memory + a MEMORY.md index the
+# engine maintains). Host-side read/delete needs no running sandbox. Deleting
+# also drops the file's line from MEMORY.md; a concurrent engine write may
+# race, but the engine tolerates dangling index lines (treats them as
+# to-be-written markers), so no locking is needed.
+
+_MEM_FILE_MAX = 64_000
+
+
+def _mem_dir(uid: str) -> Path:
+    return DATA_ROOT / tenant_key(uid) / "memory"
+
+
+def _safe_mem_name(name: str) -> bool:
+    # Filenames are engine-generated slugs (may contain CJK); reject anything
+    # that could traverse out of the memory dir instead of whitelisting chars.
+    return (
+        bool(name)
+        and name.endswith(".md")
+        and "/" not in name
+        and "\\" not in name
+        and ".." not in name
+        and not name.startswith(".")
+    )
+
+
+@app.get("/memory")
+async def memory_list(uid: str, authorization: Optional[str] = Header(None)):
+    """List a tenant's long-term memories with full content (files are small,
+    KB-scale), newest first. MEMORY.md (the index) is excluded — each file
+    carries its own frontmatter title/description."""
+    _auth(authorization)
+    d = _mem_dir(uid)
+
+    def _read() -> list[dict]:
+        if not d.is_dir():
+            return []
+        out = []
+        for p in d.iterdir():
+            if not p.is_file() or not _safe_mem_name(p.name) or p.name == "MEMORY.md":
+                continue
+            try:
+                st = p.stat()
+                text = p.read_text("utf-8", "replace")
+            except OSError:
+                continue
+            out.append({
+                "name": p.name,
+                "mtime": int(st.st_mtime),
+                "size": st.st_size,
+                "content": text[:_MEM_FILE_MAX],
+                "truncated": len(text) > _MEM_FILE_MAX,
+            })
+        out.sort(key=lambda e: e["mtime"], reverse=True)
+        return out
+
+    return {"files": await asyncio.to_thread(_read)}
+
+
+@app.post("/memory/delete")
+async def memory_delete(body: dict, authorization: Optional[str] = Header(None)):
+    """Permanently delete one memory file and its MEMORY.md index line."""
+    _auth(authorization)
+    uid = body.get("uid")
+    name = body.get("name")
+    if not uid:
+        raise HTTPException(400, "uid required")
+    if not isinstance(name, str) or not _safe_mem_name(name) or name == "MEMORY.md":
+        raise HTTPException(400, "invalid name")
+    d = _mem_dir(uid)
+    path = d / name
+
+    def _delete() -> bool:
+        existed = path.is_file()
+        if existed:
+            path.unlink()
+        idx = d / "MEMORY.md"
+        if idx.is_file():
+            try:
+                lines = idx.read_text("utf-8", "replace").splitlines(keepends=True)
+                kept = [l for l in lines if f"({name})" not in l]
+                if len(kept) != len(lines):
+                    idx.write_text("".join(kept), encoding="utf-8")
+            except OSError:
+                pass  # index cleanup is best-effort; the engine tolerates drift
+        return existed
+
+    existed = await asyncio.to_thread(_delete)
+    return {"ok": True, "deleted": existed}
+
+
 @app.get("/healthz")
 async def healthz(authorization: Optional[str] = Header(None)):
     _auth(authorization)  # docs always said Bearer; the check was simply missing
