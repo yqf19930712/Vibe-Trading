@@ -17,6 +17,7 @@
 | `ops/vibe-router/` | 已退役的 v1 进程版编排器（同机多进程隔离），源码与 runbook 保留存档，沿革见 [docs/HISTORY.md](docs/HISTORY.md) |
 | `frontend/` | 上游 React Web UI。生产不使用（镜像里放空 `frontend/dist` 占位） |
 | `wiki/` `scripts/` `tools/` | 上游站点与 CI 杂项，与多租户层无关 |
+| `CHANGELOG.md` | 上游发布记录（保持原样便于合并）；本 fork 的变更叙事记在 [docs/HISTORY.md](docs/HISTORY.md) |
 
 ## 与上游的差异（`agent/` 内）
 
@@ -24,7 +25,9 @@
 
 - **单一数据根 `_data_root()`**（`agent/api_server.py`）：`runs/` `sessions/` `uploads/` 目录可被 `VIBE_DATA_DIR` 重定向；`VIBE_MULTITENANT=1` 而缺 `VIBE_DATA_DIR` 时启动即报错（fail-loud，杜绝租户状态静默写进共享安装目录）。
 - **租户安全档位**（`agent/src/tools/__init__.py`）：`VIBE_TRADING_TENANT_SAFE=1` 时 `build_registry` 排除 `trading_*` 前缀全部工具与 `propose_mandate_profiles`（动钱红线）；shell 类工具另由上游的 `VIBE_TRADING_ENABLE_SHELL_TOOLS=1` 门控制。
-- **LLM 兼容性**（`agent/src/providers/llm.py`）：模型名含 `opus-4-8` / `fable` / `mythos` 时省略 `temperature` 字段（这些模型经 OpenAI-compat 代理会拒绝该参数）；流式默认带 `stream_options.include_usage`（`LANGCHAIN_STREAM_USAGE=0` 可关），否则 `llm_usage` 事件恒空。
+- **LLM 兼容性**（`agent/src/providers/llm.py`）：模型名含 `opus-4-7` / `opus-4-8` / `opus-5` / `sonnet-5` / `fable` / `mythos` 时省略 `temperature` 字段（这些模型拒绝该参数；名单可经 `LANGCHAIN_NO_TEMPERATURE_MODELS` 追加，见下文「换模型」节）；流式默认带 `stream_options.include_usage`（`LANGCHAIN_STREAM_USAGE=0` 可关），否则 `llm_usage` 事件恒空。
+- **Anthropic 原生通道**（`agent/src/providers/llm.py` `_build_native_anthropic`）：`LANGCHAIN_PROVIDER=anthropic` 时走原生 `/v1/messages` API（`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` + `ANTHROPIC_BASE_URL`），SSE ping 端到端透传、去掉两层协议转换——治 OpenAI-compat 路径吞 ping 导致长思考流被中间设备静默掐断的问题；生产 v34 起即此通道。
+- **美股实时行情工具 `get_realtime_quotes`**（`agent/src/tools/realtime_quote_tool.py`）：TickFlow 快照报价（现价/涨跌/OHLC/量/时段），仅美股，需 `TICKFLOW_API_KEY`；替代模型 bash-curl 行情网站。
 - **可观测性**（详见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)）：`src/core/logging_setup.py` 结构化 JSONL 日志（contextvars 绑 session/attempt id，穿透工具线程）；AgentLoop 收口发 `attempt_stats` 事件（迭代/LLM·工具耗时/tokens/逐工具/数据源统计，SSE + trace 双写）；数据链路 print 改结构化 logger。
 - **预算与提前收敛**：messages API 增 `deadline_s`；`src/core/budget.py` deadline contextvar + `cap_timeout`；AgentLoop 剩余 <25% 注入收尾提示、不足一轮强制出文本（`early_finalize`）；单工具/swarm 超时被剩余预算钳制；`VIBE_MAX_ITERATIONS` env 化。
 - **数据可靠性**：`market_data` 空结果/异常沿 `FALLBACK_CHAINS` 逐源降级并输出 `_gaps` 明细；`src/core/fetch_stats.py` attempt 级数据源记账；tushare 进程内节流（`TUSHARE_MAX_PER_MIN`）+ 重试；启动 `socket.setdefaulttimeout` 兜底无超时 SDK。美/港股日线备源 `ifind`（同花顺 iFinD MCP，国内端点不走隧道，`IFIND_MCP_TOKEN` 鉴权；自然语言 quotes 工具 → markdown 表头驱动解析，仅日频，见 `backtest/loaders/ifind_loader.py`）；美股日线备源 `tickflow`（api.tickflow.org 结构化 REST，`TICKFLOW_API_KEY` 经 `x-api-key` 头，前复权列式 K 线，免费档 10 次/分·1 标的/次，429 单次重试，见 `backtest/loaders/tickflow_loader.py`）——国内直连源优先：us_equity 链 = tickflow→ifind→yfinance→akshare、hk_equity 链 = ifind→tickflow→yfinance→tencent→futu→akshare（yfinance 依赖隧道且被 Yahoo 限频，降为兜底；tickflow 免费档无港股权限故港股由 ifind 领跑）。
@@ -115,7 +118,7 @@ systemctl daemon-reload && systemctl enable --now cube-router
 | `LANGCHAIN_NO_TEMPERATURE_MODELS` | | 逗号分隔的模型名子串，**追加**到 `llm.py` 内置的 `NO_TEMPERATURE_MODELS` 名单（追加而非替换，避免为了加新模型把已知的漏掉） |
 | `VIBE_ASK_LOG` | | 每次 `/ask` 一行的观测日志，默认 `/var/lib/cube-router/ask_log.jsonl`（20MB 轮转） |
 | `VIBE_EGRESS_KEY_FILE` / `VIBE_EGRESS_SSH_DEST` | | 沙箱出境隧道：宿主上的 SSH 私钥路径（如 `/root/vibe-egress-key`）+ 目的地（如 `root@<B服务器>`）。配了才会给引擎注入 `VIBE_TRADING_EGRESS_PROXY`；B 端该 key 必须 `restrict,port-forwarding,permitopen="127.0.0.1:8888"` |
-| 租户档位覆盖 | | `engine_env()` 会给每个租户注入默认档位：`VIBE_MAX_ITERATIONS=25`、`VIBE_TRADING_DATA_CACHE=1`、`VIBE_TRADING_TOOL_TIMEOUT_SECONDS=300`、`SWARM_TIMEOUT=1800`、`VIBE_TRADING_SEARCH_BACKENDS=auto`——在 router.env 里设同名变量即可整体覆盖 |
+| 租户档位覆盖 | | `engine_env()` 会给每个租户注入默认档位：`VIBE_MAX_ITERATIONS=50`、`VIBE_TRADING_DATA_CACHE=1`、`VIBE_TRADING_TOOL_TIMEOUT_SECONDS=300`、`SWARM_TIMEOUT=7200`、`VIBE_TRADING_SEARCH_BACKENDS=auto`——在 router.env 里设同名变量即可整体覆盖 |
 
 laicai 侧只需在 `web.env` 配 `VIBE_ROUTER_URL=http://<宿主机>:8990` + `VIBE_ROUTER_TOKEN`。
 
