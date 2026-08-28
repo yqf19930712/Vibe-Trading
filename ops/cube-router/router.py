@@ -478,6 +478,21 @@ async def _vibe(inst: Instance, method: str, path: str, **kw):
     return await http.request(method, f"{inst.base_url}{path}", headers=headers, **kw)
 
 
+async def _cancel_attempt_bg(inst: Instance, sid: str, tk: str) -> None:
+    """Fire-and-forget engine cancel, detached from the (possibly dying) ask
+    generator. Called from the unanswered path of _ask_stream: on client
+    disconnect uvicorn *cancels* the generator task, so any `await` in its
+    finally raises CancelledError before the HTTP request goes out — the
+    engine kept grinding, got frozen by pause, and resumed as a zombie that
+    422'd new asks (2026-08-28 incident). A separate task survives that
+    cancellation and reliably delivers the cancel."""
+    try:
+        await _vibe(inst, "POST", f"/sessions/{sid}/cancel", timeout=10.0)
+        log.info("cancelled unfinished attempt (tenant %s, sid %s)", tk[:8], sid)
+    except Exception as e:  # noqa: BLE001
+        log.warning("background cancel failed (tenant %s, sid %s): %s", tk[:8], sid, e)
+
+
 async def _ensure_session(inst: Instance, vibe_session_id: Optional[str]) -> str:
     if vibe_session_id:
         return vibe_session_id
@@ -729,6 +744,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                                 ev = await asyncio.wait_for(q.get(), timeout=1.0)
                             except asyncio.TimeoutError:
                                 continue
+                            inst.last_activity = time.monotonic()
                             stats.setdefault(
                                 "first_progress_ms", int((time.monotonic() - t_req) * 1000)
                             )
@@ -758,18 +774,12 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                             # engine to stop burning tokens on an answer nobody
                             # will receive (incident 2026-08-24: a 504'd attempt
                             # kept grinding and starved the tenant's retry).
-                            try:
-                                await _vibe(
-                                    inst, "POST", f"/sessions/{sid}/cancel",
-                                    timeout=10.0,
-                                )
-                                stats["engine_cancelled"] = True
-                                log.info(
-                                    "cancelled unfinished attempt (tenant %s, sid %s)",
-                                    tk[:8], sid,
-                                )
-                            except Exception as e:  # noqa: BLE001
-                                log.warning("cancel after unanswered ask failed: %s", e)
+                            # MUST be a detached task, not an await — on client
+                            # disconnect this generator is being cancelled and
+                            # an await here dies before sending (2026-08-28
+                            # zombie-attempt incident).
+                            stats["engine_cancelled"] = True
+                            asyncio.create_task(_cancel_attempt_bg(inst, sid, tk))
             finally:
                 inst.refcount -= 1
     except HTTPException as e:
