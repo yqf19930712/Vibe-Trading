@@ -19,6 +19,7 @@ from src.agent.progress import HeartbeatTimer
 from src.agent.skills import SkillsLoader
 from src.agent.tools import ToolRegistry
 from src.config.schema import AgentConfig
+from src.core.token_estimate import estimate_messages_tokens, estimate_text_tokens
 from src.providers.chat import ChatLLM, LLMResponse, ProviderStreamError
 from src.swarm.models import (
     SwarmAgentSpec,
@@ -148,7 +149,7 @@ def _estimate_tokens(
 
     Prefers the provider-reported counts attached to the response by
     :func:`ChatLLM._parse_response` (``usage_metadata``). Falls back to a
-    character-length heuristic (``len // 4``) only when the provider
+    character-class weighted heuristic only when the provider
     didn't return usage data — keeps the behaviour contract for legacy
     or partial responses while making per-run totals (which feed
     ``SwarmRun.total_input_tokens`` / ``total_output_tokens``) reflect
@@ -176,16 +177,17 @@ def _estimate_tokens(
             return real_input, real_output
 
     # Fallback: provider didn't return usage_metadata. Estimate from
-    # serialized message length and response content length. ~4 chars per
-    # English token; under-counts for CJK / Thai / emoji-heavy prompts but
-    # at least preserves the prior behaviour.
+    # serialized message length and response content length using the
+    # character-class weighted heuristic (ASCII /4, CJK ×0.6, other /3 — see
+    # src.core.token_estimate), so CJK-heavy prompts are no longer
+    # under-counted 2-3x.
     try:
-        input_tokens = len(json.dumps(messages, ensure_ascii=False)) // 4
+        input_tokens = estimate_messages_tokens(messages)
     except Exception:
         input_tokens = 0
 
     if isinstance(response, LLMResponse):
-        output_tokens = len(response.content or "") // 4
+        output_tokens = estimate_text_tokens(response.content or "")
     else:
         output_tokens = 0
 
@@ -414,22 +416,19 @@ def run_worker(
     wrap_up_at = max(1, int(max_iterations * 0.8))
     last_assistant_content = ""
 
-    _KEEP_RECENT_TOOLS = 3
     data_tool_calls = 0
 
-    for iteration in range(max_iterations):
-        # Microcompact: clear old tool results to prevent token bloat
-        tool_msgs = [m for m in messages if m.get("role") == "tool"]
-        if len(tool_msgs) > _KEEP_RECENT_TOOLS:
-            for msg in tool_msgs[:-_KEEP_RECENT_TOOLS]:
-                content = msg.get("content", "")
-                if isinstance(content, str) and len(content) > 100:
-                    # Same informative placeholder as the main loop's
-                    # _microcompact — a bare "[cleared]" once made a model
-                    # retract real fetched numbers as hallucinations.
-                    from src.agent.loop import _CLEARED_PLACEHOLDER
+    # Shared with the main loop (lazy import — src.agent.loop reaches swarm
+    # modules through the tool registry, so a module-level import would risk a
+    # cycle): threshold-triggered, token-budget retention, protected tool
+    # names. Same placeholder semantics — a bare "[cleared]" once made a
+    # model retract real fetched numbers as hallucinations.
+    from src.agent.loop import _microcompact
 
-                    msg["content"] = _CLEARED_PLACEHOLDER
+    for iteration in range(max_iterations):
+        # Microcompact: prune old tool results only when the context estimate
+        # crosses the worker's own token budget threshold.
+        _microcompact(messages, token_threshold=_MAX_TOKEN_ESTIMATE)
 
         # Check timeout
         elapsed = time.monotonic() - t0
@@ -450,8 +449,8 @@ def run_worker(
                 tool_ms=total_tool_ms,
             )
 
-        # Check token estimate
-        token_estimate = len(json.dumps(messages, ensure_ascii=False)) // 4
+        # Check token estimate (CJK-weighted, see src.core.token_estimate)
+        token_estimate = estimate_messages_tokens(messages)
         if token_estimate > _MAX_TOKEN_ESTIMATE:
             summary = last_assistant_content or f"Worker context too large (~{token_estimate} tokens, {iteration} iterations)"
             summary = _resolve_summary(artifact_dir, summary)

@@ -12,14 +12,19 @@ from src.agent.loop import (
     KEEP_RECENT,
     COLLAPSE_PRESERVE_RECENT,
     COLLAPSE_TEXT_MIN,
+    MICROCOMPACT_KEEP_BUDGET_RATIO,
+    MICROCOMPACT_PROTECTED_TOOLS,
     estimate_tokens,
+    _build_status_message,
     _microcompact,
     _context_collapse,
     _fix_tool_pairs,
     _is_tool_success,
     _normalize_tool_run_dir,
+    _remove_status_messages,
     _CLEARED_PLACEHOLDER,
     _CLEARED_PREFIX,
+    _STATUS_PREFIX,
     _tool_call_key,
 )
 
@@ -45,6 +50,17 @@ class TestEstimateTokens:
         # Should be roughly 100 tokens for 400 chars of content (plus overhead)
         assert 80 < tokens < 200
 
+    def test_cjk_weighted(self) -> None:
+        """CJK counts ~0.6 token/char — the old flat //4 under-counted
+        Chinese contexts 2-3x (E4)."""
+        en = [{"role": "user", "content": "a" * 400}]
+        zh = [{"role": "user", "content": "股" * 400}]
+        en_tokens = estimate_tokens(en)
+        zh_tokens = estimate_tokens(zh)
+        # 400 CJK chars ≈ 240 tokens vs 400 ASCII chars ≈ 100 tokens
+        assert zh_tokens > en_tokens * 2
+        assert 240 <= zh_tokens < 300
+
 
 # ---------------------------------------------------------------------------
 # _microcompact
@@ -52,6 +68,10 @@ class TestEstimateTokens:
 
 
 class TestMicrocompact:
+    """Threshold-triggered pruning (E1). Passing ``token_threshold=0`` forces
+    the trigger with a zero keep-budget — reproducing the old fixed
+    keep-last-3 behavior for these legacy assertions."""
+
     def test_clears_old_tool_messages(self) -> None:
         messages = [
             {"role": "system", "content": "system"},
@@ -60,7 +80,7 @@ class TestMicrocompact:
         for i in range(KEEP_RECENT + 5):
             messages.append({"role": "tool", "content": f"{'x' * 200} result_{i}", "tool_call_id": f"tc_{i}"})
 
-        _microcompact(messages)
+        _microcompact(messages, token_threshold=0)
 
         tool_msgs = [m for m in messages if m.get("role") == "tool"]
         # Old ones should carry the informative cleared placeholder
@@ -72,6 +92,55 @@ class TestMicrocompact:
         assert _CLEARED_PLACEHOLDER.startswith(_CLEARED_PREFIX)
         assert "re-call" in _CLEARED_PLACEHOLDER
 
+    def test_not_triggered_below_threshold(self) -> None:
+        """Below the trigger ratio the trajectory stays byte-identical —
+        no more unconditional every-iteration pruning (prompt cache)."""
+        messages = [{"role": "system", "content": "system"}]
+        for i in range(KEEP_RECENT + 5):
+            messages.append({"role": "tool", "content": f"{'x' * 200} result_{i}", "tool_call_id": f"tc_{i}"})
+        before = [m["content"] for m in messages]
+
+        _microcompact(messages)  # default TOKEN_THRESHOLD ≫ this tiny context
+
+        assert [m["content"] for m in messages] == before
+
+    def test_token_budget_keeps_more_than_floor(self) -> None:
+        """When the keep-budget affords it, more than KEEP_RECENT recent
+        results survive intact."""
+        messages = [{"role": "system", "content": "system"}]
+        for i in range(16):
+            messages.append({"role": "tool", "content": f"{'x' * 400} result_{i}", "tool_call_id": f"tc_{i}"})
+        # Each result ≈ 100 tokens; the 16-message context estimates well
+        # above the trigger (0.5 × threshold). Budget = threshold × ratio
+        # ≈ 550 tokens → keeps ~5 newest results, prunes the rest.
+        threshold = int(550 / MICROCOMPACT_KEEP_BUDGET_RATIO)
+
+        _microcompact(messages, token_threshold=threshold)
+
+        tool_msgs = [m for m in messages if m.get("role") == "tool"]
+        preserved = [m for m in tool_msgs if m["content"] != _CLEARED_PLACEHOLDER]
+        cleared = [m for m in tool_msgs if m["content"] == _CLEARED_PLACEHOLDER]
+        assert len(preserved) > KEEP_RECENT
+        assert cleared, "oldest results beyond the budget must still be pruned"
+        # The preserved ones are the newest
+        assert preserved[-1]["content"].endswith("result_15")
+
+    def test_protected_tools_never_cleared(self) -> None:
+        """Grounding / key-deliverable tool results survive pruning."""
+        protected_name = next(iter(MICROCOMPACT_PROTECTED_TOOLS))
+        messages = [{"role": "system", "content": "system"}]
+        messages.append(
+            {"role": "tool", "name": protected_name, "content": "P" * 300, "tool_call_id": "tc_p"}
+        )
+        for i in range(KEEP_RECENT + 4):
+            messages.append({"role": "tool", "name": "bash", "content": f"{'x' * 200} r_{i}", "tool_call_id": f"tc_{i}"})
+
+        _microcompact(messages, token_threshold=0)
+
+        assert messages[1]["content"] == "P" * 300
+        cleared = [m for m in messages if m.get("content") == _CLEARED_PLACEHOLDER]
+        assert cleared, "unprotected old results are still pruned"
+
     def test_preserves_short_content(self) -> None:
         messages = [
             {"role": "tool", "content": "short", "tool_call_id": "tc_0"},
@@ -82,7 +151,7 @@ class TestMicrocompact:
             {"role": "tool", "content": "x" * 200, "tool_call_id": "tc_5"},
             {"role": "tool", "content": "x" * 200, "tool_call_id": "tc_6"},
         ]
-        _microcompact(messages)
+        _microcompact(messages, token_threshold=0)
         # First tool msg is old and long enough → cleared
         # But "short" is ≤100 chars → not cleared even if old
         short_msgs = [m for m in messages if m["content"] in ("short", "also short")]
@@ -92,7 +161,7 @@ class TestMicrocompact:
         messages = [
             {"role": "tool", "content": "x" * 200, "tool_call_id": "tc_0"},
         ]
-        _microcompact(messages)
+        _microcompact(messages, token_threshold=0)
         assert messages[0]["content"] == "x" * 200
 
 
@@ -186,6 +255,53 @@ class TestContextCollapse:
         assert "HEAD_MARKER" in collapsed_msg
         assert "TAIL_MARKER" in collapsed_msg
         assert "collapsed" in collapsed_msg
+
+
+# ---------------------------------------------------------------------------
+# Status bar (E2): dynamic time/state at the trajectory tail
+# ---------------------------------------------------------------------------
+
+
+class TestStatusBar:
+    def test_build_contains_time_state_and_nudges(self) -> None:
+        msg = _build_status_message("run_dir=/tmp/r1", ["[SYSTEM] wrap up"])
+        assert msg["role"] == "user"
+        content = msg["content"]
+        assert content.startswith(_STATUS_PREFIX)
+        assert "</agent_status>" in content
+        # ISO timestamp with timezone (session time-awareness must not be lost)
+        assert "Now: 2" in content and "T" in content
+        assert "State: run_dir=/tmp/r1" in content
+        assert "[SYSTEM] wrap up" in content
+
+    def test_build_without_nudges(self) -> None:
+        msg = _build_status_message("(empty state)", [])
+        assert "[SYSTEM]" not in msg["content"]
+        assert msg["content"].rstrip().endswith("</agent_status>")
+
+    def test_remove_strips_only_status_messages(self) -> None:
+        status = _build_status_message("(empty state)", [])
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "real question"},
+            status,
+            {"role": "assistant", "content": "answer"},
+            _build_status_message("(empty state)", ["[SYSTEM] hurry"]),
+        ]
+        _remove_status_messages(messages)
+        assert len(messages) == 3
+        assert all(
+            not (isinstance(m.get("content"), str) and m["content"].startswith(_STATUS_PREFIX))
+            for m in messages
+        )
+        assert messages[1]["content"] == "real question"
+
+    def test_remove_ignores_non_string_content(self) -> None:
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "block"}]},
+        ]
+        _remove_status_messages(messages)
+        assert len(messages) == 1
 
 
 # ---------------------------------------------------------------------------

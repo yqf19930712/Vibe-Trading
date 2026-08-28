@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from src.agent.memory import WorkspaceMemory
@@ -16,20 +15,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# NOTE: deliberately NO timestamp and NO workspace-state block in here — the
+# system prompt must stay byte-identical across iterations so the provider
+# prompt cache can hit. Current time and State counters are injected by the
+# loop as an ephemeral <agent_status> user message at the trajectory tail
+# (see src/agent/loop.py `_build_status_message`).
 _SYSTEM_PROMPT = """You are a finance research agent with {skill_count} specialist skills, {tool_count} tools, 11 data sources (with auto-fallback), and 29 multi-agent swarm teams.
 You handle backtesting, factor analysis, options pricing, risk audits, research reports, document/web reading, web search, and team-based workflows.
 
 ## Tools
+
+One-line summaries only — full descriptions and parameter schemas are provided in the API tool definitions.
 
 {tool_descriptions}
 
 ## Skills (use load_skill to read full docs)
 
 {skill_descriptions}
-
-## State
-
-{memory_summary}
 
 ## Task Routing
 
@@ -81,11 +83,8 @@ Decide which workflow to use based on the request:
 - Respond in the same language the user used.
 - You have persistent cross-session memory (`remember` tool). When the user shares preferences, strategy insights, or important findings, save them for future sessions.
 - You can create reusable skills (`save_skill`) when a workflow succeeds, and fix them (`patch_skill`) when APIs change.
-{memory_section}
-## Current Date & Time
-
-Today is {current_datetime}.
-"""
+- The current date/time and workspace state arrive in the <agent_status> message at the end of the conversation.
+{memory_section}"""
 
 _MEMORY_SECTION = """
 ## Persistent Memory (cross-session)
@@ -93,6 +92,40 @@ _MEMORY_SECTION = """
 {snapshot}
 
 """
+
+_TOOL_SUMMARY_MAX_CHARS = 100
+
+
+def _tool_summary(description: str) -> str:
+    """Return the first sentence of a tool description, capped at ~100 chars.
+
+    Args:
+        description: Full tool description (may be multi-paragraph).
+
+    Returns:
+        Single-line summary.
+    """
+    text = " ".join((description or "").strip().split())
+    end = len(text)
+    # First English sentence boundary, skipping "e.g." / "i.e." abbreviations.
+    idx = 0
+    while True:
+        idx = text.find(". ", idx)
+        if idx == -1:
+            break
+        if text[max(0, idx - 3): idx + 1].lower() in ("e.g.", "i.e."):
+            idx += 2
+            continue
+        end = min(end, idx + 1)
+        break
+    for sep in ("。", "！", "; "):
+        idx = text.find(sep)
+        if idx != -1:
+            end = min(end, idx + 1)
+    text = text[:end]
+    if len(text) > _TOOL_SUMMARY_MAX_CHARS:
+        text = text[: _TOOL_SUMMARY_MAX_CHARS - 1].rstrip() + "…"
+    return text
 
 
 class ContextBuilder:
@@ -125,6 +158,9 @@ class ContextBuilder:
 
         Injects one-line skill summaries via get_descriptions; full docs loaded on demand by load_skill.
         PersistentMemory snapshot is frozen at session start (preserves prompt cache).
+        Deliberately contains NO per-turn dynamic data (timestamp, workspace
+        state) — those ride the loop's <agent_status> tail message so this
+        prompt stays byte-identical across iterations for prompt caching.
 
         Args:
             user_message: User message (kept for API compatibility).
@@ -132,8 +168,6 @@ class ContextBuilder:
         Returns:
             System prompt text.
         """
-        now = datetime.now()
-
         # Build memory section only if there are saved memories
         memory_section = ""
         if self._persistent_memory and self._persistent_memory.snapshot:
@@ -146,9 +180,7 @@ class ContextBuilder:
             skill_count=len(self.skills_loader.skills),
             tool_descriptions=self._format_tool_descriptions(),
             skill_descriptions=self.skills_loader.get_descriptions(),
-            memory_summary=self.memory.to_summary(),
             memory_section=memory_section,
-            current_datetime=now.strftime("%A, %B %d, %Y %H:%M (local)"),
         )
 
     def build_messages(self, user_message: str, history: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
@@ -190,18 +222,18 @@ class ContextBuilder:
         return messages
 
     def _format_tool_descriptions(self) -> str:
-        """Format tool descriptions."""
+        """Format tool descriptions as one-line summaries.
+
+        The full description + per-parameter schema of every tool is already
+        sent to the API in the ``tools`` payload on every call — repeating it
+        here duplicated thousands of tokens in the system prompt for zero
+        information gain (E5). The prompt only needs a compact index: tool
+        name + first sentence of its description.
+        """
         lines = []
         for tool in self.registry._tools.values():
-            params = tool.parameters.get("properties", {})
-            required = tool.parameters.get("required", [])
-            param_parts = []
-            for pname, pschema in params.items():
-                req = " (required)" if pname in required else ""
-                param_parts.append(f"    - {pname}: {pschema.get('description', pschema.get('type', ''))}{req}")
-            param_text = "\n".join(param_parts) if param_parts else "    (no params)"
-            lines.append(f"### {tool.name}\n{tool.description}\n  Params:\n{param_text}")
-        return "\n\n".join(lines)
+            lines.append(f"- {tool.name} — {_tool_summary(tool.description)}")
+        return "\n".join(lines)
 
     @staticmethod
     def format_tool_result(tool_call_id: str, tool_name: str, result: str) -> Dict[str, Any]:

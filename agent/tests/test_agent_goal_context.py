@@ -42,6 +42,20 @@ class _CapturingLLM:
         return _AnswerResponse(total_tokens=self.total_tokens)
 
 
+def _last_real_user_content(messages: list[dict[str, Any]]) -> str:
+    """Last user message that is NOT the loop's ephemeral <agent_status> bar.
+
+    Since batch E the status bar is always the final trajectory message, so
+    goal-context / continuation assertions target the message before it.
+    """
+    return next(
+        str(m.get("content", ""))
+        for m in reversed(messages)
+        if m.get("role") == "user"
+        and not str(m.get("content", "")).startswith("<agent_status>")
+    )
+
+
 def _agent(llm: _CapturingLLM, run_dir: Path) -> AgentLoop:
     from src.memory.persistent import PersistentMemory
     from src.tools import build_registry
@@ -74,7 +88,7 @@ def test_agent_loop_injects_active_goal_context(tmp_path: Path, monkeypatch) -> 
         session_id="session-1",
     )
 
-    user_message = llm.messages[-1]["content"]
+    user_message = _last_real_user_content(llm.messages)
     assert result["status"] == "success"
     assert "<current-research-goal>" in user_message
     assert goal.goal_id in user_message
@@ -125,10 +139,11 @@ def test_agent_loop_continues_active_incomplete_goal(tmp_path: Path, monkeypatch
 
     assert result["status"] == "success"
     assert len(llm.calls) == 2
-    assert "<goal-continuation>" in llm.calls[1][-1]["content"]
-    assert "criteria_snapshot:" in llm.calls[1][-1]["content"]
-    assert "recent_evidence_snapshot:" in llm.calls[1][-1]["content"]
-    assert "Check price action" in llm.calls[1][-1]["content"]
+    continuation = _last_real_user_content(llm.calls[1])
+    assert "<goal-continuation>" in continuation
+    assert "criteria_snapshot:" in continuation
+    assert "recent_evidence_snapshot:" in continuation
+    assert "Check price action" in continuation
 
 
 def test_agent_loop_continues_active_covered_goal_to_force_audit(tmp_path: Path, monkeypatch) -> None:
@@ -163,7 +178,7 @@ def test_agent_loop_continues_active_covered_goal_to_force_audit(tmp_path: Path,
 
     assert result["status"] == "success"
     assert len(llm.calls) == 2
-    continuation = llm.calls[1][-1]["content"]
+    continuation = _last_real_user_content(llm.calls[1])
     assert "<goal-continuation>" in continuation
     assert "All criteria appear covered; audit evidence" in continuation
     assert "status: active" in continuation

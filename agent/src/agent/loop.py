@@ -1,7 +1,9 @@
 """AgentLoop: ReAct core loop.
 
 Five-layer context management:
-  Layer 1 (microcompact)     — silently prunes old tool results each iteration
+  Layer 1 (microcompact)     — prunes old tool results once the context passes
+                               a token threshold (keeps a recency token budget;
+                               grounding/deliverable tools are never pruned)
   Layer 2 (context_collapse) — folds long text blocks without LLM call (zero cost)
   Layer 3 (auto_compact)     — LLM structured summary with token-budget tail protection
   Layer 4 (compact tool)     — model explicitly calls the compact tool to trigger L3
@@ -44,13 +46,38 @@ from src.tools.redaction import redact_payload
 from src.core import budget as _budget
 from src.core import fetch_stats as _fetch_stats
 from src.core.paths import data_root, runs_root
+from src.core.token_estimate import estimate_messages_tokens, estimate_text_tokens
 
 # Honor VIBE_DATA_DIR (multi-tenant per-user HOME) so the agent loop writes run
 # artifacts under the tenant root, not the shared install dir. See core/paths.py.
 RUNS_DIR = runs_root()
 SESSIONS_DIR = data_root() / "sessions"
 TOKEN_THRESHOLD = int(os.getenv("TOKEN_THRESHOLD", "40000"))
-KEEP_RECENT = 3
+# Layer 1 (microcompact) tuning. The old behavior — unconditionally pruning
+# every tool result older than the last 3, every iteration — was a sliding
+# window anti-pattern: the model kept re-fetching data the loop had just
+# thrown away (see the dea1222743ef notes below), and rewriting the middle of
+# the trajectory each turn invalidated the provider prompt cache wholesale.
+# Now pruning only triggers past a token threshold, and retention is a token
+# budget instead of a fixed count.
+MICROCOMPACT_TRIGGER_RATIO = 0.5   # prune only when > TOKEN_THRESHOLD * ratio
+MICROCOMPACT_KEEP_BUDGET_RATIO = 0.25  # keep newest tool results up to this budget
+KEEP_RECENT = 3  # hard floor: newest N tool results are always kept intact
+# Tool results that are never pruned by microcompact. Rationale: these carry
+# the run's grounding data or its key deliverables — re-fetching them is
+# either expensive (backtest / factor_analysis / options_pricing recompute,
+# run_swarm re-runs a whole multi-agent team for tens of minutes) or defeats
+# the anti-hallucination grounding (get_market_data / get_realtime_quotes are
+# the live-price sources every cited number must trace back to). Layer 2/3
+# can still fold/summarize them when the context truly overflows.
+MICROCOMPACT_PROTECTED_TOOLS = frozenset({
+    "backtest",
+    "factor_analysis",
+    "options_pricing",
+    "get_market_data",
+    "get_realtime_quotes",
+    "run_swarm",
+})
 TOOL_RESULT_LIMIT = 10_000
 HEARTBEAT_INTERVAL_S = float(os.getenv("VT_HEARTBEAT_INTERVAL_S", "3.0"))
 REASONING_DELTA_MIN_INTERVAL_S = float(os.getenv("VT_REASONING_DELTA_MIN_INTERVAL_S", "1.0"))
@@ -195,7 +222,12 @@ def _format_timeout(seconds: float) -> str:
 
 
 def estimate_tokens(messages: list) -> int:
-    """Rough token count estimate (~4 chars/token).
+    """Rough token count estimate, weighted by character class.
+
+    ASCII ~4 chars/token, CJK ~0.6 token/char, other ~3 chars/token — see
+    :mod:`src.core.token_estimate`. The old flat ``// 4`` heuristic assumed
+    English and under-estimated Chinese contexts 2-3x, so compaction fired
+    far too late for CJK-heavy sessions.
 
     Args:
         messages: Message list.
@@ -203,7 +235,7 @@ def estimate_tokens(messages: list) -> int:
     Returns:
         Estimated token count.
     """
-    return len(json.dumps(messages, default=str, ensure_ascii=False)) // 4
+    return estimate_messages_tokens(messages)
 
 
 # Placeholder for pruned tool results. MUST tell the model the data was
@@ -228,19 +260,105 @@ def _tool_call_key(name: str, arguments: Any) -> str:
     return f"{name}:{hashlib.sha1(args_repr.encode('utf-8', 'replace')).hexdigest()}"
 
 
-def _microcompact(messages: list) -> None:
-    """Layer 1: silently prune old tool results, keeping the most recent N intact.
+def _microcompact(messages: list, token_threshold: int = TOKEN_THRESHOLD) -> None:
+    """Layer 1: prune old tool results — threshold-triggered, token-budget keep.
+
+    Trigger: only runs when the estimated context exceeds
+    ``token_threshold * MICROCOMPACT_TRIGGER_RATIO``; below that the trajectory
+    is left byte-identical so the provider prompt cache stays warm.
+
+    Retention: walks tool results newest→oldest, keeping them intact until the
+    accumulated estimate reaches ``token_threshold * MICROCOMPACT_KEEP_BUDGET_RATIO``
+    (and always at least the newest ``KEEP_RECENT``, matching the old floor).
+    Older results are replaced with the informative cleared placeholder —
+    except results from ``MICROCOMPACT_PROTECTED_TOOLS`` (grounding data and
+    expensive key deliverables), which are never pruned here.
 
     Args:
         messages: Message list (mutated in place).
+        token_threshold: Context budget this trajectory is managed against
+            (the main loop's ``TOKEN_THRESHOLD``; swarm workers pass their own
+            ``_MAX_TOKEN_ESTIMATE``).
     """
+    if estimate_tokens(messages) <= token_threshold * MICROCOMPACT_TRIGGER_RATIO:
+        return
     tool_msgs = [m for m in messages if m.get("role") == "tool"]
     if len(tool_msgs) <= KEEP_RECENT:
         return
-    for msg in tool_msgs[:-KEEP_RECENT]:
+
+    keep_budget = token_threshold * MICROCOMPACT_KEEP_BUDGET_RATIO
+    keep_ids: set[int] = set()
+    accumulated = 0
+    for msg in reversed(tool_msgs):
+        cost = estimate_text_tokens(str(msg.get("content", "")))
+        if len(keep_ids) < KEEP_RECENT:
+            keep_ids.add(id(msg))
+            accumulated += cost
+            continue
+        if accumulated + cost > keep_budget:
+            break
+        keep_ids.add(id(msg))
+        accumulated += cost
+
+    for msg in tool_msgs:
+        if id(msg) in keep_ids:
+            continue
+        if msg.get("name") in MICROCOMPACT_PROTECTED_TOOLS:
+            continue
         content = msg.get("content", "")
         if isinstance(content, str) and len(content) > 100:
             msg["content"] = _CLEARED_PLACEHOLDER
+
+
+# Dynamic status bar (E2). The system prompt used to embed a minute-level
+# timestamp and the WorkspaceMemory "## State" block — both changed between
+# turns, so the very first bytes of the context diverged every iteration and
+# the provider prompt cache never hit. That dynamic information now rides a
+# single ephemeral ``<agent_status>`` user message appended to the END of the
+# trajectory each iteration (the previous one is removed first — "use and
+# discard"), together with any budget / wrap-up nudge lines. The system
+# prompt itself is byte-stable for the whole session.
+_STATUS_PREFIX = "<agent_status>"
+
+
+def _remove_status_messages(messages: list) -> None:
+    """Drop previous ``<agent_status>`` user messages (mutates in place)."""
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        content = msg.get("content")
+        if (
+            msg.get("role") == "user"
+            and isinstance(content, str)
+            and content.startswith(_STATUS_PREFIX)
+        ):
+            messages.pop(i)
+        else:
+            i += 1
+
+
+def _build_status_message(state_summary: str, nudge_lines: list[str]) -> dict[str, Any]:
+    """Build the per-iteration status-bar user message.
+
+    Args:
+        state_summary: ``WorkspaceMemory.to_summary()`` output.
+        nudge_lines: Optional ``[SYSTEM]`` nudge lines (budget / wrap-up),
+            folded into the same message so the trajectory gains at most one
+            transient message per iteration.
+
+    Returns:
+        OpenAI-format user message dict.
+    """
+    now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
+    content = (
+        f"{_STATUS_PREFIX}\n"
+        f"Now: {now_iso}\n"
+        f"State: {state_summary}\n"
+        "</agent_status>"
+    )
+    if nudge_lines:
+        content += "\n\n" + "\n\n".join(nudge_lines)
+    return {"role": "user", "content": content}
 
 
 def _context_collapse(messages: list) -> None:
@@ -606,7 +724,6 @@ class AgentLoop:
         goal_continuations = 0
         goal_last_progress: tuple[int, int] | None = None
         wrap_up_at = max(1, int(self.max_iterations * 0.8))
-        budget_nudged = False
         force_final = False
 
         try:
@@ -627,7 +744,11 @@ class AgentLoop:
                     notif_text = "\n".join(f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs)
                     messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>\n\n<system>Continue processing with the background results above.</system>"})
 
-                # Layer 1: microcompact (every iteration)
+                # Drop the previous iteration's ephemeral status bar before
+                # any compaction, so it never survives into summaries.
+                _remove_status_messages(messages)
+
+                # Layer 1: microcompact (threshold-triggered, see _microcompact)
                 _microcompact(messages)
 
                 # Layer 2: context collapse (fold long text, zero API cost)
@@ -643,25 +764,27 @@ class AgentLoop:
 
                 logger.info(f"ReAct iteration {iteration}/{self.max_iterations}")
 
-                # Inject wrap-up nudge when approaching iteration limit.
-                # Skip on the first iteration (tiny budgets) and on the last
-                # iteration (the forced text-only path already guarantees an
-                # answer there) so the nudge never displaces the active-goal
-                # context as the most recent user message.
-                if iteration == wrap_up_at and 1 < iteration < self.max_iterations:
+                # Per-iteration status bar (E2): time + State counters live at
+                # the trajectory tail, keeping the system prompt byte-stable.
+                # Budget / wrap-up nudges fold into the same message and are
+                # recomputed while their condition holds (the bar is replaced
+                # every iteration, so a one-shot append would vanish).
+                nudge_lines: list[str] = []
+
+                # Wrap-up nudge when approaching the iteration limit. Skips
+                # the first iteration (tiny budgets) and the last iteration
+                # (the forced text-only path already guarantees an answer).
+                if wrap_up_at <= iteration < self.max_iterations and iteration > 1:
                     remaining = self.max_iterations - iteration
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"[SYSTEM] You have {remaining} iterations remaining out of "
-                            f"{self.max_iterations}. Please wrap up your work. "
-                            "Stop calling tools and provide your final answer as plain text. "
-                            "If you have partial results, summarize what you have so far."
-                        ),
-                    })
+                    nudge_lines.append(
+                        f"[SYSTEM] You have {remaining} iterations remaining out of "
+                        f"{self.max_iterations}. Please wrap up your work. "
+                        "Stop calling tools and provide your final answer as plain text. "
+                        "If you have partial results, summarize what you have so far."
+                    )
 
                 # Batch 3 — wall-clock budget management. Two escalations:
-                # (a) <25% of the budget left → one wrap-up nudge, independent
+                # (a) <25% of the budget left → wrap-up nudge, independent
                 #     of the iteration counter (which fires far too late when
                 #     iterations are slow);
                 # (b) not enough time left for another full iteration → force
@@ -672,44 +795,40 @@ class AgentLoop:
                 if remaining_s is not None and iteration > 1:
                     avg_iter_s = (_time.perf_counter() - run_t0) / max(1, iteration - 1)
                     if remaining_s < max(FINALIZE_RESERVE_S, avg_iter_s * 1.2):
+                        if not force_final:
+                            # trace/emit once; the nudge line itself repeats
+                            # with the status bar for as long as needed.
+                            self._stats["early_finalize"] = True
+                            trace.write(
+                                {
+                                    "type": "early_finalize",
+                                    "iter": current_iter,
+                                    "remaining_s": round(remaining_s, 1),
+                                    "avg_iter_s": round(avg_iter_s, 1),
+                                }
+                            )
+                            self._emit(
+                                "early_finalize",
+                                {"iter": current_iter, "remaining_s": round(remaining_s, 1)},
+                            )
                         force_final = True
-                        self._stats["early_finalize"] = True
-                        trace.write(
-                            {
-                                "type": "early_finalize",
-                                "iter": current_iter,
-                                "remaining_s": round(remaining_s, 1),
-                                "avg_iter_s": round(avg_iter_s, 1),
-                            }
+                        nudge_lines.append(
+                            "[SYSTEM] The time budget for this request is nearly "
+                            "exhausted. Stop all tool use and give your final answer "
+                            "NOW based on the material you already gathered. State "
+                            "explicitly which parts are incomplete or unverified."
                         )
-                        self._emit(
-                            "early_finalize",
-                            {"iter": current_iter, "remaining_s": round(remaining_s, 1)},
+                    elif budget_total_s and remaining_s / budget_total_s < 0.25:
+                        nudge_lines.append(
+                            f"[SYSTEM] Less than 25% of the time budget remains "
+                            f"(~{int(remaining_s)}s). Prioritize concluding: avoid "
+                            "new lines of investigation, finish with the data you "
+                            "have, and prepare your final answer."
                         )
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                "[SYSTEM] The time budget for this request is nearly "
-                                "exhausted. Stop all tool use and give your final answer "
-                                "NOW based on the material you already gathered. State "
-                                "explicitly which parts are incomplete or unverified."
-                            ),
-                        })
-                    elif (
-                        not budget_nudged
-                        and budget_total_s
-                        and remaining_s / budget_total_s < 0.25
-                    ):
-                        budget_nudged = True
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                f"[SYSTEM] Less than 25% of the time budget remains "
-                                f"(~{int(remaining_s)}s). Prioritize concluding: avoid "
-                                "new lines of investigation, finish with the data you "
-                                "have, and prepare your final answer."
-                            ),
-                        })
+
+                messages.append(
+                    _build_status_message(self.memory.to_summary(), nudge_lines)
+                )
 
                 # Streaming output + collect thinking text
                 thinking_chunks: List[str] = []
@@ -1615,7 +1734,7 @@ class AgentLoop:
         cut_idx = len(body)
         for i in range(len(body) - 1, -1, -1):
             content = body[i].get("content", "")
-            msg_tokens = (len(str(content)) // 4) + 10
+            msg_tokens = estimate_text_tokens(str(content)) + 10
             if accumulated + msg_tokens > TAIL_TOKEN_BUDGET:
                 cut_idx = i + 1
                 break

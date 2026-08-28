@@ -30,13 +30,13 @@
 | 块 | 内容 | 来源 |
 |---|---|---|
 | 身份声明 | 「finance research agent，{N} skills / {N} tools / 11 数据源 / 29 swarm 团队」 | skill/tool 数量动态计数 |
-| `## Tools` | 全量工具名 + 描述 + 参数列表 | `_format_tool_descriptions()` 遍历 ToolRegistry |
+| `## Tools` | 工具名 + 一行摘要（description 首句，截 ~100 字符）；完整描述与参数 schema 只随 API `tools` 载荷传递，不再在提示词里重复 | `_format_tool_descriptions()` 遍历 ToolRegistry |
 | `## Skills` | 按 category 分组的一行摘要，提示用 `load_skill` 读全文 | `SkillsLoader.get_descriptions()` |
-| `## State` | 工作区内存摘要（run_dir 内已有文件等） | `WorkspaceMemory.to_summary()` |
 | `## Task Routing` | 五条工作流路由（见下） | 模板固定文本 |
 | `## Guidelines` | 输出与行为守则（见下） | 模板固定文本 |
 | `## Persistent Memory` | 跨会话记忆快照，**有记忆才渲染** | `PersistentMemory.snapshot` |
-| `## Current Date & Time` | 本地当前时间 | `datetime.now()` |
+
+**系统提示里刻意没有时间戳和工作区状态。** 旧版把 `## State`（WorkspaceMemory 摘要）和 `## Current Date & Time`（分钟级时间戳）拼进系统提示，导致提示词逐轮字节不一致、prompt cache 前缀全废。这两块动态信息现在由主循环以**状态栏**注入：每轮迭代在轨迹**末尾**追加一条 `<agent_status>` user 消息（ISO 时间戳 + State 计数器），并把预算/收尾类 `[SYSTEM]` 提醒并入同一条消息；下一轮先移除上一条状态栏再追加新的（用后即弃），轨迹里任何时刻只有一条。实现见 `agent/src/agent/loop.py` 的 `_build_status_message()` / `_remove_status_messages()`。
 
 **Task Routing 五条路由**（模型据此选工作流）：
 
@@ -52,8 +52,11 @@
 
 记忆走两条通道，刻意分开以保 prompt cache（`ContextBuilder.build_messages()`）：
 
-- **系统提示通道（会话内稳定）**：`PersistentMemory.snapshot` 在会话开始时冻结，整个会话不变 → 系统提示逐轮字节一致，provider 的 prompt cache 可命中。
+- **系统提示通道（会话内稳定）**：`PersistentMemory.snapshot` 在会话开始时冻结，整个会话不变；加上动态块已外移（见 §2 状态栏），系统提示现在**真正逐轮字节一致**，provider 的 prompt cache 前缀可稳定命中。
 - **user message 通道（逐查询变化）**：每轮对当前 user message 做 `find_relevant(…, max_results=3)`，命中的记忆以 `<recalled-memories>` 块前置拼进 user message。相关性召回不污染系统提示。
+- **状态栏通道（逐轮变化、用后即弃）**：时间与 State 计数器只出现在轨迹末尾的 `<agent_status>` 消息里（§2），变化被隔离在上下文尾部，前面的长前缀不受影响。
+
+配套地，native Anthropic 通道（`LANGCHAIN_PROVIDER=anthropic`）在请求构建时注入 prompt-caching 断点（`cache_control: ephemeral`）：tools 尾部、system 尾部、最新一条**非状态栏**消息的末块各一个（`llm.py` `_apply_anthropic_cache_breakpoints()`）。断点跳过状态栏是因为它每轮都变、缓存永不复用；命中依赖 Anthropic 的最长前缀查找。
 
 召回失败静默降级（debug 日志），不阻塞对话。
 

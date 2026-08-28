@@ -178,3 +178,16 @@ Minor / 补充：m1 冷启动 5–15s（重 import + CJK 字体下载 + matplotl
 - 顺带解开一个虚惊：`run_swarm` 是写工具，loop 的工具超时对写工具只警告不杀（当晚 run 21 分钟 > 租户工具超时 300s 仍跑完即为此），此前无人写下这条语义。
 
 **部署。** v8 镜像走既有 runbook（`/root/vibe-build` 构建 → 本机 registry → `tpl create-from-image` → 改 `VIBE_CUBE_TEMPLATE_ID` → restart cube-router），冒烟租户验证新模板 13.4s 冷启动出答案；存量租户下次调用自动换新模板，数据在宿主 bind-mount 不动。laicai 侧同日 `deploy:vps` 上线（014de12）。
+
+## 2026-08-28：上下文工程三件套——microcompact 阈值化、状态栏外移、prompt caching 接通
+
+**背景。** 对照《深入理解 AI Agent》§2.3/§2.7 做的引擎评审发现三处反模式叠加，导致 prompt cache 命中率趋零、CJK 会话压缩时机全错：①L1 microcompact 每轮**无条件**把倒数第 4 条之前的工具结果换成占位符——教科书级滑动窗口反模式，模型被迫反复重拉刚被丢掉的数据（dea1222743ef 事故正源于此），且每轮改写轨迹中部使缓存前缀必然失效；②系统提示里嵌着分钟级时间戳和 WorkspaceMemory State 块，逐轮字节不一致，缓存从第一个 diff 字节起全废；③native Anthropic 通道全程没设 `cache_control`，就算前缀稳定也没在用缓存。另有 token 估算 `len//4` 按英文假设，中文低估 2-3 倍。
+
+**改法（批次 E，engine 侧）。**
+- **E1 microcompact 阈值化**（`loop.py` `_microcompact`，swarm worker 复用同一实现）：只在估算 token 超过 `TOKEN_THRESHOLD × 0.5` 时才触发（worker 用自己的 `_MAX_TOKEN_ESTIMATE`）；触发后保留量从「固定最近 3 条」改为按 token 预算从新到旧累计（`× 0.25`，下限仍是最近 3 条）；新增免删名单 `MICROCOMPACT_PROTECTED_TOOLS`（backtest / factor_analysis / options_pricing / get_market_data / get_realtime_quotes / run_swarm）——grounding 数据与重算代价高的关键产出永不被 L1 清除。占位符文案与「已清除结果放行重拉」的重复守卫语义原样保留（那是事故修复）。
+- **E2 动态块外移**（`context.py` + `loop.py`）：系统提示删掉 `## State` 与 `## Current Date & Time`，改由主循环每轮在轨迹末尾注入一条 `<agent_status>` user 消息（ISO 时间戳 + State 计数器），预算/收尾 nudge 并入同一条消息、条件成立期间逐轮重算；下一轮先移除上一条再追加（用后即弃）。系统提示自此整会话字节稳定。
+- **E3 prompt caching**（`llm.py` `ChatAnthropicCompat._get_request_payload` 覆写）：native Anthropic 通道请求构建时注入三个 `cache_control: ephemeral` 断点——tools 尾、system 尾、最新一条非状态栏消息的末块（thinking 块不可缓存，自动跳过；断点注入失败静默降级为不缓存）。
+- **E4 估算加权**（新模块 `src/core/token_estimate.py`，loop/worker 共用）：ASCII /4、CJK ×0.6/字、其余 /3；worker 的兜底计费估算与 auto_compact 尾部预算同步接线。
+- **E5 工具文档去双份**（`context.py`）：`## Tools` 块收缩为「工具名 — description 首句（截 100 字符）」的索引；完整描述与参数 schema 本就每轮随 API `tools` 载荷传递，不再在提示词里重复数千 token。
+
+**结果。** 全量回归改前基线 3285 passed / 5 failed / 2 skipped → 改后 3311 passed / 5 failed / 2 skipped：失败清单逐项相同（均为本地缺 langchain-anthropic 包等环境因素），零新增失败；passed 净增 26 = 新增的 microcompact 阈值/预算/免删、状态栏、缓存断点、CJK 加权、系统提示字节稳定用例。既有测试同步更新：goal-context / background-results 断言从「末条消息」改为「状态栏之前的最后一条真实 user 消息」，microcompact 旧断言以 `token_threshold=0` 复现固定 keep-3 行为。文档同步：SYSTEM-PROMPT.md §2/§3 改为状态栏与缓存断点的现状描述。
