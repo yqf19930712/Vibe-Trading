@@ -37,7 +37,7 @@
 
 | 工具 | 行为 | 关键语义 |
 |---|---|---|
-| `save_skill` | 新建/整体覆盖用户 skill | name 清洗为 `[a-z0-9-]` slug；content 缺 frontmatter 时自动补（category 默认 `user`） |
+| `save_skill` | 新建/整体覆盖用户 skill | name 清洗为 `[a-z0-9-]` slug；content 缺 frontmatter 时自动补（category 默认 `user`）；description 要求新 skill 正文含 Related 段、链接 ≥2 个相关已有 skill |
 | `patch_skill` | 对现有 skill 做精确查找替换（1 次） | **copy-on-write**：目标是内置 skill 时先整份复制到用户目录再打补丁——此后用户版永久覆盖内置版 |
 | `delete_skill` | 整目录删除 | 仅限用户 skill，内置不可删；删除被 patch 出来的用户副本即回退到内置版 |
 | `skill_file` | 辅助文件管理（write / remove / list） | 仅限 `references/` `templates/` `examples/` `assets/` 四个子目录，skill 须已存在 |

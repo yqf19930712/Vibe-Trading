@@ -125,9 +125,17 @@ class ToolRegistry:
             return tool.execute(**_coerce_params(tool.parameters, params))
         except Exception as exc:
             logger.exception("Tool %s failed", name)
+            # F6: the raw exception text can leak internal filesystem topology
+            # (home dir, venv paths) to the model. Individual tools already
+            # redact their own error paths (e.g. read_file); this is the
+            # registry-level backstop for every tool that doesn't.
+            # Lazy import: src.tools.redaction lives in the package whose
+            # __init__ imports this module — a top-level import would cycle.
+            from src.tools.redaction import redact_internal_paths
+
             return json.dumps({
                 "status": "error", "tool": name,
-                "error": str(exc),
+                "error": redact_internal_paths(str(exc)),
             }, ensure_ascii=False)
 
     @property

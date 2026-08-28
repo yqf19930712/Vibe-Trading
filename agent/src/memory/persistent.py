@@ -14,6 +14,7 @@ import hashlib
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.agent.frontmatter import parse_frontmatter as _parse_frontmatter
@@ -55,6 +56,9 @@ class MemoryEntry:
         memory_type: Category (user/feedback/project/reference).
         body: Body text content.
         modified_at: File modification timestamp.
+        created: ISO timestamp from frontmatter (empty for legacy entries).
+        source: Optional provenance note from frontmatter (empty for legacy
+            entries) — what conversation/tool/task produced this memory.
     """
 
     path: Path
@@ -63,6 +67,8 @@ class MemoryEntry:
     memory_type: str
     body: str
     modified_at: float
+    created: str = ""
+    source: str = ""
 
 
 def _tokenize(text: str) -> set[str]:
@@ -70,7 +76,9 @@ def _tokenize(text: str) -> set[str]:
 
     ASCII words >= 3 chars + individual characters from non-Latin scripts
     listed in ``_NON_LATIN_SCRIPT_RANGES`` (CJK, Thai, Arabic, Hebrew,
-    Cyrillic). Underscores are
+    Cyrillic), plus adjacent-pair 2-grams of those characters (F7④: single
+    CJK chars are far too promiscuous — "分" matches half the corpus — so
+    scoring weights 2-grams full and lone chars low). Underscores are
     treated as word boundaries so snake_case titles (e.g. ``mcp_wiring_test``)
     match natural-language queries (``"mcp wiring"``) as well as verbatim
     lookups.
@@ -79,9 +87,36 @@ def _tokenize(text: str) -> set[str]:
         text: Input text.
 
     Returns:
-        Set of tokens.
+        Set of tokens (1-char non-Latin tokens, non-Latin 2-grams, ASCII words).
     """
-    return set(_TOKEN_RE.findall(text.lower()))
+    lowered = text.lower()
+    tokens = set(_TOKEN_RE.findall(lowered))
+    # Non-Latin 2-grams: pairs of ADJACENT script chars in the original text
+    # (runs of consecutive script chars), so "比特币" yields 比特/特币 but a
+    # boundary like "价格,走势" does not bridge the comma.
+    for run in _NON_LATIN_RUN_RE.findall(lowered):
+        tokens.update(run[i : i + 2] for i in range(len(run) - 1))
+    return tokens
+
+
+#: Weight applied to lone non-Latin (e.g. single CJK) character tokens when
+#: scoring — they carry little signal on their own (F7④).
+SINGLE_CJK_WEIGHT = 0.3
+#: Recency bonus: score is multiplied by ``1 + RECENCY_WEIGHT * freshness``
+#: where freshness decays linearly from 1 (just modified) to 0 over
+#: ``RECENCY_HORIZON_DAYS`` (F7④).
+RECENCY_WEIGHT = 0.1
+RECENCY_HORIZON_DAYS = 30.0
+
+_NON_LATIN_RUN_RE = re.compile(rf"[{_NON_LATIN_SCRIPT_RANGES}]{{2,}}")
+_NON_LATIN_CHAR_RE = re.compile(rf"^[{_NON_LATIN_SCRIPT_RANGES}]$")
+
+
+def _token_weight(token: str) -> float:
+    """Return the scoring weight of one token (lone non-Latin chars count low)."""
+    if _NON_LATIN_CHAR_RE.match(token):
+        return SINGLE_CJK_WEIGHT
+    return 1.0
 
 
 # Strip C0 (U+0000-U+001F except \t \n) and C1 (U+0080-U+009F) bytes from
@@ -160,6 +195,9 @@ class PersistentMemory:
         self._dir.mkdir(parents=True, exist_ok=True)
         self._index_path = self._dir / "MEMORY.md"
         self._snapshot: str = ""
+        # Whether the most recent add() landed inside the line-capped index
+        # (F7①). True until an add is actually dropped by the cap.
+        self.last_add_indexed: bool = True
         self._load_snapshot()
 
     def _load_snapshot(self) -> None:
@@ -199,6 +237,9 @@ class PersistentMemory:
                 memory_type=_coerce_str(meta.get("type"), default="project"),
                 body=body[:MAX_ENTRY_CHARS],
                 modified_at=path.stat().st_mtime,
+                # F7③: optional fields — legacy entries simply have "".
+                created=_coerce_str(meta.get("created")),
+                source=_coerce_str(meta.get("source")),
             ))
         return entries
 
@@ -238,7 +279,12 @@ class PersistentMemory:
     def find_relevant(self, query: str, max_results: int = MAX_RESULTS) -> List[MemoryEntry]:
         """Keyword search across all memory entries.
 
-        Scoring: metadata_hits * 2.0 + body_hits * 1.0.
+        Scoring (F7④): weighted token overlap — metadata hits × 2.0 + body
+        hits × 1.0, where non-Latin 2-grams and ASCII words weigh 1.0 and lone
+        non-Latin chars weigh ``SINGLE_CJK_WEIGHT`` (they match half the corpus
+        on their own). The result is then multiplied by a small recency bonus
+        ``1 + RECENCY_WEIGHT × freshness`` (mtime-based, linear decay over
+        ``RECENCY_HORIZON_DAYS``) so newer memories win ties.
 
         Args:
             query: Search query.
@@ -247,23 +293,32 @@ class PersistentMemory:
         Returns:
             Top-scoring memory entries.
         """
+        import time as _time
+
         query_tokens = _tokenize(query)
         if not query_tokens:
             return []
 
+        now = _time.time()
         scored: list[tuple[float, MemoryEntry]] = []
         for entry in self._scan_entries():
             meta_tokens = _tokenize(f"{entry.title} {entry.description}")
             body_tokens = _tokenize(entry.body)
-            score = len(query_tokens & meta_tokens) * METADATA_WEIGHT + len(query_tokens & body_tokens)
-            if score > 0:
-                scored.append((score, entry))
+            meta_hits = sum(_token_weight(t) for t in query_tokens & meta_tokens)
+            body_hits = sum(_token_weight(t) for t in query_tokens & body_tokens)
+            score = meta_hits * METADATA_WEIGHT + body_hits
+            if score <= 0:
+                continue
+            age_days = max(0.0, (now - entry.modified_at) / 86400.0)
+            freshness = max(0.0, 1.0 - age_days / RECENCY_HORIZON_DAYS)
+            score *= 1.0 + RECENCY_WEIGHT * freshness
+            scored.append((score, entry))
 
         scored.sort(key=lambda x: (-x[0], -x[1].modified_at))
         return [entry for _, entry in scored[:max_results]]
 
     def add(self, name: str, content: str, memory_type: str = "project",
-            description: str = "") -> Path:
+            description: str = "", source: str = "") -> Path:
         """Save a new memory entry and update the index.
 
         Args:
@@ -274,9 +329,14 @@ class PersistentMemory:
                 ``MAX_ENTRY_CHARS`` with a visible marker.
             memory_type: One of user/feedback/project/reference.
             description: One-line description for retrieval scoring.
+            source: Optional provenance note (F7③) — which conversation /
+                tool / task produced this memory. Stored in frontmatter;
+                readers treat a missing field as "".
 
         Returns:
-            Path to the created memory file.
+            Path to the created memory file. After the call,
+            :attr:`last_add_indexed` reports whether the entry made it into
+            the (line-capped) index.
 
         Raises:
             ValueError: If `name` is empty or whitespace-only.
@@ -306,19 +366,28 @@ class PersistentMemory:
 
         safe_name = stripped_name.replace("\n", " ").replace("\r", " ")
         safe_desc = (description or stripped_name).replace("\n", " ").replace("\r", " ")
+        safe_source = (source or "").replace("\n", " ").replace("\r", " ").strip()
 
         # Strip control bytes (#108) before truncation (#109) so the marker
         # is computed against the user-visible content length.
         clean_content = _truncate_body(_sanitize_body(content))
 
+        # F7③: created timestamp always; source only when supplied. Readers
+        # (_scan_entries) treat both as optional so legacy entries are fine.
+        created_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        source_line = f"source: {safe_source}\n" if safe_source else ""
         frontmatter = (
             f"---\nname: {safe_name}\n"
             f"description: {safe_desc}\n"
-            f"type: {memory_type}\n---\n\n"
+            f"type: {memory_type}\n"
+            f"created: {created_iso}\n"
+            f"{source_line}---\n\n"
             f"{clean_content}"
         )
         path.write_text(frontmatter, encoding="utf-8")
-        self._update_index(stripped_name, filename, description or stripped_name)
+        self.last_add_indexed = self._update_index(
+            stripped_name, filename, description or stripped_name
+        )
         return path
 
     def remove(self, name: str) -> bool:
@@ -337,10 +406,18 @@ class PersistentMemory:
                 return True
         return False
 
-    def _update_index(self, title: str, filename: str, description: str) -> None:
-        """Append or update an entry in MEMORY.md."""
+    def _update_index(self, title: str, filename: str, description: str) -> bool:
+        """Append or update an entry in MEMORY.md.
+
+        Returns:
+            ``True`` when the entry's line landed inside the kept
+            ``MAX_INDEX_LINES`` window, ``False`` when the cap truncated it
+            away (F7① — the caller should warn: the entry file exists but it
+            will not appear in the session-start snapshot).
+        """
         new_line = f"- [{title}]({filename}) — {description}"
 
+        included = True
         if self._index_path.exists():
             lines = self._index_path.read_text(encoding="utf-8").split("\n")
             updated = False
@@ -348,14 +425,95 @@ class PersistentMemory:
                 if f"[{title}]" in line:
                     lines[i] = new_line
                     updated = True
+                    included = i < MAX_INDEX_LINES
                     break
             if not updated:
                 lines.append(new_line)
+                included = len(lines) <= MAX_INDEX_LINES
             text = "\n".join(lines[:MAX_INDEX_LINES])
         else:
             text = new_line
 
         self._index_path.write_text(text, encoding="utf-8")
+        return included
+
+    @property
+    def index_full(self) -> bool:
+        """Whether the index has reached its line cap (new adds get dropped)."""
+        if not self._index_path.exists():
+            return False
+        try:
+            lines = self._index_path.read_text(encoding="utf-8").split("\n")
+        except OSError:
+            return False
+        return len(lines) >= MAX_INDEX_LINES
+
+    def consolidate(self) -> dict:
+        """Deduplicate entries sharing a title and rebuild the index (F7⑤).
+
+        Same-title entries can accumulate under different ``memory_type``
+        prefixes (``project_x.md`` + ``user_x.md``) because the filename
+        embeds the type. For every duplicated title the newest file (mtime)
+        is kept, older bodies are appended into it under a merge marker
+        (subject to the entry size cap), and the older files are deleted.
+
+        Returns:
+            Stats dict: ``duplicates_merged`` (files removed), ``entries``
+            (count after), ``index_lines``, ``index_full``.
+        """
+        entries = self._scan_entries()
+        by_title: dict[str, list[MemoryEntry]] = {}
+        for entry in entries:
+            by_title.setdefault(entry.title, []).append(entry)
+
+        removed = 0
+        for title, group in by_title.items():
+            if len(group) <= 1:
+                continue
+            group.sort(key=lambda e: -e.modified_at)
+            keeper, older = group[0], group[1:]
+            merged_body = keeper.body
+            for dup in older:
+                note = (
+                    f"\n\n---\n[merged from duplicate '{dup.memory_type}' entry "
+                    f"{dup.path.name} during consolidation]\n{dup.body}"
+                )
+                merged_body = _truncate_body(merged_body + note)
+            try:
+                text = keeper.path.read_text(encoding="utf-8")
+                header_end = text.find("\n---\n", 4)
+                if header_end != -1 and text.startswith("---"):
+                    header = text[: header_end + len("\n---\n")]
+                    keeper.path.write_text(header + "\n" + merged_body, encoding="utf-8")
+                else:
+                    # No frontmatter to preserve — write the merged body as-is.
+                    keeper.path.write_text(merged_body, encoding="utf-8")
+            except OSError as exc:
+                # Merge failed → keep the duplicates (deleting them now would
+                # lose their bodies).
+                logger.warning("Consolidation merge failed for %s: %s", title, exc)
+                continue
+            for dup in older:
+                try:
+                    dup.path.unlink(missing_ok=True)
+                    removed += 1
+                except OSError as exc:
+                    logger.warning("Failed to remove duplicate %s: %s", dup.path, exc)
+
+        self._rebuild_index()
+        remaining = self._scan_entries()
+        try:
+            index_lines = len(
+                self._index_path.read_text(encoding="utf-8").split("\n")
+            ) if self._index_path.exists() else 0
+        except OSError:
+            index_lines = 0
+        return {
+            "duplicates_merged": removed,
+            "entries": len(remaining),
+            "index_lines": index_lines,
+            "index_full": index_lines >= MAX_INDEX_LINES,
+        }
 
     def _rebuild_index(self) -> None:
         """Rebuild MEMORY.md from all existing entry files."""

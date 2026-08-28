@@ -33,6 +33,7 @@ from src.agent.memory import WorkspaceMemory
 from src.agent.progress import HeartbeatTimer, ProgressEvent, _set_emitter
 from src.agent.tools import ToolRegistry
 from src.agent.trace import TraceWriter
+from src.agent.verify import verify_run
 from src.core.state import RunStateStore
 from src.goal.context import (
     format_goal_continuation_prompt,
@@ -79,6 +80,11 @@ MICROCOMPACT_PROTECTED_TOOLS = frozenset({
     "run_swarm",
 })
 TOOL_RESULT_LIMIT = 10_000
+# F1 (batch F): successful results from these tools are kept (raw) for the
+# zero-LLM finalization verification — the final answer's price claims are
+# cross-checked against what the run actually fetched (see src/agent/verify.py).
+VERIFY_GROUNDING_TOOLS = frozenset({"get_market_data", "get_realtime_quotes"})
+VERIFY_GROUNDING_MAX_RESULTS = 40
 HEARTBEAT_INTERVAL_S = float(os.getenv("VT_HEARTBEAT_INTERVAL_S", "3.0"))
 REASONING_DELTA_MIN_INTERVAL_S = float(os.getenv("VT_REASONING_DELTA_MIN_INTERVAL_S", "1.0"))
 STREAM_RETRY_DELAY_S = float(os.getenv("VT_STREAM_RETRY_DELAY_S", "2.0"))
@@ -89,6 +95,15 @@ STREAM_RETRY_DELAY_S = float(os.getenv("VT_STREAM_RETRY_DELAY_S", "2.0"))
 STREAM_RETRIES = max(0, int(os.getenv("VT_STREAM_RETRIES", "3")))
 STREAM_RETRY_MAX_DELAY_S = 60.0
 TOOL_TIMEOUT_SECONDS = float(os.getenv("VIBE_TRADING_TOOL_TIMEOUT_SECONDS", "1800"))
+# F2 (batch F): write tools used to be "never killed" — the watchdog warned once
+# past the timeout and then waited forever, so one hung write tool ate the whole
+# attempt budget and defeated the FINALIZE_RESERVE partial-answer path. They now
+# get a grace window of this factor × the per-call (budget-capped) timeout:
+# warn at 1×, abandon waiting at 2×. Abandoning marks the run degraded, returns
+# a structured timeout error to the model, and discards the late result via the
+# same queue mechanism the readonly path uses (the worker thread may still
+# finish its side effect in the background — that is announced in the error).
+WRITE_TOOL_TIMEOUT_FACTOR = 2.0
 # Batch 3: when an attempt deadline is bound, force the final text answer once
 # less than this many seconds (or ~1.2 avg iterations) remain — a partial
 # answer beats the caller timing out on nothing.
@@ -626,6 +641,8 @@ class AgentLoop:
         self._persistent_memory = persistent_memory
         self._run_iteration: int = 0
         self._stats: Dict[str, Any] = _new_run_stats()
+        # (tool_name, raw_result) pairs feeding the finalization verifier (F1).
+        self._grounding_results: List[tuple[str, str]] = []
 
     def cancel(self) -> None:
         """Cancel the current loop.
@@ -661,6 +678,7 @@ class AgentLoop:
         self._called_ok = {}
         self._previous_summary = ""
         self._stats = _new_run_stats()
+        self._grounding_results = []
         run_t0 = _time.perf_counter()
         _fetch_stats.start_collect()
         if deadline is None:
@@ -1143,6 +1161,29 @@ class AgentLoop:
         elif (run_dir / "artifacts" / "metrics.csv").exists() or final_content:
             state_store.mark_success(run_dir)
             final_status = "success"
+            # F1: zero-LLM structural verification. Warnings never flip the
+            # success status — they ride attempt_stats / trace / an event so
+            # the observability panel can surface suspect runs.
+            try:
+                verify_warnings = verify_run(
+                    run_dir, final_content, self._grounding_results
+                )
+            except Exception:  # noqa: BLE001 - verification must never break the run
+                logger.debug("run verification failed", exc_info=True)
+                verify_warnings = []
+            if verify_warnings:
+                self._stats["verify_warnings"] = verify_warnings
+                try:
+                    trace.write(
+                        {
+                            "type": "verify_warnings",
+                            "iter": self._run_iteration,
+                            "warnings": verify_warnings,
+                        }
+                    )
+                except Exception:  # noqa: BLE001 - trace must never break the run
+                    logger.debug("verify_warnings trace write failed", exc_info=True)
+                self._emit("verify_warnings", {"warnings": verify_warnings})
         elif empty_model_response_iter is not None:
             provider = os.getenv("LANGCHAIN_PROVIDER", "openai").strip().lower() or "openai"
             model = getattr(self.llm, "model_name", None) or os.getenv("LANGCHAIN_MODEL_NAME", "").strip() or "(unset)"
@@ -1233,9 +1274,15 @@ class AgentLoop:
             "data_fetches": [],
             "data_gaps": [],
             "early_finalize": bool(self._stats.get("early_finalize")),
+            # F2: set when a write tool blew through its hard timeout and its
+            # result was abandoned — the attempt finished on partial footing.
+            "degraded": bool(self._stats.get("degraded")),
             "model": getattr(self.llm, "model_name", None)
             or os.getenv("LANGCHAIN_MODEL_NAME", ""),
         }
+        # F1: structural verification warnings (only present when non-empty).
+        if self._stats.get("verify_warnings"):
+            stats["verify_warnings"] = self._stats["verify_warnings"]
         collector = _fetch_stats.current()
         if collector is not None:
             fetches, gaps = collector.snapshot()
@@ -1547,41 +1594,11 @@ class AgentLoop:
             self._emit("tool_progress", payload)
             return elapsed_ms
 
-        if not readonly:
-            # Write tools are never killed: a watchdog warns once past the
-            # timeout, then the result is awaited to completion.
-            finished = threading.Event()
-
-            def _warn_if_stale() -> None:
-                if timeout is None or finished.wait(timeout):
-                    return
-                _emit_timeout_progress(
-                    "timeout_warning",
-                    (
-                        f"Write tool exceeded {timeout_label} timeout; "
-                        "waiting for completion because it cannot be safely cancelled"
-                    ),
-                    readonly=False,
-                )
-
-            watchdog = threading.Thread(
-                target=_warn_if_stale,
-                name=f"tool-watchdog-{tool_name}",
-                daemon=True,
-            )
-            watchdog.start()
-            _set_emitter(_on_progress)
-            try:
-                with _heartbeat_timer():
-                    result = self.registry.execute(tool_name, args)
-            finally:
-                finished.set()
-                _set_emitter(None)
-            return result or "", _elapsed_ms()
-
-        # Readonly tools run in a worker thread so a hung tool becomes a
-        # bounded error: late results are discarded and the emitters are
-        # suppressed via the timed_out event.
+        # Both read and write tools run in a worker thread so a hung tool
+        # becomes a bounded error: late results are discarded and the emitters
+        # are suppressed via the timed_out event. Write tools cannot be safely
+        # cancelled mid-flight, so they get a longer leash (see
+        # WRITE_TOOL_TIMEOUT_FACTOR): warn at 1× the timeout, abandon at 2×.
         result_queue: queue.Queue[tuple[str | None, BaseException | None]] = queue.Queue(maxsize=1)
 
         def _worker() -> None:
@@ -1604,23 +1621,86 @@ class AgentLoop:
             try:
                 result, exc = result_queue.get(timeout=timeout)
             except queue.Empty:
-                timed_out.set()
-                elapsed_ms = _emit_timeout_progress(
-                    "timeout", f"Tool exceeded {timeout_label} timeout"
-                )
-                return (
-                    json.dumps(
-                        {
-                            "status": "error",
-                            "error_code": "tool_timeout",
-                            "tool": tool_name,
-                            "timeout_seconds": timeout,
-                            "message": f"Tool exceeded {timeout_label} timeout",
-                        },
-                        ensure_ascii=False,
+                if readonly:
+                    timed_out.set()
+                    elapsed_ms = _emit_timeout_progress(
+                        "timeout", f"Tool exceeded {timeout_label} timeout"
+                    )
+                    return (
+                        json.dumps(
+                            {
+                                "status": "error",
+                                "error_code": "tool_timeout",
+                                "tool": tool_name,
+                                "timeout_seconds": timeout,
+                                "message": f"Tool exceeded {timeout_label} timeout",
+                            },
+                            ensure_ascii=False,
+                        ),
+                        elapsed_ms,
+                    )
+                # Write tool past 1× the timeout: warn once, then keep waiting
+                # up to the hard cap (it cannot be safely cancelled, but it
+                # must not be allowed to eat the whole attempt budget either).
+                _emit_timeout_progress(
+                    "timeout_warning",
+                    (
+                        f"Write tool exceeded {timeout_label} timeout; "
+                        "waiting up to the hard cap because it cannot be "
+                        "safely cancelled"
                     ),
-                    elapsed_ms,
+                    readonly=False,
                 )
+                # The grace window is budget-capped too, so the total wait can
+                # never overshoot the attempt deadline past its reserve.
+                grace = (
+                    _budget.cap_timeout(
+                        timeout * (WRITE_TOOL_TIMEOUT_FACTOR - 1.0),
+                        reserve_s=45.0,
+                        floor_s=5.0,
+                    )
+                    if timeout is not None
+                    else None
+                )
+                try:
+                    result, exc = result_queue.get(timeout=grace)
+                except queue.Empty:
+                    timed_out.set()
+                    self._stats["degraded"] = True
+                    hard_label = _format_timeout(
+                        (timeout or 0.0) * WRITE_TOOL_TIMEOUT_FACTOR
+                    )
+                    elapsed_ms = _emit_timeout_progress(
+                        "timeout",
+                        (
+                            f"Write tool exceeded the {hard_label} hard timeout "
+                            f"({WRITE_TOOL_TIMEOUT_FACTOR:g}x the regular limit); "
+                            "abandoning the wait"
+                        ),
+                        readonly=False,
+                    )
+                    return (
+                        json.dumps(
+                            {
+                                "status": "error",
+                                "error_code": "write_tool_timeout",
+                                "tool": tool_name,
+                                "timeout_seconds": (
+                                    (timeout or 0.0) * WRITE_TOOL_TIMEOUT_FACTOR
+                                ),
+                                "degraded": True,
+                                "message": (
+                                    f"Write tool exceeded the {hard_label} hard "
+                                    "timeout and its result was abandoned. Its "
+                                    "side effect may still complete in the "
+                                    "background — verify before retrying, and "
+                                    "do NOT assume the operation failed cleanly."
+                                ),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        elapsed_ms,
+                    )
         if exc is not None:
             raise exc
         return result or "", _elapsed_ms()
@@ -1679,6 +1759,11 @@ class AgentLoop:
             # Keep the message REF so the duplicate guard can tell whether
             # _microcompact has since pruned this result (pruned -> re-allow).
             self._called_ok[_tool_call_key(tc.name, tc.arguments)] = result_msg
+            # F1: keep raw grounding results for the finalization verifier.
+            if tc.name in VERIFY_GROUNDING_TOOLS:
+                self._grounding_results.append((tc.name, result))
+                if len(self._grounding_results) > VERIFY_GROUNDING_MAX_RESULTS:
+                    self._grounding_results.pop(0)
 
         trace_result = _redact_trace_result(result)
         trace.write_tool_result(

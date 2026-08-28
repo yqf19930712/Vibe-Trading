@@ -191,3 +191,19 @@ Minor / 补充：m1 冷启动 5–15s（重 import + CJK 字体下载 + matplotl
 - **E5 工具文档去双份**（`context.py`）：`## Tools` 块收缩为「工具名 — description 首句（截 100 字符）」的索引；完整描述与参数 schema 本就每轮随 API `tools` 载荷传递，不再在提示词里重复数千 token。
 
 **结果。** 全量回归改前基线 3285 passed / 5 failed / 2 skipped → 改后 3311 passed / 5 failed / 2 skipped：失败清单逐项相同（均为本地缺 langchain-anthropic 包等环境因素），零新增失败；passed 净增 26 = 新增的 microcompact 阈值/预算/免删、状态栏、缓存断点、CJK 加权、系统提示字节稳定用例。既有测试同步更新：goal-context / background-results 断言从「末条消息」改为「状态栏之前的最后一条真实 user 消息」，microcompact 旧断言以 `token_threshold=0` 复现固定 keep-3 行为。文档同步：SYSTEM-PROMPT.md §2/§3 改为状态栏与缓存断点的现状描述。
+
+## 2026-08-28：批次 F——harness 校验/写工具硬超时/工具与记忆生命周期加固
+
+**背景。** 同一轮引擎评审的第六批：harness 五要素缺 Verify（成功判据只有「metrics.csv 存在或有最终文本」）、写工具超时只警告不杀（挂死即吃光预算，架空 FINALIZE_RESERVE 部分答案机制）、swarm「失败先打捞别重跑」只有提示词一句话没有代码兜底，外加 bash 静默截断、MCP 远端结果不设防、registry 兜底异常泄内部路径、记忆生命周期三处缺口。
+
+**改法（批次 F，engine 侧）。**
+- **F1 收口轻校验**（新模块 `src/agent/verify.py` + `loop.py` 挂接）：run 判成功时跑两类零 LLM 结构化检查——①metrics.csv 数值可解析且在宽松合理区间（total_return/annual_return ∈ [-100%,+10000%]、sharpe ∈ [-20,20]、max_drawdown ∈ [-1,0]、win_rate ∈ [0,1]，抓引擎爆炸不评策略好坏）；②最终文本中标的邻近的价格类数字（落在参考价 1/3×~3× 带内才视为价格声明）与本 run get_market_data/get_realtime_quotes 抓到的参考价差超 20% 记警告。警告不翻转 success，只进 `attempt_stats.verify_warnings` + trace `verify_warnings` 条目 + 同名事件，供观测面板看。
+- **F2 写工具硬超时**（`loop.py` `_invoke_tool` 重构 + `WRITE_TOOL_TIMEOUT_FACTOR=2`）：写工具与只读工具统一走 worker 线程 + 队列；1× 超时发 timeout_warning 继续等，2×（宽限段同样被预算钳制）仍未归即放弃等待——run 标 `degraded=true`（attempt_stats 可见）、给模型回 `write_tool_timeout` 结构化错误（明示副作用可能仍在后台完成、勿假设干净失败）、迟到结果照只读路径丢弃。
+- **F3 swarm 失败打捞代码化**（`swarm_tool.py`）：同一 SwarmTool 实例内，preset 失败后 30 分钟（`_FAILURE_COOLDOWN_SECONDS`）内再调同 preset → 不执行，返回 `swarm_preset_cooldown` 结构化拒绝，附上次失败 run 已完成 worker 的产物摘要（completed tasks summary 各截 1200 字符、final_report 截 4000、最多 12 条）与「基于已有产物继续或换 preset」提示。系统提示原句保留作解释。
+- **F4 bash/read_file 感知边界**（`bash_tool.py` / `read_file_tool.py`）：①bash 输出超 50k 改头 40k+尾 8k、中间插明确标记，完整输出落盘 run_dir（`bash_output_{stream}_{ts}.log`，标记内给文件名可 read_file 分页读）；②危险模式审计黑名单（rm -rf /、绝对路径重定向（容 /dev/null、/tmp）、curl|sh、sudo、dd of=/dev/、chmod 777 /）——只审计不拦截，命中记入结果 JSON `security_audit` 字段（随 tool_result 进 trace）+ emit_progress 事件；bash description 补出境走白名单代理说明；③read_file 增 `offset` 参数（1-based 行号，与 limit 配合分页），行截断提示「还有 N 行，可用 offset=M 继续」。
+- **F5 MCP 结果设防**（`mcp.py`）：远端调用结果两级截断（超长字符串字段先各截 20k 带标记，仍超 50k 则降级为 envelope+序列化摘录，均标 `result_truncated`），统一过 `with_security_warnings`（text/error/data/content.*.text，与 reader 工具同款 scanner）；远端工具 description 注册时截 500 字符（第三方 description 属不可信输入）。
+- **F6 registry 兜底脱敏**（`agent/tools.py`）：`ToolRegistry.execute` 兜底 except 的 `str(exc)` 统一过 `redact_internal_paths`（懒 import 避免包循环），个别工具自带的脱敏保持不变。
+- **F7 记忆生命周期**（`persistent.py` / `remember_tool.py` / `context.py`）：①索引满 200 行时 remember save 返回值携带警告 + emit `memory_index_full` 事件（`_update_index` 返回是否入索引、`last_add_indexed`/`index_full` 暴露）；②`<recalled-memories>` 块首加非指令声明；③frontmatter 增 `created`（ISO）与可选 `source`（remember 新参数），老条目无字段兼容；④检索改加权计分——中文相邻 2-gram 满权、孤立单字降权 0.3，乘 `1+0.1×新鲜度`（mtime 30 天线性衰减）recency 权重，零依赖；⑤`consolidate()` 去重（同 title 跨 type 并列条目按 mtime 保留最新、旧 body 以合并标记折入、合并失败不删旧文件）+ 新工具 `consolidate_memory`（共享 PersistentMemory 注入）；⑥remember description 补齐何时存/不存、同名同 type 覆盖语义、索引上限。
+- **F8 skill 横向链接**（`skill_writer_tool.py`）：save_skill description 要求新 skill 正文含 Related 段、链接 ≥2 个相关已有 skill。
+
+**结果。** 全量回归改前基线 3311 passed / 5 failed / 2 skipped → 改后 3366 passed / 5 failed / 2 skipped，失败清单逐项相同（均为本地环境因素：缺 langchain-anthropic 等），零新增失败；净增 55 = 新增用例（verify 13、写工具硬超时 1、swarm 冷却 4、bash 截断/审计 10、read_file offset 5、MCP 设防 9、记忆生命周期 12、registry 脱敏 1）。既有测试同步更新：写工具「永不杀」断言改为「宽限内完成只警告 + 超 2× 放弃并标 degraded」两条。文档同步：SYSTEM-PROMPT.md §2 Guidelines/§3 记忆通道、SKILLS.md save_skill 行。注意 agent/SKILL.md 的 MCP 插件工具表未加 `consolidate_memory`——该表只列 mcp_server.py 暴露的工具，`remember`/`consolidate_memory` 均为进程内 agent 工具不在其列。

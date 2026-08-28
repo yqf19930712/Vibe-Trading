@@ -147,7 +147,7 @@ def build_registry(
         StartResearchGoalTool,
         UpdateResearchGoalStatusTool,
     )
-    from src.tools.remember_tool import RememberTool
+    from src.tools.remember_tool import ConsolidateMemoryTool, RememberTool
     from src.tools.swarm_tool import SwarmTool
 
     goal_tool_classes = {
@@ -172,7 +172,7 @@ def build_registry(
             if not cls.check_available():
                 logger.info("Tool %s unavailable, skipping", cls.name)
                 continue
-            if cls is RememberTool and persistent_memory is not None:
+            if cls in (RememberTool, ConsolidateMemoryTool) and persistent_memory is not None:
                 registry.register(cls(memory=persistent_memory))
             elif cls in goal_tool_classes:
                 registry.register(cls(default_session_id=session_id, event_callback=event_callback))

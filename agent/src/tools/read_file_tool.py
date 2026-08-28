@@ -18,12 +18,19 @@ class ReadFileTool(BaseTool):
     """Read file contents with optional line limit."""
 
     name = "read_file"
-    description = "Read a file from the workspace. Returns file contents with optional line limit."
+    description = (
+        "Read a file from the workspace. Returns file contents with optional "
+        "line limit; use offset+limit to page through large files."
+    )
     parameters = {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "File path relative to run_dir or skills/"},
             "limit": {"type": "integer", "description": "Max number of lines to return (default: all)"},
+            "offset": {
+                "type": "integer",
+                "description": "1-based line number to start reading from (default: 1). Combine with limit to page through large files.",
+            },
         },
         "required": ["path"],
     }
@@ -40,6 +47,7 @@ class ReadFileTool(BaseTool):
         """
         file_path = kwargs["path"]
         limit = kwargs.get("limit")
+        offset = kwargs.get("offset")
         run_dir = kwargs.get("run_dir")
 
         allowed_roots = []
@@ -88,11 +96,31 @@ class ReadFileTool(BaseTool):
 
         try:
             text = resolved.read_text(encoding="utf-8")
-            if limit and limit > 0:
+            # F4: offset (1-based line start) + limit paging with an explicit
+            # continuation hint, so large files are readable in slices instead
+            # of always losing everything past the truncation point.
+            start = 0
+            try:
+                if offset is not None and int(offset) > 1:
+                    start = int(offset) - 1
+            except (TypeError, ValueError):
+                start = 0
+            if start > 0 or (limit and limit > 0):
                 lines = text.splitlines(keepends=True)
-                text = "".join(lines[:limit])
+                total_lines = len(lines)
+                end = start + limit if (limit and limit > 0) else total_lines
+                text = "".join(lines[start:end])
+                remaining = total_lines - min(end, total_lines)
+                if remaining > 0:
+                    text += (
+                        f"\n... ({remaining} more lines; continue with "
+                        f"offset={min(end, total_lines) + 1})"
+                    )
             if len(text) > _OUTPUT_LIMIT:
-                text = text[:_OUTPUT_LIMIT] + "\n... (truncated)"
+                text = text[:_OUTPUT_LIMIT] + (
+                    "\n... (truncated at 50000 chars; use offset/limit to read "
+                    "the rest in slices)"
+                )
             return json.dumps(
                 {
                     "status": "ok",

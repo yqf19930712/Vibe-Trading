@@ -21,6 +21,17 @@ logger = logging.getLogger(__name__)
 _POLL_INTERVAL_SECONDS = 5
 _MAX_WAIT_SECONDS = int(os.getenv("SWARM_TIMEOUT", "7200"))
 
+# F3 (batch F): code-level enforcement of the "salvage, don't re-run" rule the
+# system prompt only stated as prose. After a preset FAILS, an identical-preset
+# re-run within this window is refused with a structured rejection carrying the
+# failed run's completed-worker products — a systemic upstream issue would kill
+# the re-run too, burning tens of minutes for nothing (incident 2026-08-24).
+_FAILURE_COOLDOWN_SECONDS = 30 * 60
+# Caps for the salvage payload embedded in the rejection (keeps it prompt-sized).
+_SALVAGE_REPORT_MAX_CHARS = 4000
+_SALVAGE_TASK_MAX_CHARS = 1200
+_SALVAGE_MAX_TASKS = 12
+
 # Preset matching: (preset_name, keyword_patterns, weight_boost). Patterns match user intent (EN + ZH).
 _PRESET_KEYWORDS: list[tuple[str, list[str], float]] = [
     (
@@ -668,6 +679,68 @@ class SwarmTool(BaseTool):
         """
         self.include_shell_tools = include_shell_tools
         self._event_callback = event_callback
+        # preset -> {"ts", "run_id", "salvage"} for the failure cooldown (F3).
+        # Instance-scoped: one SwarmTool lives per session registry, so the
+        # cooldown naturally covers "the same run/session".
+        self._recent_failures: dict[str, dict[str, Any]] = {}
+
+    def _record_preset_failure(self, preset: str, run_obj: Any) -> None:
+        """Remember a failed run's completed-worker products for salvage (F3)."""
+        completed: list[dict[str, Any]] = []
+        for task in (getattr(run_obj, "tasks", None) or [])[:_SALVAGE_MAX_TASKS * 2]:
+            status = getattr(task, "status", None)
+            status = status.value if hasattr(status, "value") else str(status)
+            if status != "completed":
+                continue
+            summary = str(getattr(task, "summary", "") or "")
+            completed.append({
+                "id": getattr(task, "id", ""),
+                "agent_id": getattr(task, "agent_id", ""),
+                "summary": summary[:_SALVAGE_TASK_MAX_CHARS],
+            })
+            if len(completed) >= _SALVAGE_MAX_TASKS:
+                break
+        self._recent_failures[preset] = {
+            "ts": time.monotonic(),
+            "run_id": getattr(run_obj, "id", None),
+            "salvage": {
+                "final_report": str(getattr(run_obj, "final_report", "") or "")[
+                    :_SALVAGE_REPORT_MAX_CHARS
+                ],
+                "completed_tasks": completed,
+            },
+        }
+
+    def _cooldown_rejection(self, preset: str) -> str | None:
+        """Return a structured refusal when ``preset`` failed recently (F3)."""
+        record = self._recent_failures.get(preset)
+        if record is None:
+            return None
+        elapsed = time.monotonic() - record["ts"]
+        if elapsed >= _FAILURE_COOLDOWN_SECONDS:
+            self._recent_failures.pop(preset, None)
+            return None
+        retry_after = int(_FAILURE_COOLDOWN_SECONDS - elapsed)
+        return json.dumps(
+            {
+                "status": "rejected",
+                "error_code": "swarm_preset_cooldown",
+                "preset": preset,
+                "failed_run_id": record.get("run_id"),
+                "retry_after_s": retry_after,
+                "salvage": record.get("salvage") or {},
+                "message": (
+                    f"Preset '{preset}' failed {int(elapsed)}s ago in this run; "
+                    "an immediate identical re-run is refused because a systemic "
+                    "upstream issue would very likely kill it again. Salvage the "
+                    "completed workers' products above (salvage.completed_tasks / "
+                    "salvage.final_report), fill gaps with your own research, and "
+                    "answer from that — or use a different preset. The cooldown "
+                    f"lifts in {retry_after}s."
+                ),
+            },
+            ensure_ascii=False,
+        )
 
     def _emit_swarm_usage(self, run_id: str, run_obj: Any) -> None:
         """Report swarm worker token totals through the same ``llm_usage``
@@ -724,6 +797,13 @@ class SwarmTool(BaseTool):
                 ensure_ascii=False,
             )
         assert preset is not None
+
+        # F3: refuse an identical-preset re-run inside the failure cooldown.
+        rejection = self._cooldown_rejection(preset)
+        if rejection is not None:
+            logger.warning("SwarmTool: preset %s rejected by failure cooldown", preset)
+            return rejection
+
         variables = _build_variables(preset, prompt)
 
         # Per-attempt swarm accounting (surfaces in attempt_stats.swarm_runs).
@@ -851,6 +931,9 @@ class SwarmTool(BaseTool):
                     output_tokens=reconciled.total_output_tokens,
                 )
                 self._emit_swarm_usage(run_id, reconciled)
+                if reconciled.status.value == "failed":
+                    # F3: arm the cooldown with salvageable worker products.
+                    self._record_preset_failure(preset, reconciled)
                 return _format_result(reconciled, preset, variables)
 
         # Wait budget elapsed but the run is still in flight. Do NOT cancel —

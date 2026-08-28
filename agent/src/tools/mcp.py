@@ -25,8 +25,21 @@ from mcp import types as mcp_types
 
 from src.agent.tools import BaseTool
 from src.config.schema import MCPServerConfig
+from src.security.scanner import with_security_warnings
 
 logger = logging.getLogger(__name__)
+
+# F5: remote MCP results are third-party content. Unlike the in-house reader
+# tools (web_search / read_url / read_document), they used to reach the model
+# unbounded and unscanned. They now get a size cap and the same
+# prompt-injection warning layer the reader tools use.
+_RESULT_CHAR_LIMIT = 50_000
+_STRING_FIELD_TRUNC = 20_000
+# Remote tool DESCRIPTIONS are untrusted third-party input too — they are
+# injected into the system prompt / tools payload, so an oversized or
+# adversarial description would ride straight into the context. Clamped at
+# registration time.
+_DESCRIPTION_CHAR_LIMIT = 500
 
 _NAME_SEGMENT_RE = re.compile(r"[^a-z0-9]+")
 _SCHEMA_COMPOSITION_KEYS = ("anyOf", "oneOf", "allOf")
@@ -331,7 +344,9 @@ class MCPServerAdapter:
                     server_name=self.server_name,
                     remote_name=tool.name,
                     local_name=local_name,
-                    description=(tool.description or f"Remote MCP tool {tool.name} from {self.server_name}."),
+                    description=_clamp_remote_description(
+                        tool.description, tool.name, self.server_name
+                    ),
                     parameters=normalize_mcp_tool_schema(getattr(tool, "inputSchema", None)),
                     annotations=getattr(tool, "annotations", None),
                 )
@@ -554,6 +569,12 @@ class MCPRemoteTool(BaseTool):
             self._filter_arguments(kwargs),
             local_name=self.name,
         )
+        # F5: size cap + prompt-injection warning layer (same scanner as the
+        # in-house reader tools) — remote MCP output is untrusted content.
+        payload = _truncate_remote_payload(payload)
+        payload = with_security_warnings(
+            payload, fields=("text", "error", "data", "content.*.text")
+        )
         return json.dumps(payload, ensure_ascii=False, default=_json_default)
 
     def _filter_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -583,6 +604,68 @@ class MCPRemoteTool(BaseTool):
             }
 
         return {}
+
+
+def _clamp_remote_description(description: str | None, tool_name: str, server_name: str) -> str:
+    """Clamp an untrusted remote tool description to a sane length (F5).
+
+    Third-party MCP servers control this text and it flows into the model's
+    tools payload verbatim — an unbounded description is a token-burn and
+    prompt-injection surface. Content is NOT rewritten (the scanner covers
+    call results); only the length is bounded.
+    """
+    text = (description or "").strip() or f"Remote MCP tool {tool_name} from {server_name}."
+    if len(text) > _DESCRIPTION_CHAR_LIMIT:
+        text = text[: _DESCRIPTION_CHAR_LIMIT - 1].rstrip() + "…"
+    return text
+
+
+def _truncate_long_strings(value: Any) -> Any:
+    """Recursively truncate oversized strings in a payload (F5)."""
+    if isinstance(value, str) and len(value) > _STRING_FIELD_TRUNC:
+        omitted = len(value) - _STRING_FIELD_TRUNC
+        return value[:_STRING_FIELD_TRUNC] + f"…[truncated {omitted} chars]"
+    if isinstance(value, dict):
+        return {key: _truncate_long_strings(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_truncate_long_strings(item) for item in value]
+    return value
+
+
+def _truncate_remote_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Cap a remote MCP result at ``_RESULT_CHAR_LIMIT`` serialized chars (F5).
+
+    Two stages: first oversized string fields are truncated in place (with a
+    marker); if the payload is still too large (many medium fields, huge
+    structured content), it degrades to an envelope + a flat serialized text
+    excerpt. ``result_truncated: true`` marks both stages.
+    """
+    try:
+        serialized = json.dumps(payload, ensure_ascii=False, default=_json_default)
+    except (TypeError, ValueError):
+        return payload
+    if len(serialized) <= _RESULT_CHAR_LIMIT:
+        return payload
+
+    truncated = _truncate_long_strings(payload)
+    truncated["result_truncated"] = True
+    try:
+        serialized = json.dumps(truncated, ensure_ascii=False, default=_json_default)
+    except (TypeError, ValueError):
+        return truncated
+    if len(serialized) <= _RESULT_CHAR_LIMIT:
+        return truncated
+
+    omitted = len(serialized) - _RESULT_CHAR_LIMIT
+    return {
+        "status": payload.get("status"),
+        "server": payload.get("server"),
+        "remote_tool": payload.get("remote_tool"),
+        "tool": payload.get("tool"),
+        "result_truncated": True,
+        "text": serialized[:_RESULT_CHAR_LIMIT]
+        + f"…[remote MCP result truncated: {omitted} more serialized chars omitted]",
+    }
 
 
 def _run_sync(operation: Callable[[], Coroutine[Any, Any, ResultT]]) -> ResultT:
