@@ -217,7 +217,7 @@ flowchart LR
 - 入参校验：model 与 llm.model 过白名单正则（字母数字开头，≤100 字符）；`baseUrl` 须 `http(s)://` 且 ≤500 字符；`apiKey` 非空 ≤500 字符且无控制字符。BYOK apiKey 只进指纹哈希与引擎 env，不落日志。
 - **指纹即实例身份**：引擎子进程的 env 启动后不可变（`build_llm` 虽每 attempt 读 env，读的也是引擎自己进程的 env），所以任何 LLM 配置切换都表现为 launcher `/boot` 重启引擎。
 - **引擎侧鉴权**：经 cube-proxy 到达引擎的请求不是 loopback，引擎的 loopback 信任失效 → 引擎依赖 `API_AUTH_KEY` Bearer 校验。router 每次 boot 随机生成 32-hex key，注入引擎 env 并持久化到 state.json，之后对该实例的所有请求（sessions/messages/events）都带 `Authorization: Bearer <key>`。
-- 引擎侧兼容性（本 fork 差异）：`opus-4-8`/`fable`/`mythos` 模型省略 `temperature`；流式默认请求 usage 块，`llm_usage` SSE 事件（增量 input/output tokens）经 progress 帧到达 laicai 做用量记账。
+- 引擎侧兼容性（本 fork 差异）：`opus-4-7`/`opus-4-8`/`opus-5`/`sonnet-5`/`fable`/`mythos` 模型省略 `temperature`（可经 `LANGCHAIN_NO_TEMPERATURE_MODELS` 追加）；流式默认请求 usage 块，`llm_usage` SSE 事件（增量 input/output tokens）经 progress 帧到达 laicai 做用量记账。
 - **Anthropic 原生通道**：`LANGCHAIN_PROVIDER=anthropic` 时引擎走原生 `/v1/messages` API（`agent/src/providers/llm.py` `_build_native_anthropic`），SSE ping 端到端透传、去掉两层协议转换，治 OpenAI-compat 路径长思考停顿被中间设备静默掐断的问题；生产 v34 起内置模型即此通道。
 
 ## 6. 资源与网络边界
