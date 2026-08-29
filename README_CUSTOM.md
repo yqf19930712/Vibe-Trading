@@ -112,13 +112,15 @@ systemctl daemon-reload && systemctl enable --now cube-router
 | `VIBE_MAX_INSTANCES` | | 并发 RUNNING 沙箱上限，默认 3（8G 宿主机的安全值） |
 | `VIBE_MAX_CONCURRENT_ACTIVE` | | 并发 `/ask` 处理上限，默认 2 |
 | `VIBE_IDLE_TTL_S` | | 空闲 pause 阈值，默认 1200 |
-| `VIBE_READY_TIMEOUT_S` / `VIBE_POLL_INTERVAL_S` / `VIBE_ASK_TIMEOUT_S` | | 就绪预算 180s / 轮询间隔 3s / 单问默认超时 900s |
+| `VIBE_READY_TIMEOUT_S` / `VIBE_POLL_INTERVAL_S` / `VIBE_ASK_TIMEOUT_S` | | 就绪预算 180s / 轮询间隔 3s / 单问默认超时 900s（= `intent=standard` 的预算档） |
+| `VIBE_SWARM_ASK_TIMEOUT_S` | | `intent=deep_team`（多智能体团队）的预算档，默认 7200。**这是「swarm 两小时」的唯一真源**：`BUDGET_BY_INTENT` 与下发给租户引擎的 `SWARM_TIMEOUT` env 都从它派生，不要在别处再写一遍 |
+| `VIBE_TENANT_QUOTA_BYTES` / `VIBE_TENANT_WATERMARK` | | 租户可写数据配额（默认 4G）与告警水位（默认 0.8）。只影响 `/healthz` 的 `disk` 段、`GET /tenants/usage` 与 warn 日志——**router 目前不做任何自动清扫** |
 | `OPENAI_*` `ANTHROPIC_*` `LANGCHAIN_*` `TUSHARE_TOKEN` `IFIND_MCP_TOKEN` `TICKFLOW_API_KEY` `VIBE_TRADING_SEARCH_BACKENDS` | | 内置默认 LLM 凭据与数据源配置，经 launcher `/boot` 转发进每个租户引擎（完整清单见 `router.py` 的 `FORWARD_ENV`） |
 | `LANGCHAIN_TEMPERATURE` | | `none` / `off` / 空 = 任何模型都不发 `temperature`；否则按数值发。填了非数字会 warning 后回落 `0.0` |
 | `LANGCHAIN_NO_TEMPERATURE_MODELS` | | 逗号分隔的模型名子串，**追加**到 `llm.py` 内置的 `NO_TEMPERATURE_MODELS` 名单（追加而非替换，避免为了加新模型把已知的漏掉） |
 | `VIBE_ASK_LOG` | | 每次 `/ask` 一行的观测日志，默认 `/var/lib/cube-router/ask_log.jsonl`（20MB 轮转） |
 | `VIBE_EGRESS_KEY_FILE` / `VIBE_EGRESS_SSH_DEST` | | 沙箱出境隧道：宿主上的 SSH 私钥路径（如 `/root/vibe-egress-key`）+ 目的地（如 `root@<B服务器>`）。配了才会给引擎注入 `VIBE_TRADING_EGRESS_PROXY`；B 端该 key 必须 `restrict,port-forwarding,permitopen="127.0.0.1:8888"` |
-| 租户档位覆盖 | | `engine_env()` 会给每个租户注入默认档位：`VIBE_MAX_ITERATIONS=50`、`VIBE_TRADING_DATA_CACHE=1`、`VIBE_TRADING_TOOL_TIMEOUT_SECONDS=300`、`SWARM_TIMEOUT=7200`、`VIBE_TRADING_SEARCH_BACKENDS=auto`——在 router.env 里设同名变量即可整体覆盖 |
+| 租户档位覆盖 | | `engine_env()` 会给每个租户注入默认档位：`VIBE_MAX_ITERATIONS=50`、`VIBE_TRADING_DATA_CACHE=1`、`VIBE_TRADING_TOOL_TIMEOUT_SECONDS=300`、`SWARM_TIMEOUT`（派生自 `VIBE_SWARM_ASK_TIMEOUT_S`）、`VIBE_TRADING_SEARCH_BACKENDS=auto`——在 router.env 里设同名变量即可整体覆盖 |
 
 laicai 侧只需在 `web.env` 配 `VIBE_ROUTER_URL=http://<宿主机>:8990` + `VIBE_ROUTER_TOKEN`。
 

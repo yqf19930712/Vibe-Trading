@@ -6,77 +6,10 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
-- **Shared context-compression policy (`agent/context_policy.py`).** Layers 1–3
-  now read one rule source. Layer 2 used to fold the middle out of exactly the
-  grounding results Layer 1 refuses to prune, and out of the Layer 3 handoff
-  summary. Rules are graded rather than boolean — the first user message folds
-  under a looser budget instead of being exempted outright, and a pathological
-  protected result still has a hard-cap escape valve.
-- **Off-disk tool results with an explicit truncation envelope
-  (`agent/tool_result_store.py`).** Oversized results are written under
-  `run_dir/tool-results/` and the model receives a marked head+tail preview
-  plus the path and read instructions, instead of a silent `[:10_000]` cut it
-  could not detect. File names are deterministic so the preview text — and
-  therefore the prompt cache — stays byte-stable across replays.
-- **Cross-attempt handoff summaries (`session/handoff.py`).** The Layer 3
-  structured summary is persisted the moment it is produced and resumed by the
-  next attempt, so decisions compressed away earlier are inherited instead of
-  lost. Session history replay is now summary + token-budgeted raw turns, with
-  an explicit placeholder for turns that did not fit.
-- **Per-(tool, args) circuit breaker.** After
-  `VIBE_TOOL_CIRCUIT_FAILURE_LIMIT` (default 3) consecutive identical failures
-  the call is refused with an actionable structured error. The duplicate guard
-  only ever registered successes, so a dead upstream could repeat until the
-  iteration cap.
-- **Chinese prompt-injection rules and an `<external-content>` declaration.**
-  All five scanner rules gained a Chinese variant, and `read_url` /
-  `web_search` / `read_document` bodies are now wrapped in an untrusted-data
-  declaration mirroring `<recalled-memories>`, with high-severity findings
-  promoted to a banner above the content.
 
 ### Changed
-- **microcompact hysteresis.** Crossing the trigger arms the layer and cuts
-  once, deeper (keep ratio 0.25 → 0.15), staying armed until the estimate
-  falls back below 0.35. Replaces a shallow rewrite of the trajectory middle on
-  every single turn past the trigger, which rebuilt the provider prompt cache
-  each time.
-- **`run_swarm` returns conclusions plus pointers.** Per-task summaries are
-  previews with a `report_path`, and `final_report` receives the measured
-  leftover of the payload budget, so the whole return is valid JSON inside the
-  tool-result limit rather than being cut mid-document on the way in.
-- **Session history budget is now tokens, not characters.**
-  `MAX_HISTORY_CHARS = 12000` ("roughly 3000 tokens") was an English-only
-  assumption worth ~7.2k tokens of Chinese. Replaced with
-  `MAX_HISTORY_TOKENS = 6000` using the repo's CJK-weighted estimator — this
-  unifies the unit and deliberately does NOT also cut the budget.
-- **Swarm workers run tools through the main loop's watchdog.** Worker tool
-  calls now get the same timeout, heartbeat and budget clamp as the main loop;
-  previously a hung tool blocked a worker until the layer deadline expired.
-- **Long-term memory hygiene.** Overwriting an entry folds the superseded body
-  into the new file under a merge marker instead of destroying it; the index is
-  auto-consolidated at run end once it reaches 180 lines.
 
 ### Fixed
-- **Compaction failure no longer fails the run.** The Layer 3 summary call is
-  guarded: on failure the run degrades to the zero-LLM layers and continues. A
-  correction mechanism must not be what kills a healthy attempt.
-- **`empty_model_response` gets one in-place retry.** A degraded provider turn
-  (stream succeeds, no content and no tool calls) used to write off a
-  potentially hour-long attempt without a single retry.
-- **Swarm worker `tool_result` events report real status.** The status was
-  hardcoded `"ok"`, so the swarm panel showed a 0% worker tool error rate
-  regardless of what happened.
-- **Worker `incomplete` results are retried.** A missing deliverable is the
-  failure class most likely to succeed on a second attempt, and leaving it
-  unretried blocked every downstream task.
-- **Upstream reports injected into downstream workers are budgeted.** A
-  multi-upstream role concatenated whole `report.md` documents into its system
-  prompt with no limit.
-- **A full tenant volume no longer kills the attempt.** `PersistentMemory.add`
-  raises `MemoryWriteError`, which `remember` turns into a structured tool
-  error; tool-result offload failures degrade to a marked, disk-free preview.
-- **Removed the tracked `agent/logs/engine.jsonl`** (164KB, first line leaked
-  an internal LLM gateway host) and gitignored `agent/logs/`.
 
 ## [0.1.9] — 2026-06-01
 

@@ -77,6 +77,26 @@ IDLE_TTL_S = int(os.environ.get("VIBE_IDLE_TTL_S", str(20 * 60)))     # pause af
 READY_TIMEOUT_S = int(os.environ.get("VIBE_READY_TIMEOUT_S", "180"))  # create+boot budget
 POLL_INTERVAL_S = float(os.environ.get("VIBE_POLL_INTERVAL_S", "3"))
 DEFAULT_ASK_TIMEOUT_S = int(os.environ.get("VIBE_ASK_TIMEOUT_S", str(15 * 60)))
+# Swarm committees legitimately run tens of minutes to hours (multi-layer DAG ×
+# multi-iteration workers).
+SWARM_ASK_TIMEOUT_S = int(os.environ.get("VIBE_SWARM_ASK_TIMEOUT_S", str(2 * 60 * 60)))
+# THE single place a caller's budget tier is decided. Callers declare a
+# structured `intent` and the number is derived here — previously 7200 was
+# written out in four places (laicai chat-tools, laicai warlab-engine, the
+# SWARM_TIMEOUT env below, and the engine's swarm_tool), and the 2026-08-24
+# incident was exactly those four drifting apart. An explicit `timeoutS` still
+# wins so laicai can be rolled back on its own without touching the router.
+BUDGET_BY_INTENT = {
+    "standard": DEFAULT_ASK_TIMEOUT_S,
+    "deep_team": SWARM_ASK_TIMEOUT_S,
+}
+
+
+def budget_for(intent: Optional[str], explicit: Optional[int]) -> int:
+    """Resolve one ask's wall-clock budget. `explicit` (body.timeoutS) wins."""
+    if explicit:
+        return explicit
+    return BUDGET_BY_INTENT.get(intent or "standard", DEFAULT_ASK_TIMEOUT_S)
 # Per-ask observability: one JSONL line per /ask (segment timings, outcome,
 # attempt_id) so slow/failed asks can be traced without any extra infra.
 ASK_LOG = Path(os.environ.get("VIBE_ASK_LOG", "/var/lib/cube-router/ask_log.jsonl"))
@@ -170,12 +190,12 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
         ("VIBE_MAX_ITERATIONS", "50"),
         ("VIBE_TRADING_DATA_CACHE", "1"),
         ("VIBE_TRADING_TOOL_TIMEOUT_SECONDS", "300"),
-        # Swarm committees legitimately run tens of minutes to hours (multi-
-        # layer DAG × multi-iteration workers). The wait is still clamped to
-        # the attempt's remaining budget (cap_timeout), so no inversion — the
-        # two hours only materialize when laicai grants a matching timeoutS
-        # for swarm asks.
-        ("SWARM_TIMEOUT", "7200"),
+        # The engine's own swarm wait budget. Derived from BUDGET_BY_INTENT so
+        # the two hours are stated once, not copied. The wait is still clamped
+        # to the attempt's remaining budget (cap_timeout), so no inversion —
+        # the two hours only materialize when the ask itself was granted a
+        # matching budget (intent="deep_team", or an explicit timeoutS).
+        ("SWARM_TIMEOUT", str(SWARM_ASK_TIMEOUT_S)),
         # LLM streaming read timeout (httpx). The engine default of 120s is
         # too tight for long-context opus-class calls: incident 2026-08-24, a
         # swarm worker's stream went silent >120s twice in a row (ReadTimeout
@@ -505,13 +525,26 @@ async def _ensure_session(inst: Instance, vibe_session_id: Optional[str]) -> str
 
 
 async def _post_turn(
-    inst: Instance, sid: str, query: str, deadline_s: Optional[float] = None
+    inst: Instance,
+    sid: str,
+    query: str,
+    deadline_s: Optional[float] = None,
+    intent: Optional[str] = None,
+    swarm_preset: Optional[str] = None,
 ) -> Optional[str]:
     payload: dict = {"content": query}
     if deadline_s is not None:
         # The engine finalizes with what it has before this budget runs out
         # (batch 3) instead of grinding past the caller's timeout.
         payload["deadline_s"] = round(deadline_s, 1)
+    # Structured intent rides alongside deadline_s. Engines that don't know
+    # these fields yet ignore them (the request model tolerates extras), so the
+    # router can ship ahead of the engine — that is the whole point of staging
+    # the cross-repo contract: the budget lands first, the prompt branch later.
+    if intent is not None:
+        payload["intent"] = intent
+    if swarm_preset is not None:
+        payload["swarm_preset"] = swarm_preset
     r = await _vibe(inst, "POST", f"/sessions/{sid}/messages", json=payload)
     if r.status_code == 404:
         raise _SessionGone()
@@ -633,6 +666,17 @@ class AskBody(BaseModel):
     vibeSessionId: Optional[str] = None
     model: Optional[str] = None
     llm: Optional[LlmOverride] = None
+    # Structured research-depth intent (cross-repo contract, 2026-08-29).
+    # "deep_team" = multi-agent swarm committee. The router derives the budget
+    # from it (BUDGET_BY_INTENT) instead of every caller hardcoding 7200.
+    # Optional on purpose: an older laicai that sends only `timeoutS` behaves
+    # exactly as before.
+    intent: Optional[str] = None
+    # Swarm preset name for deep_team asks. Forwarded to the engine as-is; the
+    # authoritative enum is the engine's agent/src/swarm/presets/*.yaml listing,
+    # so the router deliberately does NOT validate it against a copied list
+    # (a stale copy here would reject presets the engine actually supports).
+    swarmPreset: Optional[str] = None
     timeoutS: Optional[int] = None
 
 
@@ -676,6 +720,10 @@ async def _ask_stream(body: AskBody, timeout_s: int):
         "channel": "byok" if body.llm else "builtin",
         "model": (body.llm.model if body.llm else body.model) or None,
         "timeout_s": timeout_s,
+        # Which tier this ask got and why — the ask log is where a "why did my
+        # swarm only get 15 minutes" question gets answered.
+        "intent": body.intent or "standard",
+        "budget_source": "explicit" if body.timeoutS else "intent",
         "outcome": "incomplete",
     }
     engine_stats: Optional[dict] = None
@@ -710,15 +758,20 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                         60.0, timeout_s - (time.monotonic() - t_req) - 10.0
                     )
                     sid = await _ensure_session(inst, body.vibeSessionId)
+                    turn_kwargs = {
+                        "deadline_s": engine_deadline_s,
+                        "intent": body.intent,
+                        "swarm_preset": body.swarmPreset,
+                    }
                     try:
                         attempt_id = await _post_turn(
-                            inst, sid, body.query, deadline_s=engine_deadline_s
+                            inst, sid, body.query, **turn_kwargs
                         )
                     except _SessionGone:
                         stats["session_recovered"] = True
                         sid = await _ensure_session(inst, None)
                         attempt_id = await _post_turn(
-                            inst, sid, body.query, deadline_s=engine_deadline_s
+                            inst, sid, body.query, **turn_kwargs
                         )
                     stats["session_ms"] = int((time.monotonic() - sess_t0) * 1000)
                     stats["attempt_id"] = attempt_id
@@ -823,7 +876,11 @@ async def ask(body: AskBody, authorization: Optional[str] = Header(None)):
             raise HTTPException(400, "invalid llm.baseUrl")
         if not (0 < len(l.apiKey) <= 500) or any(ord(c) < 32 or ord(c) == 127 for c in l.apiKey):
             raise HTTPException(400, "invalid llm.apiKey")
-    timeout_s = body.timeoutS or DEFAULT_ASK_TIMEOUT_S
+    if body.intent is not None and body.intent not in BUDGET_BY_INTENT:
+        raise HTTPException(400, "invalid intent")
+    if body.swarmPreset is not None and not re.fullmatch(r"[a-z0-9_]{3,64}", body.swarmPreset):
+        raise HTTPException(400, "invalid swarmPreset")
+    timeout_s = budget_for(body.intent, body.timeoutS)
     return StreamingResponse(_ask_stream(body, timeout_s), media_type="application/x-ndjson")
 
 
@@ -1130,10 +1187,120 @@ async def memory_delete(body: dict, authorization: Optional[str] = Header(None))
     return {"ok": True, "deleted": existed}
 
 
+# ── Tenant disk usage (read-only water-mark exposure) ────────────────────────
+# Each tenant's writable data lives under DATA_ROOT/<tenant_key>/ and is capped
+# at TENANT_QUOTA_BYTES. Before this, hitting the cap had **no defined failure
+# mode**: the engine's memory writes and trace writes call write_text with no
+# try, so a full disk surfaced as an exception mid-attempt with nothing pointing
+# at "the tenant is out of space".
+#
+# This is deliberately the READ-ONLY half of the retention design. The actual
+# sweeper (deleting old sessions/runs/uploads) is NOT here — deleting user data
+# on a schedule is the highest-consequence change in the whole plan, and the
+# right order is: expose usage first, watch real numbers for a couple of weeks,
+# then decide the retention windows from evidence instead of from a guess.
+#
+# TODO(retention, after ~2 weeks of /tenants/usage data): add `retention.py`
+#   with a 6-hourly sweeper — sessions/ and runs/ evicted by directory mtime
+#   (age or count), uploads/ by age, **memory/ never** (it is the user's asset;
+#   only the user or /forget removes it). Two hard requirements before it ships:
+#     1. `--dry-run` listing reviewed by hand — no active session in it;
+#     2. the engine's FTS index (sessions.db) must drop rows for deleted session
+#        dirs, or search returns dead links.
+#   laicai-bound session ids self-heal: a deleted session makes the engine 404,
+#   the router creates a new one and reports the new sid back (already in use).
+TENANT_QUOTA_BYTES = int(os.environ.get("VIBE_TENANT_QUOTA_BYTES", str(4 * 1024**3)))
+# Warn (log + /healthz flag) at this fraction of the quota.
+TENANT_WATERMARK = float(os.environ.get("VIBE_TENANT_WATERMARK", "0.8"))
+# `du` over a multi-GB tree is not free, and /healthz is polled. Cache it.
+_DU_TTL_S = 300.0
+_du_cache: dict[str, tuple[float, int]] = {}
+
+
+def _dir_bytes(path: Path) -> int:
+    """Apparent size of one tenant dir. Returns 0 for a missing/unreadable dir."""
+    total = 0
+    try:
+        for p in path.rglob("*"):
+            try:
+                if p.is_file() and not p.is_symlink():
+                    total += p.stat().st_size
+            except OSError:
+                continue  # racing with the engine writing/rotating files
+    except OSError:
+        return 0
+    return total
+
+
+def _tenant_usage_sync() -> list[dict]:
+    """(tk, bytes) for every tenant dir under DATA_ROOT, 5-minute cached."""
+    now = time.monotonic()
+    out: list[dict] = []
+    try:
+        dirs = [d for d in DATA_ROOT.iterdir() if d.is_dir()]
+    except OSError as e:
+        log.warning("usage: DATA_ROOT unreadable: %s", e)
+        return out
+    for d in dirs:
+        hit = _du_cache.get(d.name)
+        if hit and now - hit[0] < _DU_TTL_S:
+            size = hit[1]
+        else:
+            size = _dir_bytes(d)
+            _du_cache[d.name] = (now, size)
+        out.append(
+            {
+                "tk8": d.name[:8],
+                "disk_bytes": size,
+                "quota_bytes": TENANT_QUOTA_BYTES,
+                "pct": round(size / TENANT_QUOTA_BYTES * 100, 1) if TENANT_QUOTA_BYTES else 0.0,
+                "over_watermark": size > TENANT_QUOTA_BYTES * TENANT_WATERMARK,
+            }
+        )
+    # Drop cache entries for tenants that no longer exist (post-/forget).
+    live = {d.name for d in dirs}
+    for stale in [k for k in _du_cache if k not in live]:
+        _du_cache.pop(stale, None)
+    out.sort(key=lambda r: r["disk_bytes"], reverse=True)
+    for r in out:
+        if r["over_watermark"]:
+            log.warning(
+                "tenant %s over disk watermark: %d bytes (%.1f%% of quota)",
+                r["tk8"], r["disk_bytes"], r["pct"],
+            )
+    return out
+
+
+async def tenant_usage() -> list[dict]:
+    return await asyncio.to_thread(_tenant_usage_sync)
+
+
+@app.get("/tenants/usage")
+async def tenants_usage(
+    limit: int = 20, authorization: Optional[str] = Header(None)
+):
+    """Top tenants by writable-data size. Read-only; nothing is deleted here."""
+    _auth(authorization)
+    rows = await tenant_usage()
+    return {
+        "quota_bytes": TENANT_QUOTA_BYTES,
+        "watermark": TENANT_WATERMARK,
+        "data_root_bytes": sum(r["disk_bytes"] for r in rows),
+        "tenants_total": len(rows),
+        "over_watermark": sum(1 for r in rows if r["over_watermark"]),
+        "tenants": rows[: max(1, min(limit, 200))],
+    }
+
+
 @app.get("/healthz")
 async def healthz(authorization: Optional[str] = Header(None)):
     _auth(authorization)  # docs always said Bearer; the check was simply missing
     ok_ms = list(recent_ask_ms)
+    # Disk usage per tenant (5-min cached `du`; a cold cache costs one walk).
+    # `tenants[]` only lists tenants with a live instance, so the disk totals
+    # are computed over DATA_ROOT — paused-and-evicted tenants still occupy it.
+    usage = await tenant_usage()
+    by_tk8 = {u["tk8"]: u for u in usage}
     return {
         "instances": len(pool),
         "running": sum(1 for i in pool.values() if not i.paused),
@@ -1146,6 +1313,13 @@ async def healthz(authorization: Optional[str] = Header(None)):
             "p95_ms": _percentile(ok_ms, 0.95),
             "window": len(ok_ms),
         },
+        "disk": {
+            "data_root_bytes": sum(u["disk_bytes"] for u in usage),
+            "quota_bytes": TENANT_QUOTA_BYTES,
+            "watermark": TENANT_WATERMARK,
+            "tenants_total": len(usage),
+            "over_watermark": sum(1 for u in usage if u["over_watermark"]),
+        },
         "tenants": [
             {
                 "tk8": i.tk[:8],
@@ -1153,6 +1327,8 @@ async def healthz(authorization: Optional[str] = Header(None)):
                 "paused": i.paused,
                 "refcount": i.refcount,
                 "idle_s": round(time.monotonic() - i.last_activity),
+                "disk_bytes": (by_tk8.get(i.tk[:8]) or {}).get("disk_bytes", 0),
+                "over_watermark": (by_tk8.get(i.tk[:8]) or {}).get("over_watermark", False),
             }
             for i in pool.values()
         ],

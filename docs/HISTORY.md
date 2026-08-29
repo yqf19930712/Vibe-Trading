@@ -271,3 +271,17 @@ Minor / 补充：m1 冷启动 5–15s（重 import + CJK 字体下载 + matplotl
 既有测试的语义更新（都是行为确实变了，不是迁就实现）：`test_loop_helpers` 的两条折叠用例从 `messages[1]` 改看 `messages[2]`（下标 1 现在是走 FIRST_USER 分档的首条 user）；两条 `empty_model_response` 用例的断言从 "iteration 1" 改 "iteration 2"（多了一次重试）；`test_swarm_status_hydration` 的心跳源码检查从「worker 必须用 HeartbeatTimer 包住 registry.execute」改为「worker 必须走 `invoke_tool_guarded` 且转发它的心跳 + 守卫自身必须包住阻塞等待」；三处 FakeStore/\_Store 测试替身补 `run_dir()`；doc_reader / web_search 的三条相等断言改为包含断言（正文现在带 `<external-content>` 包裹）。
 
 **本次未部署**（无镜像重建、无模板切换、未碰生产）。
+
+## 2026-08-29：批次 V3——数据生命周期收口 + swarm 意图结构化（router 侧）
+
+**问题一：注销不清引擎数据。** laicai 的 `deleteUser` 只让本库的域表随 cascade 清空；引擎宿主机租户目录下的长期记忆、`sessions/` 全部对话正文、`trace.jsonl`（含**未裁剪的完整 prompt**）、runs 与用户上传的交割单**永久残留**。router 的 `POST /forget` 早就完整实现且幂等，但**laicai 侧零引用**——端点存在不等于链路存在。修法在 laicai 侧（无外键的 `engine_forget_jobs` 登记表 + `deleteUser` 前后两个钩子 + 夜间重试 + 运营看板告警，见该仓记录）；router 侧只补文档，把「谁调用、什么时候调用、失败怎么办」写进 PRODUCT_DESIGN §3.2 —— 一个没有记录调用方的清理端点，下一次评审还会把它读成死代码。
+
+**问题二：7200 散落四处。** 「swarm 两小时预算」这一个事实此前被写在四个地方：laicai `chat-tools.ts` 的 `SWARM_TIMEOUT_S`、laicai `warlab-engine.ts` 的 `SWARM_GEN_TIMEOUT_S`、router 下发的 `SWARM_TIMEOUT` env、引擎 `swarm_tool.py` 的默认值。08-24 事故记录里那句「三处同调」就是这么来的。更糟的是**意图本身**的传递方式：模型把「使用多智能体团队(swarm)分析」写成中文散文塞进 `query`，laicai 再用正则把它嗅探回结构化来决定 15min/2h 预算，引擎侧还有第三份关键词表——`结构化 →（压成散文）→ 正则嗅探回结构化 →（再压成散文）→ 正则嗅探回结构化`，每一次往返都掉信息，模型换个措辞，本该跑两小时的 swarm 就落在 15 分钟预算里。
+
+改法：`/ask` 接收结构化的 `intent`（`standard` | `deep_team`）与 `swarmPreset`，预算由 router 的 `BUDGET_BY_INTENT` **单点推导**，下发给引擎的 `SWARM_TIMEOUT` env 也从同一常量派生。三条兼容保证：①`body.timeoutS` 显式给出时仍最优先，因此只回滚 laicai 就能立刻回到旧预算行为；②两个新字段都是 `Optional`，老 laicai 不发即走原路径；③`intent`/`swarm_preset` 与 `deadline_s` 并列下发，不认识它们的引擎版本忽略即可——router 因此可以先于引擎发布。`swarmPreset` 只做形状校验、**不比对 router 侧的名单副本**：preset 的唯一真源是引擎的 `agent/src/swarm/presets/*.yaml`，一份过期的副本会去误拒引擎实际支持的 preset（V1-B 修的正是同一类病）。ask 日志新增 `intent` 与 `budget_source`，「我的 swarm 为什么只拿到 15 分钟」从此有据可查。
+
+**问题三：4G 打满没有失败模式。** 租户可写层封顶 4G，但打满之后会怎样此前无定义——引擎的记忆写入与 trace 写入都是裸 `write_text`，磁盘满表现为 attempt 中途抛异常，且没有任何东西指向「这个租户没空间了」。本批次**只做只读的那一半**：`/healthz` 增 `disk` 段与每租户 `disk_bytes`/`over_watermark`，新增 `GET /tenants/usage` 列 Top N，超 80% 水位打 warn；`du` 结果缓存 5 分钟（healthz 会被轮询，逐次遍历数 GB 目录不可接受），且对缺失/竞态目录一律返回 0 而不抛——健康检查不能被一块满盘拖下水。
+
+**真正的清扫（删 sessions/runs/uploads）刻意不做**，代码里留 `TODO(retention)` 写明落地前置条件：先积累两周真实用量再定保留窗（凭证据而不是凭猜测定阈值）、上线必须先 `--dry-run` 人工核对无活跃会话、引擎侧 FTS 索引要同步清死行否则搜索返回死链。`memory/` 永不参与清扫——那是用户资产，只有用户手删或 `/forget` 能动。删用户数据是整个计划里失误代价最高的一步，把它放在最后是刻意的。
+
+**验收**：`python -m py_compile ops/cube-router/router.py` 通过；新增 `ops/cube-router/test_router_budget.py` 10 条纯逻辑用例全过（预算推导四种组合、`timeoutS` 优先级、引擎 env 与 `BUDGET_BY_INTENT` 一致性、磁盘统计的求和/缺目录/缓存/水位/缓存回收）。**本次未部署**（未重建镜像、未切模板、未碰生产）。
