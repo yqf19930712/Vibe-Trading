@@ -8,7 +8,9 @@
 - **preset 名单的唯一真源是 `agent/src/swarm/presets/*.yaml` 的目录清单**（`_discover_preset_names`），不是关键词表。关键词表只决定「没点名时选谁」，缺一行不影响该 preset 能被点名。
 - **关键词打分平分时**优先精确短语命中数更多者（多词英文短语或 3 字以上中文词，如 "funding rate" / "资金费率"；单个泛词如 "crypto"、"macro" 不计），仍平分则按表内顺序。路由置信度随结果返回（`preset_score`：99 = 点名、正数 = 关键词命中、0 = 兜底到 `equity_research_team`）。
 - **变量抽取**（`_build_variables`）逐 preset 从 prompt 里读 commodity / crypto 标的 / 方向观点 / 因子族 / 事件类型 / 基金类型等，抽不到才回落到默认值；`commodity_research_team` 与 `crypto_research_lab` 的模板另带 `{goal}`（用户原话），确保回落时 worker 看到的是真实诉求而不是一个自信的错主题。
-- **laicai 侧**（`app/src/server/chat-tools.ts`）：chat 模型仅在两类场景把 swarm 意图写进 query——① 用户明确要求多视角/团队/委员会式研判；② 重大资金决策（具体金额的加仓/清仓/大类配置）且用户要求全面论证。命中 swarm 意图正则的调用自动获得 **2 小时预算**（`timeoutS=7200`，普通深度分析 15 分钟），与引擎租户档位 `SWARM_TIMEOUT=7200` 配套。
+- **laicai 侧意图声明**（`app/src/server/chat-tools.ts`）：chat 模型通过 `ask_vibe_trading` 的 **`depth="deep_team"` 参数**声明团队研判意图（可选 `swarmPreset` 点名团队），而**不是**把这个意图写成散文塞进 `query`。适用场景仍是两类：① 用户明确要求多视角/团队/委员会式研判；② 重大资金决策（具体金额的加仓/清仓/大类配置）且用户要求全面论证。laicai 服务端据此拼出固定措辞的 swarm 指令追加到 query（引擎侧协议不变），并把 `intent=deep_team` 下发给 router。
+- **预算档位的唯一真源是 router 的 `BUDGET_BY_INTENT`**（`standard`=900s / `deep_team`=7200s），租户档 `SWARM_TIMEOUT` env 由同一常量派生。此前这个 7200 被写在四个地方（laicai chat / laicai 作战室 / router env / 引擎默认值）各自漂移。laicai 灰度期仍显式发 `timeoutS`，而 router 让显式值优先——因此只回滚 laicai 就能立刻回到旧预算行为。
+- **散文正则只是兜底**：laicai 保留了 swarm 意图正则用于历史线程与用户自己写的散文，声明与嗅探不一致时打一条 `swarm_intent_diverged` 运营事件；分歧率达标后即可删除正则。
 - **两层等待的嵌套关系**（决定上一条是否真的可达）：工具自己的等待是 `cap_timeout(SWARM_TIMEOUT, reserve 90s, floor 60s)`；循环侧的写工具看门狗按 `run_swarm` 声明的 `timeout_seconds`（=`SWARM_TIMEOUT + 120s`）计算并自留 60s。**swarm 自留得更多，所以工具必然先于看门狗自收口。** 看门狗曾经按租户档工具超时（300s）计算，于是每次 swarm 在第 600 秒被丢弃、两小时档实际不可达——见 [HISTORY.md](HISTORY.md) 2026-08-29 条目。
 - 等待预算耗尽时 run **不取消、后台继续**（`wait_budget_exhausted`），工具返回 run_id 与部分结果；模型可据此如实汇报，或用 `run_swarm(run_id=…)` 继续等**同一个** run（不起新 run、不产生额外 worker token）。
 - **失败冷却（F3）**：同一 SwarmTool 实例内某 preset 失败后 **30 分钟**（`_FAILURE_COOLDOWN_SECONDS`）内再调同 preset 直接拒绝（`swarm_preset_cooldown`），并附上次失败 run 已完成 worker 的产物供打捞——systemic 上游故障重跑还是会死，代价是几十分钟。冷却只在工具真的返回过失败时装填，所以它同样依赖上面的嵌套关系成立。

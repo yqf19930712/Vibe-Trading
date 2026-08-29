@@ -6,8 +6,29 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Structured research-depth intent on `/ask` (cross-repo contract).** The
+  router now accepts `intent` (`standard` | `deep_team`) and `swarmPreset`, and
+  derives the wall-clock budget from a single `BUDGET_BY_INTENT` table. The
+  two-hour swarm budget used to be spelled out in four places that drifted
+  apart; the engine's `SWARM_TIMEOUT` env is now derived from the same constant.
+  An explicit `timeoutS` still wins, so callers can be rolled back on their own.
+  Both new fields are forwarded to the engine alongside `deadline_s`; engine
+  versions that don't know them ignore them.
+- **Tenant disk-usage exposure.** `GET /healthz` gains a `disk` section plus
+  per-tenant `disk_bytes` / `over_watermark`, and a new `GET /tenants/usage`
+  lists the biggest tenants (`du` cached 5 minutes, warn above 80% of the 4G
+  quota). Read-only by design — the retention sweeper is deliberately NOT part
+  of this change; see `TODO(retention)` in `router.py` for what has to be true
+  before deleting user data on a schedule.
+- Pure-logic tests for both of the above (`ops/cube-router/test_router_budget.py`).
 
 ### Changed
+- `POST /forget` is now actually reachable from laicai: its account-deletion
+  flow registers the uid before the user row disappears and calls this endpoint,
+  with a nightly retry and an ops-dashboard alert when it gives up. Previously
+  the endpoint existed but had zero callers, so a deleted account's long-term
+  memory, sessions, traces (full prompts) and uploaded statements stayed on the
+  engine host forever.
 
 ### Fixed
 

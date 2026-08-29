@@ -133,7 +133,11 @@ stateDiagram-v2
 | `vibeSessionId` | string? | 引擎会话 id；有值则续聊复用，缺省新建 |
 | `model` | string? | 内置模型覆盖（如 `claude-sonnet-4-6`），白名单正则校验 |
 | `llm` | object? | BYOK 覆盖：`{provider, model, apiKey, baseUrl}`，见 §5；与 `model` 互斥时以 `llm` 为准 |
-| `timeoutS` | int? | 单问超时，默认 900。router 会把「扣除排队/冷启后的剩余预算 − 10s 余量」作为 `deadline_s` 随消息下发给引擎，引擎据此在预算内提前收敛（见 §9） |
+| `intent` | string? | 研判深度：`standard`（缺省，15 分钟）\| `deep_team`（多智能体团队 swarm，2 小时）。**预算档位的唯一真源**是 router 的 `BUDGET_BY_INTENT`；非法值 400 |
+| `swarmPreset` | string? | `intent=deep_team` 时的团队 preset 名，原样转交引擎。**枚举真源是引擎的 `agent/src/swarm/presets/*.yaml`**，router 只做 `[a-z0-9_]{3,64}` 形状校验、不比对副本清单（副本过期会误拒引擎实际支持的 preset） |
+| `timeoutS` | int? | 单问超时的**显式覆盖，优先级高于 `intent`**。给出即照用；缺省时由 `intent` 推导。router 会把「扣除排队/冷启后的剩余预算 − 10s 余量」作为 `deadline_s` 随消息下发给引擎，引擎据此在预算内提前收敛（见 §9） |
+
+`intent` / `swarm_preset` 与 `deadline_s` 并列下发给引擎（`POST /sessions/<sid>/messages`）；不认识这两个字段的引擎版本会忽略它们，因此 router 可以先于引擎发布。
 
 响应：`application/x-ndjson`，每行一帧：
 
@@ -157,7 +161,9 @@ stateDiagram-v2
 
 ### 3.2 `POST /forget` — 租户注销
 
-`{"uid": "..."}` → 删除该租户沙箱（连同全部记忆/会话/上传）+ 清 state 行，幂等，返回 `{"ok": true}`。
+`{"uid": "..."}` → 删除该租户沙箱**与宿主机租户目录**（连同全部记忆/会话/trace/上传）+ 清 state 行，幂等，返回 `{"ok": true}`。
+
+**调用方**：laicai 的注销流程（`app/src/lib/auth.ts` 的 `deleteUser` 钩子）。laicai 在删 user 行**之前**把 uid 登记进 `engine_forget_jobs`（无外键，否则会被级联带走），删除后立即调一次本端点，失败由 23:30 的夜间任务重试、超 10 次在运营看板告警。**这是引擎侧数据生命周期的唯一出口**——域表的 cascade 只清得到 laicai 自己的库。
 
 ### 3.3 `GET /healthz`
 
@@ -168,9 +174,20 @@ Bearer 鉴权与其余端点一致（无豁免）。池状态之外含进程内 
   "instances": 2, "running": 1, "active": 0, "max_running": 3,
   "asks": {"asks_total": 6, "asks_ok": 3, "asks_timeout": 1, "asks_busy": 0,
            "asks_error": 2, "uptime_s": 15591, "p50_ms": 21276, "p95_ms": 580769, "window": 3},
-  "tenants": [ {"tk8":"a1b2c3d4","sandbox":"sbx-...","paused":false,"refcount":0,"idle_s":42} ]
+  "disk": {"data_root_bytes": 1288490188, "quota_bytes": 4294967296,
+           "watermark": 0.8, "tenants_total": 5, "over_watermark": 0},
+  "tenants": [ {"tk8":"a1b2c3d4","sandbox":"sbx-...","paused":false,"refcount":0,
+                "idle_s":42,"disk_bytes":734003200,"over_watermark":false} ]
 }
 ```
+
+`disk.*` 与每租户 `disk_bytes` 来自 `DATA_ROOT` 下各租户目录的实际字节数，**结果缓存 5 分钟**（healthz 会被轮询，逐次遍历数 GB 目录不可接受）。`tenants[]` 只列有活实例的租户，`disk.*` 的合计口径覆盖 `DATA_ROOT` 全部目录——被换出的租户仍占盘。
+
+### 3.3.1 `GET /tenants/usage?limit=20` — 租户用量 Top N
+
+Bearer 鉴权。返回 `{quota_bytes, watermark, data_root_bytes, tenants_total, over_watermark, tenants:[{tk8, disk_bytes, quota_bytes, pct, over_watermark}]}`，按占用降序。超水位（默认 80%，`VIBE_TENANT_WATERMARK`）的租户同时打 router warn 日志。
+
+**只读**：本端点与 `/healthz` 的 disk 段只**曝光**水位，不删任何数据。自动保留清扫（sessions/runs/uploads 按期淘汰）尚未实现——见 `router.py` 中 `TODO(retention)` 的落地前置条件（先积累两周真实用量再定保留窗；上线必须先跑 `--dry-run` 人工核对，且引擎侧 FTS 索引要同步清死行）。
 
 ### 3.4 只读 `/obs/*` — 租户遥测在线回读
 
@@ -227,7 +244,7 @@ flowchart LR
 | 项 | 值 | 说明 |
 |---|---|---|
 | 沙箱规格 | 2C / 2G（模板默认） | MicroVM 硬隔离，租户内 runaway 不外溢 |
-| writable layer | 4G | 租户全部落盘状态（记忆/会话/上传/runs）的容量上限 |
+| writable layer | 4G（`VIBE_TENANT_QUOTA_BYTES`） | 租户全部落盘状态（记忆/会话/trace/上传/runs）的容量上限。水位经 `/healthz` 的 `disk` 段与 `GET /tenants/usage` 曝光（`du` 缓存 5 分钟），超 80%（`VIBE_TENANT_WATERMARK`）打 warn。**目前只曝光不清扫**——自动保留策略见 §3.3.1 与 `router.py` 的 `TODO(retention)` |
 | RUNNING 沙箱上限 | `VIBE_MAX_INSTANCES`（默认 3；**生产现配 4**，配合 laicai 作战室四份专业报告并行，宿主已加 2G swap） | 8G 宿主机：OS + CubeSandbox 控制面 ≈2.5G，余量 ≈3 个 RUNNING；满则 pause LRU 空闲者，全忙 503 |
 | 并发 `/ask` | `VIBE_MAX_CONCURRENT_ACTIVE`（默认 2；**生产现配 4**） | 信号量排队 |
 | 空闲 pause | `VIBE_IDLE_TTL_S`（默认 20min） | pause 不占 CPU/内存调度，盘保留 |
