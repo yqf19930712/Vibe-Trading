@@ -18,6 +18,8 @@ class BaseTool(ABC):
         description: Tool description shown to the LLM.
         parameters: Parameter definition in JSON Schema format.
         repeatable: Whether the tool may be called more than once.
+        timeout_seconds: Optional per-call upper bound this tool declares for
+            itself (see below).
     """
 
     name: str = ""
@@ -25,6 +27,26 @@ class BaseTool(ABC):
     parameters: Dict[str, Any] = {}
     repeatable: bool = False
     is_readonly: bool = True
+    # The tool's own upper bound on a single call, in seconds.
+    # None = use the loop's global VIBE_TRADING_TOOL_TIMEOUT_SECONDS.
+    #
+    # This is NOT an exemption from the F2 write-tool watchdog: the loop still
+    # clamps whatever is declared here by the attempt's remaining budget
+    # (``cap_timeout``), so a hung tool can never outlive the caller's
+    # deadline. The declaration only RAISES the base of the 1x-warn / 2x-abandon
+    # window — ``_tool_timeout`` takes ``max(global, declared)``, so a tool can
+    # never quietly shorten its own window either.
+    #
+    # Declare it only when the tool's NORMAL runtime legitimately exceeds the
+    # tenant-wide limit (run_swarm: a multi-layer DAG of LLM workers that
+    # routinely runs for tens of minutes). A tool that declares a long timeout
+    # MUST also enforce a budget of its own and return partial results when it
+    # expires — otherwise the declaration just moves the unbounded wait from the
+    # loop into the tool.
+    #
+    # May be overridden as a property when the value depends on runtime config
+    # (see SwarmTool / AlphaBenchTool / MCPRemoteTool).
+    timeout_seconds: Optional[float] = None
 
     @classmethod
     def check_available(cls) -> bool:
@@ -120,7 +142,18 @@ class ToolRegistry:
         """Execute a tool and guarantee a valid JSON return value."""
         tool = self._tools.get(name)
         if not tool:
-            return json.dumps({"status": "error", "error": f"Tool '{name}' not found"}, ensure_ascii=False)
+            # List what IS available: a bare "not found" leaves the model to
+            # guess again from the same wrong memory (the same reason
+            # _resolve_preset spells out the preset roster on a bad name).
+            available = ", ".join(sorted(self._tools))
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": f"Tool '{name}' not found. Available tools: {available}",
+                    "available_tools": sorted(self._tools),
+                },
+                ensure_ascii=False,
+            )
         try:
             return tool.execute(**_coerce_params(tool.parameters, params))
         except Exception as exc:

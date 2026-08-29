@@ -123,14 +123,18 @@ def _build_agent(llm: Any, max_iter: int = 3, tmp_run_dir: Path | None = None) -
 def test_empty_model_response_returns_specific_reason(
     tmp_path: Path,
 ) -> None:
-    """Empty no-tool provider output is distinct from exhausting iterations."""
+    """Empty no-tool provider output is distinct from exhausting iterations.
+
+    V2: the first empty turn now buys one in-place retry (a nudge, same
+    trajectory), so the terminal reason lands on iteration 2 rather than 1.
+    """
     agent = _build_agent(_StubLLMNoFinal(), max_iter=3, tmp_run_dir=tmp_path / "run")
 
     result = agent.run(user_message="anything")
 
     assert result["status"] == "failed"
     assert result["reason"].startswith("empty_model_response")
-    assert "iteration 1" in result["reason"]
+    assert "iteration 2" in result["reason"]
     assert result["iterations"] >= 1
     assert result["max_iterations"] == 3
 
@@ -217,7 +221,8 @@ def test_session_service_renders_meaningful_error_from_result(tmp_path: Path) ->
 
     assert ui_error != "unknown"
     assert "empty_model_response" in ui_error
-    assert "iteration 1" in ui_error
+    # iteration 2: V2 spends one in-place retry on the first empty turn.
+    assert "iteration 2" in ui_error
 
 
 def test_usage_metadata_is_persisted_to_run_artifact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

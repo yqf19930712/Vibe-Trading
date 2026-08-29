@@ -22,8 +22,24 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
+class MemoryWriteError(RuntimeError):
+    """Raised when a memory entry cannot be persisted (full / read-only disk).
+
+    Every tenant volume has a hard size cap, and the failure mode past it used
+    to be an unhandled ``OSError`` from ``Path.write_text`` that propagated all
+    the way up and failed the attempt. Callers catch this and return a
+    structured tool error: losing one memory write must not lose the answer.
+    """
+
+
 MEMORY_BASE = Path.home() / ".vibe-trading" / "memory"
 MAX_INDEX_LINES = 200
+# V2 (P2-11): once the index gets this long the engine runs one consolidation
+# pass on its own at run end, instead of waiting for the model to notice the
+# F7① "index is full" warning and call consolidate_memory itself. Past
+# MAX_INDEX_LINES new entries stop appearing in the session-start snapshot
+# altogether, so the tidy-up has to happen BEFORE the cap, not at it.
+AUTO_CONSOLIDATE_INDEX_LINES = 180
 MAX_ENTRY_CHARS = 8000
 MAX_RESULTS = 5
 METADATA_WEIGHT = 2.0
@@ -372,6 +388,19 @@ class PersistentMemory:
         # is computed against the user-visible content length.
         clean_content = _truncate_body(_sanitize_body(content))
 
+        # V2 (P2-7): same-name-same-type used to overwrite silently, so one
+        # bad update destroyed the previous body for good — the Mem0 write-time
+        # UPDATE failure mode. The old body is now folded into the tail of the
+        # new file under the same merge marker ``consolidate()`` uses, which
+        # costs nothing and keeps the history visible.
+        previous_body = self._read_body(path)
+        if previous_body:
+            clean_content = _truncate_body(
+                clean_content
+                + f"\n\n---\n[superseded body, kept from the previous version of "
+                f"'{safe_name}']\n{previous_body}"
+            )
+
         # F7③: created timestamp always; source only when supplied. Readers
         # (_scan_entries) treat both as optional so legacy entries are fine.
         created_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -384,11 +413,40 @@ class PersistentMemory:
             f"{source_line}---\n\n"
             f"{clean_content}"
         )
-        path.write_text(frontmatter, encoding="utf-8")
-        self.last_add_indexed = self._update_index(
-            stripped_name, filename, description or stripped_name
-        )
+        # V2 (memory P1-3): a full tenant volume raised OSError straight out of
+        # here and killed the whole attempt. Writing memory is a nice-to-have;
+        # the caller turns this into a structured tool error instead.
+        try:
+            path.write_text(frontmatter, encoding="utf-8")
+        except OSError as exc:
+            logger.warning("memory write failed for %s: %s", path.name, exc)
+            raise MemoryWriteError(
+                f"memory store unavailable: {exc}"
+            ) from exc
+        try:
+            self.last_add_indexed = self._update_index(
+                stripped_name, filename, description or stripped_name
+            )
+        except OSError as exc:  # noqa: BLE001 - entry exists; index is derived
+            logger.warning("memory index update failed for %s: %s", path.name, exc)
+            self.last_add_indexed = False
         return path
+
+    def _read_body(self, path: Path) -> str:
+        """Return the body (frontmatter stripped) of an existing entry file.
+
+        Args:
+            path: Entry file path.
+
+        Returns:
+            The body text, or ``""`` when the file is absent or unreadable.
+        """
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        _, body = _parse_frontmatter(text)
+        return (body or "").strip()
 
     def remove(self, name: str) -> bool:
         """Remove a memory entry by name.
@@ -440,13 +498,38 @@ class PersistentMemory:
     @property
     def index_full(self) -> bool:
         """Whether the index has reached its line cap (new adds get dropped)."""
+        return self.index_line_count() >= MAX_INDEX_LINES
+
+    def index_line_count(self) -> int:
+        """Return the number of lines currently in the index.
+
+        Returns:
+            Line count, or 0 when the index does not exist or cannot be read.
+        """
         if not self._index_path.exists():
-            return False
+            return 0
         try:
-            lines = self._index_path.read_text(encoding="utf-8").split("\n")
+            return len(self._index_path.read_text(encoding="utf-8").split("\n"))
         except OSError:
-            return False
-        return len(lines) >= MAX_INDEX_LINES
+            return 0
+
+    def maybe_auto_consolidate(self) -> dict | None:
+        """Run one consolidation pass when the index is close to its cap (V2).
+
+        Called at run end, not per-write: consolidation rewrites entry files,
+        and doing that mid-run would churn the session-start snapshot the
+        system prompt froze. Failures are swallowed — tidying is best effort.
+
+        Returns:
+            The ``consolidate()`` stats dict when a pass ran, else None.
+        """
+        if self.index_line_count() < AUTO_CONSOLIDATE_INDEX_LINES:
+            return None
+        try:
+            return self.consolidate()
+        except OSError as exc:  # noqa: BLE001 - tidying must never fail a run
+            logger.warning("auto consolidation failed: %s", exc)
+            return None
 
     def consolidate(self) -> dict:
         """Deduplicate entries sharing a title and rebuild the index (F7⑤).

@@ -18,7 +18,7 @@ import time
 from typing import Any
 
 from src.agent.tools import BaseTool
-from src.security.scanner import with_security_warnings
+from src.security.scanner import with_security_warnings, wrap_external_content
 
 logger = logging.getLogger(__name__)
 
@@ -69,10 +69,15 @@ class WebSearchTool(BaseTool):
             return True
         except ImportError:
             return False
+    # Deliberately no engine roster here: ddgs 9.x removed the google/bing
+    # backends and the pool now rotates under "auto". A hard-coded list in the
+    # description is how the model ends up naming engines deleted two releases
+    # ago — and it has no way to pick one anyway (there is no engine parameter).
     description = (
-        "Search the web across free engines (DuckDuckGo, Google, Bing, Brave, "
-        "Mojeek, Yahoo). Returns top results with title, URL, and snippet. Use "
-        "this to find information, news, or URLs before reading them with read_url."
+        "Search the web across the free, no-key engines ddgs can reach — they are "
+        "rotated automatically, so a rate-limited engine falls through to the next. "
+        "Returns top results with title, URL, and snippet. Use this to find "
+        "information, news, or URLs before reading them with read_url."
     )
     parameters = {
         "type": "object",
@@ -173,17 +178,37 @@ class WebSearchTool(BaseTool):
                 payload,
                 fields=("results.*.title", "results.*.snippet"),
             )
+            # V2: snippets are attacker-controlled text (anyone can put a
+            # sentence on a page a search engine indexes). Declare each one as
+            # untrusted DATA rather than pasting it bare into the trajectory.
+            findings = payload.get("security_warnings")
+            for idx, item in enumerate(payload["results"]):
+                if not item.get("snippet"):
+                    continue
+                item["snippet"] = wrap_external_content(
+                    item["snippet"],
+                    source=item.get("url") or f"result {idx}",
+                    kind="search_result",
+                    findings=[
+                        f
+                        for f in (findings or [])
+                        if str(f.get("field", "")).startswith(f"results.{idx}.")
+                    ],
+                )
             return json.dumps(payload, ensure_ascii=False)
 
         return json.dumps(
             {
                 "status": "error",
                 "error": (
+                    # Only actions the MODEL can take belong here. The old text
+                    # told it to set VIBE_TRADING_SEARCH_BACKENDS (an operator
+                    # env var it cannot touch) and named google/bing, which
+                    # ddgs 9.x no longer has.
                     f"Web search failed after {_MAX_ATTEMPTS} attempts "
                     f"(backends: {backends if supports_backend else 'duckduckgo'}): {last_error}. "
                     "Free search engines rate-limit aggressively from cloud/shared IPs — "
-                    "retry shortly, set VIBE_TRADING_SEARCH_BACKENDS to a different engine "
-                    "list (e.g. 'google, bing'), or read a known URL directly with read_url."
+                    "retry shortly, or read a known URL directly with read_url."
                 ),
             },
             ensure_ascii=False,

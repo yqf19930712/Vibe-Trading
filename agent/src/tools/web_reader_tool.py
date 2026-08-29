@@ -12,7 +12,7 @@ import requests
 
 from src.agent.progress import emit_progress
 from src.agent.tools import BaseTool
-from src.security.scanner import with_security_warnings
+from src.security.scanner import with_security_warnings, wrap_external_content
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +136,16 @@ def read_url(url: str, no_cache: bool = False) -> str:
         if _CACHED_MARKER in resp.text:
             result["cached"] = True
         result = with_security_warnings(result, fields=("content",))
+        # V2: declare the page body as untrusted DATA, mirroring what the
+        # recalled-memories block already does for stored content. Without
+        # this the page text sat bare in the trajectory while the scanner's
+        # verdict lived in a JSON field the model reads last, if at all.
+        result["content"] = wrap_external_content(
+            result["content"],
+            source=target_url,
+            kind="web_page",
+            findings=result.get("security_warnings"),
+        )
         return json.dumps(result, ensure_ascii=False)
 
     except requests.Timeout:

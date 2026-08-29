@@ -63,3 +63,56 @@ class TestDangerousPatternAudit:
         result = json.loads(tool.execute(command="echo ok", run_dir=str(tmp_path)))
         assert result["status"] == "ok"
         assert "security_audit" not in result
+
+
+# --- V1: timeout is configurable, budget-aligned, and actionable ------------
+
+
+def test_bash_timeout_error_points_at_background_run(monkeypatch, tmp_path) -> None:
+    """The old message only said "timed out", so the model re-ran the same command."""
+    import subprocess
+
+    import src.tools.bash_tool as bash_mod
+
+    monkeypatch.setattr(bash_mod, "_DEFAULT_TIMEOUT", 0.05)
+
+    def _boom(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="sleep 999", timeout=kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(bash_mod.subprocess, "run", _boom)
+
+    payload = json.loads(
+        bash_mod.BashTool().execute(command="sleep 999", run_dir=str(tmp_path))
+    )
+
+    assert payload["status"] == "error"
+    assert payload["error_code"] == "bash_timeout"
+    assert "background_run" in payload["error"]
+    assert "check_background" in payload["error"]
+
+
+def test_bash_timeout_is_clamped_by_the_attempt_budget(monkeypatch) -> None:
+    """bash must give up before the loop's watchdog abandons it."""
+    import time
+
+    import src.tools.bash_tool as bash_mod
+    from src.core import budget
+
+    monkeypatch.setattr(bash_mod, "_DEFAULT_TIMEOUT", 120.0)
+    monkeypatch.setattr(bash_mod, "_TIMEOUT_RESERVE_S", 5.0)
+    previous = budget.get_deadline()
+    budget.bind_deadline(time.monotonic() + 30.0)
+    try:
+        effective = bash_mod._effective_timeout()
+    finally:
+        budget.bind_deadline(previous)
+
+    assert 20.0 < effective <= 25.0, effective
+
+
+def test_bash_description_explains_the_background_run_split() -> None:
+    import src.tools.bash_tool as bash_mod
+
+    description = bash_mod.BashTool.description
+    assert "background_run" in description
+    assert "killed after" in description

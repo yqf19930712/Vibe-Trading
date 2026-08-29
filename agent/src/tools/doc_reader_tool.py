@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 from src.agent.progress import emit_progress
 from src.agent.tools import BaseTool
-from src.security.scanner import with_security_warnings
+from src.security.scanner import with_security_warnings, wrap_external_content
 from src.tools.path_utils import safe_document_path
 
 _MAX_CHARS = 15000
@@ -73,6 +73,15 @@ def _envelope(path: Path, fmt: str, text: str, **extra: Any) -> str:
     }
     payload.update(extra)
     payload = with_security_warnings(payload, fields=("text",))
+    # V2: uploaded statements / PDFs are the storage-injection vector named in
+    # the engine's own threat model (docs/HISTORY.md) — declare them as
+    # untrusted DATA the same way recalled memories are declared.
+    payload["text"] = wrap_external_content(
+        payload["text"],
+        source=path.name,
+        kind="document",
+        findings=payload.get("security_warnings"),
+    )
     return json.dumps(payload, ensure_ascii=False)
 
 

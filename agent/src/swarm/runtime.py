@@ -20,7 +20,7 @@ from concurrent.futures import (
 )
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from src.config.schema import AgentConfig
 from src.swarm import grounding
@@ -45,6 +45,64 @@ from src.tools.redaction import redact_internal_paths
 from src.swarm.worker import run_worker
 
 logger = logging.getLogger(__name__)
+
+# Worker outcomes worth another attempt. ``timeout`` / ``token_limit`` are
+# deliberately excluded — a re-run hits the same wall. ``incomplete`` (V2) is
+# the deliverable-contract failure (no report.md written, or a data role that
+# never called a data tool): exactly the class where one more attempt usually
+# succeeds, and what the presets' ``max_retries`` budget was meant for. Before
+# V2 only ``failed`` retried, so a contract miss silently blocked every
+# downstream task that depended on it.
+_RETRYABLE_WORKER_STATUSES = frozenset({"failed", "incomplete"})
+
+# Cap on a single upstream report injected into a downstream worker's system
+# prompt (V2). ``task_summaries`` holds the full report.md text, and an
+# editor/PM role with several upstreams used to concatenate all of them with no
+# budget at all. Workers have ``read_file``, so the pointer is enough.
+UPSTREAM_SUMMARY_MAX_CHARS = 8_000
+_UPSTREAM_HEAD_CHARS = 6_000
+_UPSTREAM_TAIL_CHARS = 1_500
+
+
+def _clip_upstream_summary(
+    summary: str,
+    *,
+    run_dir: Path,
+    source_task_id: str,
+    task_store: Any,
+) -> str:
+    """Cap one upstream report before it enters a downstream system prompt.
+
+    Args:
+        summary: Full upstream report text.
+        run_dir: Swarm run directory.
+        source_task_id: Task id the summary came from.
+        task_store: Task store used to resolve the producing agent id.
+
+    Returns:
+        The summary unchanged when within budget, otherwise head + tail plus a
+        pointer to the full report on disk.
+    """
+    if not summary or len(summary) <= UPSTREAM_SUMMARY_MAX_CHARS:
+        return summary
+    agent_id = ""
+    try:
+        agent_id = getattr(task_store.load_task(source_task_id), "agent_id", "") or ""
+    except Exception:  # noqa: BLE001 - a missing task only costs us the path
+        agent_id = ""
+    pointer = (
+        str(run_dir / "artifacts" / agent_id / "report.md")
+        if agent_id
+        else "(report path unavailable)"
+    )
+    omitted = len(summary) - _UPSTREAM_HEAD_CHARS - _UPSTREAM_TAIL_CHARS
+    return (
+        f"{summary[:_UPSTREAM_HEAD_CHARS]}\n\n"
+        f"...[{omitted} chars omitted — this upstream report is a PREVIEW. "
+        f"Read the full text with read_file(path=\"{pointer}\") before citing "
+        "numbers from the omitted part.]...\n\n"
+        f"{summary[-_UPSTREAM_TAIL_CHARS:]}"
+    )
 
 
 class SwarmRuntime:
@@ -586,11 +644,23 @@ class SwarmRuntime:
                     self._make_event("task_started", agent_id=agent_spec.id, task_id=tid),
                 )
 
-                # Build upstream summaries from input_from mapping
+                # Build upstream summaries from input_from mapping.
+                # V2: each upstream report is capped — the value here is the
+                # full report.md text, and a multi-upstream role concatenated
+                # every one of them into its system prompt unbudgeted. Over the
+                # cap the worker gets head + tail and the artifact path to
+                # read_file (book §2.7.6: return conclusions plus a pointer,
+                # not the whole document).
                 upstream: dict[str, str] = {}
                 for context_key, source_task_id in task.input_from.items():
-                    if source_task_id in task_summaries:
-                        upstream[context_key] = task_summaries[source_task_id]
+                    if source_task_id not in task_summaries:
+                        continue
+                    upstream[context_key] = _clip_upstream_summary(
+                        task_summaries[source_task_id],
+                        run_dir=run_dir,
+                        source_task_id=source_task_id,
+                        task_store=task_store,
+                    )
 
                 # Fresh context copy per submit (a Context can't be entered
                 # concurrently) so worker threads inherit the attempt's
@@ -742,8 +812,8 @@ class SwarmRuntime:
             cumulative_llm_ms += result.llm_ms
             cumulative_tool_ms += result.tool_ms
 
-            if result.status != "failed":
-                # Success (or timeout/token_limit/completed) — no more retries
+            if result.status not in _RETRYABLE_WORKER_STATUSES:
+                # Success (or timeout/token_limit) — no more retries
                 result = result.model_copy(
                     update={
                         "input_tokens": cumulative_input_tokens,

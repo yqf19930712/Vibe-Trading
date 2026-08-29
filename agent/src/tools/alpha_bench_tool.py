@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +49,23 @@ _SP500_CONSTITUENT_SOURCE_DATE = "2026-05-17"
 # Concurrent Tushare ``pro.daily`` fetches when building CSI300. Free tier
 # allows ~200 calls/min; 4 workers stays well under that with a 300-name list.
 _CSI300_FETCH_WORKERS = 4
+
+# V1: alpha_bench's own overall budget. Fetching ~300 (csi300) or ~500 (sp500)
+# names at 4 workers with up to 3 backoff retries each, then computing IC for
+# every alpha in a zoo, runs for many minutes on a cold cache — a normal
+# runtime that comfortably exceeds the tenant-wide tool timeout, which is why
+# the tool declares ``timeout_seconds`` to the loop. But a declaration alone
+# would merely move the unbounded wait from the loop into the tool, so the
+# bench ALSO clamps itself here: it stops starting new alphas once the budget
+# is spent and returns the partial IC table it has (``budget_exhausted``),
+# instead of running until something else kills it.
+_BENCH_BUDGET_S = float(os.getenv("VIBE_ALPHA_BENCH_BUDGET_S", "1800"))
+# Held back so the report still gets rendered and written after the cut-off.
+_BENCH_RESERVE_S = 90.0
+_BENCH_FLOOR_S = 60.0
+# Same dead-heat margin rationale as SwarmTool: the loop's watchdog must sit
+# strictly outside the tool's own budget so it only fires on a real hang.
+_BENCH_LOOP_WATCHDOG_MARGIN_S = 120.0
 
 
 # ---------------------------------------------------------------------------
@@ -688,6 +706,19 @@ def _default_output_dir() -> Path:
 
 def run_alpha_bench(**kwargs: Any) -> dict[str, Any]:
     """Run the bench and return a parsed envelope (dict, not JSON string)."""
+    # V1: own wall-clock budget, additionally clamped by the attempt's
+    # remaining budget so the bench can never outlive its caller.
+    from src.core.budget import cap_timeout
+
+    t_budget = time.monotonic()
+    budget_s = cap_timeout(
+        _BENCH_BUDGET_S, reserve_s=_BENCH_RESERVE_S, floor_s=_BENCH_FLOOR_S
+    )
+
+    def _budget_left() -> float:
+        """Seconds left in the bench's own budget (never negative)."""
+        return max(0.0, budget_s - (time.monotonic() - t_budget))
+
     universe = kwargs.get("universe")
     period = kwargs.get("period")
     if not universe or not isinstance(universe, str):
@@ -755,7 +786,19 @@ def run_alpha_bench(**kwargs: Any) -> dict[str, Any]:
 
     results: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
-    for aid in alpha_ids:
+    not_run: list[str] = []
+    for idx, aid in enumerate(alpha_ids):
+        # V1: stop STARTING alphas once the budget is spent. The reserve keeps
+        # enough time to render and write the report, so the caller gets the
+        # partial IC table instead of nothing.
+        if _budget_left() <= 0.0:
+            not_run = list(alpha_ids[idx:])
+            logger.warning(
+                "alpha_bench: budget of %.0fs exhausted after %d/%d alphas; "
+                "reporting partial results",
+                budget_s, idx, len(alpha_ids),
+            )
+            break
         try:
             results.append(_bench_one_alpha(registry, aid, panel, return_df))
         except (SkipAlpha, RegistryError, RuntimeError, KeyError, ValueError) as exc:
@@ -788,13 +831,24 @@ def run_alpha_bench(**kwargs: Any) -> dict[str, Any]:
     except OSError as exc:
         return {"status": "error", "error": f"failed to write report: {exc}"}
 
-    return {
+    envelope: dict[str, Any] = {
         "status": "ok",
         "report_path": str(report_path),
         "n_alphas_tested": len(results),
         "n_skipped": len(failures),
         "top": top,
     }
+    if not_run:
+        envelope["budget_exhausted"] = True
+        envelope["n_not_run"] = len(not_run)
+        envelope["not_run"] = not_run[:50]
+        envelope["message"] = (
+            f"Bench budget ({budget_s:.0f}s) ran out after {len(results)} alphas; "
+            f"{len(not_run)} were never started. The IC table above is PARTIAL — "
+            "say so, and narrow the zoo/universe or bench the remainder in a "
+            "follow-up call rather than treating this as the full ranking."
+        )
+    return envelope
 
 
 class AlphaBenchTool(BaseTool):
@@ -839,6 +893,21 @@ class AlphaBenchTool(BaseTool):
     }
     repeatable = True
     is_readonly = False
+
+    @property
+    def timeout_seconds(self) -> float:
+        """Loop-side watchdog bound for alpha_bench (V1).
+
+        A cold csi300/sp500 bench legitimately runs for many minutes, well past
+        the tenant-wide tool timeout, so the loop's 1×/2× write-tool window
+        would abandon a perfectly healthy run. Safe to declare only because
+        ``run_alpha_bench`` enforces ``_BENCH_BUDGET_S`` itself and returns the
+        partial IC table when it expires.
+
+        Returns:
+            The bench budget plus the dead-heat margin, in seconds.
+        """
+        return _BENCH_BUDGET_S + _BENCH_LOOP_WATCHDOG_MARGIN_S
 
     def execute(self, **kwargs: Any) -> str:
         envelope = run_alpha_bench(**kwargs)

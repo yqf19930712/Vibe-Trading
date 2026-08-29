@@ -94,6 +94,7 @@ class FetchStatsCollector:
         tool_ms: Optional[int] = None,
         input_tokens: Optional[int] = None,
         output_tokens: Optional[int] = None,
+        resumed: bool = False,
     ) -> None:
         with self._lock:
             if len(self._swarm_runs) < 20:  # bound for pathological loops
@@ -117,6 +118,11 @@ class FetchStatsCollector:
                     entry["input_tokens"] = max(0, int(input_tokens))
                 if output_tokens is not None:
                     entry["output_tokens"] = max(0, int(output_tokens))
+                if resumed:
+                    # V1: a run_id resume waits on an ALREADY-RUNNING run —
+                    # without this flag the ops tab would read two entries for
+                    # one run as two separate swarms.
+                    entry["resumed"] = True
                 self._swarm_runs.append(entry)
 
     def snapshot(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:

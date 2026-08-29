@@ -7,7 +7,7 @@ from typing import Any
 
 from src.agent.progress import emit_progress
 from src.agent.tools import BaseTool
-from src.memory.persistent import MAX_INDEX_LINES, PersistentMemory
+from src.memory.persistent import MAX_INDEX_LINES, MemoryWriteError, PersistentMemory
 
 
 class RememberTool(BaseTool):
@@ -28,7 +28,11 @@ class RememberTool(BaseTool):
         "anything already in the run's artifacts. Saving with an existing "
         "title of the SAME memory_type overwrites that entry (same title with "
         "a different type creates a parallel entry — run consolidate_memory "
-        "to merge those). The index tops out at "
+        "to merge those; the superseded body is folded into the tail of the "
+        "new entry so nothing is lost). When an entry relates to memories you "
+        "already have, end its content with a 'Related' section linking at "
+        "least 2 of them by title — isolated append-only notes decay into "
+        "disconnected islands and stop being findable. The index tops out at "
         f"{MAX_INDEX_LINES} lines; past that, new entries are stored but "
         "no longer appear in the session-start snapshot — consolidate or "
         "forget stale entries when warned."
@@ -105,9 +109,29 @@ class RememberTool(BaseTool):
             return json.dumps({"status": "error", "error": "title and content required"})
         memory_type = kwargs.get("memory_type", "project")
         source = kwargs.get("source", "") or ""
-        path = self._memory.add(
-            title, content, memory_type, description=title, source=source
-        )
+        try:
+            path = self._memory.add(
+                title, content, memory_type, description=title, source=source
+            )
+        except MemoryWriteError as exc:
+            # V2: a full tenant volume used to raise OSError straight out of
+            # add() and take the whole attempt down with it. Losing one memory
+            # write must not lose the answer, so it becomes a structured tool
+            # error the model can route around.
+            emit_progress(stage="memory_write_failed", message=str(exc))
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error_code": "memory_write_failed",
+                    "error": str(exc),
+                    "message": (
+                        "The memory could not be saved (storage unavailable). "
+                        "Continue with the task and put this fact in your "
+                        "answer instead — do not retry the same save."
+                    ),
+                },
+                ensure_ascii=False,
+            )
         payload: dict[str, Any] = {
             "status": "ok",
             "message": f"Saved: {title}",

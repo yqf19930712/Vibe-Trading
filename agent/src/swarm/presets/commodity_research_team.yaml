@@ -106,17 +106,17 @@ agents:
 tasks:
   - id: task-supply-research
     agent_id: supply_analyst
-    prompt_template: "Conduct a comprehensive supply-side analysis of {commodity}: production landscape, inventory cycle, capacity utilization, OPEC policy or mine output, supply disruption risks, and cost curve. Output a supply tightness score and inventory cycle assessment to inform a {horizon} investment strategy."
+    prompt_template: "Conduct a comprehensive supply-side analysis of {commodity}: production landscape, inventory cycle, capacity utilization, OPEC policy or mine output, supply disruption risks, and cost curve. Output a supply tightness score and inventory cycle assessment to inform a {horizon} investment strategy. Original user request (authoritative — if it names a different subject or angle than the variables above, follow the request): {goal}"
     depends_on: []
 
   - id: task-demand-research
     agent_id: demand_analyst
-    prompt_template: "Conduct a comprehensive demand-side analysis of {commodity}: downstream demand structure, leading macro indicators, China demand tracking, seasonal patterns, and structural energy-transition demand. Output a demand strength score and seasonality calendar to inform a {horizon} investment strategy."
+    prompt_template: "Conduct a comprehensive demand-side analysis of {commodity}: downstream demand structure, leading macro indicators, China demand tracking, seasonal patterns, and structural energy-transition demand. Output a demand strength score and seasonality calendar to inform a {horizon} investment strategy. Original user request (authoritative — if it names a different subject or angle than the variables above, follow the request): {goal}"
     depends_on: []
 
   - id: task-cycle-strategy
     agent_id: cycle_strategist
-    prompt_template: "Synthesize the supply and demand research to construct a supply-demand balance sheet for {commodity}, identify the commodity cycle phase, overlay seasonal timing, and develop a complete cycle investment strategy for a {horizon} horizon. Output investment recommendations, price range forecasts, and optimal entry windows."
+    prompt_template: "Synthesize the supply and demand research to construct a supply-demand balance sheet for {commodity}, identify the commodity cycle phase, overlay seasonal timing, and develop a complete cycle investment strategy for a {horizon} horizon. Output investment recommendations, price range forecasts, and optimal entry windows. Original user request (authoritative — if it names a different subject or angle than the variables above, follow the request): {goal}"
     depends_on: [task-supply-research, task-demand-research]
     input_from:
       supply_analysis: task-supply-research
@@ -128,4 +128,7 @@ variables:
     required: true
   - name: horizon
     description: "Investment horizon, e.g.: 1 month / 3 months / 6 months / 1 year"
+    required: true
+  - name: goal
+    description: "The user's original request verbatim, so workers see the actual ask when the commodity could not be identified from it"
     required: true

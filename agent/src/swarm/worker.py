@@ -423,12 +423,31 @@ def run_worker(
     # cycle): threshold-triggered, token-budget retention, protected tool
     # names. Same placeholder semantics — a bare "[cleared]" once made a
     # model retract real fetched numbers as hallucinations.
-    from src.agent.loop import _microcompact
+    #
+    # V2 also borrows the loop's tool watchdog (``invoke_tool_guarded``): the
+    # worker used to call ``registry.execute`` inline, so a tool hanging inside
+    # an iteration blocked forever — the worker only checks its own deadline at
+    # iteration boundaries, and the layer deadline in runtime.py then needs
+    # ``layer_budget + 60s`` to notice.
+    from src.agent.loop import (
+        _microcompact,
+        invoke_tool_guarded,
+        tool_is_readonly,
+        tool_timeout_for,
+    )
+    from src.agent.tool_result_store import prepare_for_context
+
+    # Layer 1 hysteresis state, owned by this worker (see loop._microcompact).
+    microcompact_state: dict[str, Any] = {}
 
     for iteration in range(max_iterations):
         # Microcompact: prune old tool results only when the context estimate
         # crosses the worker's own token budget threshold.
-        _microcompact(messages, token_threshold=_MAX_TOKEN_ESTIMATE)
+        _microcompact(
+            messages,
+            token_threshold=_MAX_TOKEN_ESTIMATE,
+            state=microcompact_state,
+        )
 
         # Check timeout
         elapsed = time.monotonic() - t0
@@ -673,38 +692,71 @@ def run_worker(
             tc_start = time.monotonic()
             args = {**tc.arguments, "run_dir": str(artifact_dir)}
 
-            # Wrap tool execution in a heartbeat so the events.jsonl tail has a
-            # fresh timestamp every few seconds. The stale-run reaper relies on
-            # this signal to tell a hung tool call apart from a dead host; the
-            # CLI dashboard / SSE clients also get live "still working" ticks.
-            def _on_heartbeat(payload: dict) -> None:
+            # V2: the guard supplies the heartbeat (the events.jsonl tail keeps
+            # a fresh timestamp so the stale-run reaper can tell a hung tool
+            # apart from a dead host), the hard per-tool timeout, and the
+            # budget clamp — the same code path the main loop uses.
+            def _guard_emit(event_type: str, payload: dict) -> None:
+                if event_type == "tool_heartbeat":
+                    _emit(
+                        event_callback,
+                        "task_heartbeat",
+                        agent_id,
+                        task_id,
+                        {**payload, "iteration": iteration, "phase": "tool"},
+                    )
+                    return
                 _emit(
                     event_callback,
-                    "task_heartbeat",
+                    event_type,
                     agent_id,
                     task_id,
-                    {**payload, "iteration": iteration, "phase": "tool"},
+                    {**payload, "iteration": iteration},
                 )
 
-            with HeartbeatTimer(
-                tool_name=tc.name,
-                interval=_HEARTBEAT_INTERVAL_S,
-                emit=_on_heartbeat,
-            ):
-                result = registry.execute(tc.name, args)
-            if tc.name != "load_skill" and not _is_error_result(result):
+            # Never let one tool outlive what is left of the worker's own
+            # deadline; cap_timeout inside the guard additionally clamps to
+            # the attempt budget, so the nesting stays "inner <= outer".
+            tool_timeout = tool_timeout_for(registry, tc.name)
+            worker_remaining = max(1.0, timeout - (time.monotonic() - t0))
+            if tool_timeout is None:
+                tool_timeout = worker_remaining
+            else:
+                tool_timeout = min(tool_timeout, worker_remaining)
+            result, tool_elapsed_ms = invoke_tool_guarded(
+                registry,
+                tc.name,
+                args,
+                readonly=tool_is_readonly(registry, tc.name),
+                timeout=tool_timeout,
+                emit=_guard_emit,
+            )
+            is_error = _is_error_result(result)
+            if tc.name != "load_skill" and not is_error:
                 data_tool_calls += 1
             tc_elapsed = time.monotonic() - tc_start
             total_tool_ms += int(tc_elapsed * 1000)
             _emit(
                 event_callback, "tool_result", agent_id, task_id,
+                # V2: was hardcoded "ok", so the swarm observability panel
+                # reported a 0% worker tool error rate no matter what.
                 {"tool": tc.name, "elapsed_ms": int(tc_elapsed * 1000),
-                 "status": "ok", "iteration": iteration,
+                 "status": "error" if is_error else "ok", "iteration": iteration,
                   "result_preview": _preview_tool_result(result),
                  **mcp_meta},
             )
+            # V2: oversized results are written to the worker's artifact dir
+            # and replaced by an explicit preview + on-disk pointer instead of
+            # a silent [:10_000] cut (the worker has read_file).
+            payload, _offload_failed = prepare_for_context(
+                result,
+                base_dir=artifact_dir,
+                iteration=iteration,
+                tool_name=tc.name,
+                call_id=getattr(tc, "id", "") or "",
+            )
             messages.append(
-                ContextBuilder.format_tool_result(tc.id, tc.name, result[:10_000])
+                ContextBuilder.format_tool_result(tc.id, tc.name, payload)
             )
 
     # Hit iteration limit — use last meaningful content as summary

@@ -29,8 +29,18 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from src.agent.context import ContextBuilder
+from src.agent.context_policy import (
+    CLEARED_PREFIX,
+    HANDOFF_PREFIX,
+    PROTECTED_TOOLS,
+    STATUS_PREFIX,
+    collapse_rule,
+    first_user_index,
+    is_prunable_by_microcompact,
+)
 from src.agent.memory import WorkspaceMemory
 from src.agent.progress import HeartbeatTimer, ProgressEvent, _set_emitter
+from src.agent.tool_result_store import TOOL_RESULT_LIMIT, prepare_for_context
 from src.agent.tools import ToolRegistry
 from src.agent.trace import TraceWriter
 from src.agent.verify import verify_run
@@ -42,6 +52,7 @@ from src.goal.context import (
     goal_progress_tuple,
 )
 from src.providers.chat import ChatLLM, ProviderStreamError
+from src.session import handoff
 from src.tools.background_tools import get_background_manager
 from src.tools.redaction import redact_payload
 from src.core import budget as _budget
@@ -63,6 +74,18 @@ TOKEN_THRESHOLD = int(os.getenv("TOKEN_THRESHOLD", "40000"))
 # budget instead of a fixed count.
 MICROCOMPACT_TRIGGER_RATIO = 0.5   # prune only when > TOKEN_THRESHOLD * ratio
 MICROCOMPACT_KEEP_BUDGET_RATIO = 0.25  # keep newest tool results up to this budget
+# V2 hysteresis. With a single trigger line, every iteration past it recomputed
+# the keep set and the newest results pushed one or two older ones out of the
+# budget — so the middle of the trajectory changed EVERY turn and the provider
+# prompt cache rebuilt from that diff point each time (batch E fixed the
+# unconditional per-turn prune, but reintroduced a slow one above the line).
+# Now: crossing the trigger arms the layer and cuts once, deeper; the layer
+# stays armed (still cutting to the deep water mark) until the estimate falls
+# back below the release line, at which point the trajectory is left alone for
+# many turns and the cache stays hot. Book §2.7.3 "compact in batches near the
+# threshold, not every turn".
+MICROCOMPACT_RELEASE_RATIO = 0.35  # disarm once the estimate falls back here
+MICROCOMPACT_ARMED_KEEP_RATIO = 0.15  # deeper cut while armed
 KEEP_RECENT = 3  # hard floor: newest N tool results are always kept intact
 # Tool results that are never pruned by microcompact. Rationale: these carry
 # the run's grounding data or its key deliverables — re-fetching them is
@@ -71,15 +94,14 @@ KEEP_RECENT = 3  # hard floor: newest N tool results are always kept intact
 # the anti-hallucination grounding (get_market_data / get_realtime_quotes are
 # the live-price sources every cited number must trace back to). Layer 2/3
 # can still fold/summarize them when the context truly overflows.
-MICROCOMPACT_PROTECTED_TOOLS = frozenset({
-    "backtest",
-    "factor_analysis",
-    "options_pricing",
-    "get_market_data",
-    "get_realtime_quotes",
-    "run_swarm",
-})
-TOOL_RESULT_LIMIT = 10_000
+#
+# V2: the set itself now lives in ``src.agent.context_policy`` so Layer 2 obeys
+# it too (it used to fold the middle out of exactly these results). This name
+# is kept as an alias for existing call sites and tests.
+MICROCOMPACT_PROTECTED_TOOLS = PROTECTED_TOOLS
+# Re-exported for callers that knew this constant as a loop-module name before
+# V2 moved it (and the offload path that enforces it) into tool_result_store.
+__all_reexports__ = ("TOOL_RESULT_LIMIT",)
 # F1 (batch F): successful results from these tools are kept (raw) for the
 # zero-LLM finalization verification — the final answer's price claims are
 # cross-checked against what the run actually fetched (see src/agent/verify.py).
@@ -103,12 +125,47 @@ TOOL_TIMEOUT_SECONDS = float(os.getenv("VIBE_TRADING_TOOL_TIMEOUT_SECONDS", "180
 # a structured timeout error to the model, and discards the late result via the
 # same queue mechanism the readonly path uses (the worker thread may still
 # finish its side effect in the background — that is announced in the error).
+#
+# V1: the base of that 1×/2× window is per-tool (``_tool_timeout``), not the
+# tenant-wide constant. Pinning it to TOOL_TIMEOUT_SECONDS made the watchdog
+# fire at 600s on a run_swarm whose own wait budget is 7200s, so the two-hour
+# swarm tier was unreachable and the ``wait_budget_exhausted`` salvage path
+# (which is what carries the run_id back) never executed.
 WRITE_TOOL_TIMEOUT_FACTOR = 2.0
 # Batch 3: when an attempt deadline is bound, force the final text answer once
 # less than this many seconds (or ~1.2 avg iterations) remain — a partial
 # answer beats the caller timing out on nothing.
 FINALIZE_RESERVE_S = float(os.getenv("VIBE_FINALIZE_RESERVE_S", "60"))
+# V1: seconds held back when clamping a tool timeout to the attempt budget.
+# Keep at least as much back as the forced-finalize path needs — the literal
+# 45.0 used before was 15s SHORT of FINALIZE_RESERVE_S's default, so abandoning
+# a tool could leave the loop with less time than the forced-finalize path
+# requires and the "a partial answer beats a timeout" guarantee became nominal.
+_TOOL_CAP_RESERVE_S = max(45.0, FINALIZE_RESERVE_S)
+# Minimum window a tool gets even on a nearly-spent budget, so a late call
+# still gets one quick shot instead of an instant failure (batch 3 semantics,
+# unchanged). Promoted from call-site literals to named constants in V1 so the
+# nesting/clamp regressions can scale them, and so the overshoot they permit
+# (up to floor + grace floor past the deadline) is visible in one place.
+_TOOL_CAP_FLOOR_S = 10.0
+_TOOL_GRACE_FLOOR_S = 5.0
 GOAL_MAX_CONTINUATIONS = int(os.getenv("VIBE_TRADING_GOAL_MAX_CONTINUATIONS", "3"))
+# V2: consecutive failures of the SAME (tool, args) pair before the call is
+# refused outright. Keyed identically to the duplicate guard, which only ever
+# registered successes — so a dead upstream could burn 40+ iterations of LLM
+# spend before max_iterations stopped it.
+TOOL_CIRCUIT_FAILURE_LIMIT = max(
+    1, int(os.getenv("VIBE_TOOL_CIRCUIT_FAILURE_LIMIT", "3"))
+)
+# V2: in-place retries for a stream that SUCCEEDS but returns neither text nor
+# tool calls (relay truncation, upstream degraded empty turn). The transport
+# layer already retries; this degenerate provider response used to fail a
+# possibly hour-long attempt without a single retry.
+EMPTY_RESPONSE_RETRIES = max(0, int(os.getenv("VIBE_EMPTY_RESPONSE_RETRIES", "1")))
+_EMPTY_RESPONSE_NUDGE = (
+    "[SYSTEM] Your previous turn returned no content and no tool calls. "
+    "Respond now: either call a tool, or write your answer as text."
+)
 LLM_USAGE_ARTIFACT = "llm_usage.json"
 
 # Layer 2: Context collapse thresholds
@@ -120,6 +177,13 @@ COLLAPSE_TAIL = 500
 
 # Layer 3: Token-budget tail protection
 TAIL_TOKEN_BUDGET = 20_000
+# Layer 3 summary INPUT budget (V2). The old ``json.dumps(head)[:80000]`` cut
+# from the tail, i.e. it discarded the newest and densest turns in the head —
+# and 80k ASCII chars is only ~20k tokens, so an English-heavy session hit it
+# almost every time. Now the input is filled newest-first against a token
+# budget and the OLDEST turns are the ones dropped (they are already covered
+# by the previous summary and by the full transcript on disk).
+SUMMARY_INPUT_TOKEN_BUDGET = int(TOKEN_THRESHOLD * 0.5)
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +322,10 @@ def estimate_tokens(messages: list) -> int:
 # name-level duplicate guard once dead-locked an attempt into retracting
 # REAL numbers as hallucinations (dea1222743ef, 2026-08-25: result pruned,
 # every re-fetch refused with "already succeeded").
-_CLEARED_PREFIX = "[cleared"
+# Aliased from context_policy (the shared marker registry) so the duplicate
+# guard's "was this result pruned?" test and Layer 2's skip rule can never
+# disagree about what a cleared placeholder looks like.
+_CLEARED_PREFIX = CLEARED_PREFIX
 _CLEARED_PLACEHOLDER = (
     "[cleared — this old tool result was pruned to keep the context small. "
     "The call DID succeed earlier; if you need the data again, re-call the "
@@ -275,33 +342,60 @@ def _tool_call_key(name: str, arguments: Any) -> str:
     return f"{name}:{hashlib.sha1(args_repr.encode('utf-8', 'replace')).hexdigest()}"
 
 
-def _microcompact(messages: list, token_threshold: int = TOKEN_THRESHOLD) -> None:
+def _microcompact(
+    messages: list,
+    token_threshold: int = TOKEN_THRESHOLD,
+    state: dict | None = None,
+) -> None:
     """Layer 1: prune old tool results — threshold-triggered, token-budget keep.
 
     Trigger: only runs when the estimated context exceeds
     ``token_threshold * MICROCOMPACT_TRIGGER_RATIO``; below that the trajectory
     is left byte-identical so the provider prompt cache stays warm.
 
+    Hysteresis (V2): crossing the trigger *arms* the layer, which then cuts to
+    the deeper ``MICROCOMPACT_ARMED_KEEP_RATIO`` water mark and stays armed
+    until the estimate falls back under ``MICROCOMPACT_RELEASE_RATIO``. One
+    deep cut every so often replaces a shallow cut every single turn, which is
+    what kept invalidating the provider cache mid-trajectory.
+
     Retention: walks tool results newest→oldest, keeping them intact until the
-    accumulated estimate reaches ``token_threshold * MICROCOMPACT_KEEP_BUDGET_RATIO``
-    (and always at least the newest ``KEEP_RECENT``, matching the old floor).
-    Older results are replaced with the informative cleared placeholder —
-    except results from ``MICROCOMPACT_PROTECTED_TOOLS`` (grounding data and
-    expensive key deliverables), which are never pruned here.
+    accumulated estimate reaches the keep budget (and always at least the
+    newest ``KEEP_RECENT``, matching the old floor). Older results are replaced
+    with the informative cleared placeholder — except results from
+    ``MICROCOMPACT_PROTECTED_TOOLS`` (grounding data and expensive key
+    deliverables), which are never pruned here.
 
     Args:
         messages: Message list (mutated in place).
         token_threshold: Context budget this trajectory is managed against
             (the main loop's ``TOKEN_THRESHOLD``; swarm workers pass their own
             ``_MAX_TOKEN_ESTIMATE``).
+        state: Caller-owned dict carrying the armed flag across iterations.
+            Omitted (None) reproduces the pre-V2 single-line behavior, so the
+            function stays usable stateless.
     """
-    if estimate_tokens(messages) <= token_threshold * MICROCOMPACT_TRIGGER_RATIO:
-        return
+    estimate = estimate_tokens(messages)
+    keep_ratio = MICROCOMPACT_KEEP_BUDGET_RATIO
+    if state is None:
+        if estimate <= token_threshold * MICROCOMPACT_TRIGGER_RATIO:
+            return
+    elif state.get("armed"):
+        if estimate <= token_threshold * MICROCOMPACT_RELEASE_RATIO:
+            state["armed"] = False
+            return
+        keep_ratio = MICROCOMPACT_ARMED_KEEP_RATIO
+    else:
+        if estimate <= token_threshold * MICROCOMPACT_TRIGGER_RATIO:
+            return
+        state["armed"] = True
+        keep_ratio = MICROCOMPACT_ARMED_KEEP_RATIO
+
     tool_msgs = [m for m in messages if m.get("role") == "tool"]
     if len(tool_msgs) <= KEEP_RECENT:
         return
 
-    keep_budget = token_threshold * MICROCOMPACT_KEEP_BUDGET_RATIO
+    keep_budget = token_threshold * keep_ratio
     keep_ids: set[int] = set()
     accumulated = 0
     for msg in reversed(tool_msgs):
@@ -318,7 +412,7 @@ def _microcompact(messages: list, token_threshold: int = TOKEN_THRESHOLD) -> Non
     for msg in tool_msgs:
         if id(msg) in keep_ids:
             continue
-        if msg.get("name") in MICROCOMPACT_PROTECTED_TOOLS:
+        if not is_prunable_by_microcompact(msg):
             continue
         content = msg.get("content", "")
         if isinstance(content, str) and len(content) > 100:
@@ -333,7 +427,7 @@ def _microcompact(messages: list, token_threshold: int = TOKEN_THRESHOLD) -> Non
 # trajectory each iteration (the previous one is removed first — "use and
 # discard"), together with any budget / wrap-up nudge lines. The system
 # prompt itself is byte-stable for the whole session.
-_STATUS_PREFIX = "<agent_status>"
+_STATUS_PREFIX = STATUS_PREFIX
 
 
 def _remove_status_messages(messages: list) -> None:
@@ -382,20 +476,30 @@ def _context_collapse(messages: list) -> None:
     Preserves head + tail of large text, collapses the middle.
     Zero API cost — pure string operation.
 
+    V2: which messages may be folded, and how hard, comes from
+    ``src.agent.context_policy`` — the single rule source Layers 1 and 3 also
+    read. Before that this loop folded anything over 2400 chars outside the
+    last six messages, which meant it cut the middle out of the grounding
+    results Layer 1 refuses to prune and out of the Layer 3 handoff summary.
+
     Args:
         messages: Message list (mutated in place).
     """
     if len(messages) <= COLLAPSE_PRESERVE_RECENT + 1:
         return
-    for msg in messages[1:-COLLAPSE_PRESERVE_RECENT]:
+    fu_index = first_user_index(messages)
+    stop = len(messages) - COLLAPSE_PRESERVE_RECENT
+    for idx in range(1, stop):
+        msg = messages[idx]
+        rule = collapse_rule(msg, index=idx, first_user_index=fu_index)
+        if rule.skip:
+            continue
         content = msg.get("content")
-        if not isinstance(content, str) or len(content) <= COLLAPSE_TEXT_MIN:
+        if not isinstance(content, str) or len(content) <= rule.min_chars:
             continue
-        if content.startswith(_CLEARED_PREFIX):
-            continue
-        head = content[:COLLAPSE_HEAD]
-        tail = content[-COLLAPSE_TAIL:]
-        trimmed = len(content) - COLLAPSE_HEAD - COLLAPSE_TAIL
+        head = content[: rule.head]
+        tail = content[-rule.tail:]
+        trimmed = len(content) - rule.head - rule.tail
         msg["content"] = f"{head}\n\n...[{trimmed} chars collapsed]...\n\n{tail}"
 
 
@@ -559,6 +663,47 @@ Rules:
 {focus_section}"""
 
 
+def _select_summary_input(head: list[dict]) -> tuple[str, int]:
+    """Serialize the summary input newest-first within a token budget (V2).
+
+    Args:
+        head: The messages Layer 3 is about to summarize.
+
+    Returns:
+        Tuple of (serialized text, number of older messages dropped). When
+        anything was dropped the text is prefixed with an explicit note so the
+        summarizer does not read the gap as "nothing happened before".
+    """
+    kept: list[dict] = []
+    budget = SUMMARY_INPUT_TOKEN_BUDGET
+    for msg in reversed(head):
+        try:
+            blob = json.dumps(msg, default=str, ensure_ascii=False)
+        except (TypeError, ValueError):
+            blob = str(msg)
+        cost = estimate_text_tokens(blob)
+        if cost > budget:
+            # A single message bigger than the whole remaining budget is
+            # skipped, not a stop condition: shorter older messages after it
+            # can still fit.
+            continue
+        kept.append(msg)
+        budget -= cost
+    kept.reverse()
+    dropped = len(head) - len(kept)
+    try:
+        text = json.dumps(kept, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = str(kept)
+    if dropped:
+        text = (
+            f"[{dropped} older messages omitted from this summary input; they "
+            "are covered by the previous summary and by the full transcript on "
+            "disk.]\n" + text
+        )
+    return text, dropped
+
+
 def _is_tool_success(result: str) -> bool:
     """Return True if the tool result does not look like an error response."""
     try:
@@ -593,6 +738,281 @@ def _normalize_tool_run_dir(args: dict[str, Any], memory_run_dir: str | None) ->
     if not candidate.is_absolute():
         normalized["run_dir"] = str((Path(memory_run_dir) / candidate).resolve())
     return normalized
+
+
+def tool_timeout_for(registry: Any, tool_name: str) -> float | None:
+    """Per-call hard timeout for ``tool_name`` (None = no watchdog).
+
+    Defaults to the tenant-wide ``TOOL_TIMEOUT_SECONDS``. A tool whose NORMAL
+    runtime legitimately exceeds it declares ``timeout_seconds``
+    (``run_swarm``: SWARM_TIMEOUT + margin). The declaration only RAISES the
+    base of the F2 1x-warn / 2x-abandon window, never lowers it, and the
+    attempt budget still clamps the result via ``cap_timeout`` at the call
+    site — so a hung tool can never outlive the caller's deadline regardless
+    of what it declares.
+
+    ``max()`` rather than a plain override is deliberate: an operator lowering
+    ``VIBE_TRADING_TOOL_TIMEOUT_SECONDS`` for a tenant must not silently
+    truncate a swarm (``SWARM_TIMEOUT`` is that knob), and a tool author must
+    not be able to shorten its own window and have its result thrown away.
+
+    Args:
+        registry: Tool registry.
+        tool_name: Name of the tool about to be invoked.
+
+    Returns:
+        Timeout in seconds, or None when the watchdog is disabled.
+    """
+    base = TOOL_TIMEOUT_SECONDS
+    get_tool = getattr(registry, "get", None)
+    if callable(get_tool):
+        try:
+            # Read through the instance so a property-backed declaration
+            # (SwarmTool) is evaluated at call time.
+            declared = getattr(get_tool(tool_name), "timeout_seconds", None)
+        except Exception:  # noqa: BLE001 - unknown tool keeps the default
+            declared = None
+        try:
+            if declared:
+                base = max(base, float(declared))
+        except (TypeError, ValueError):  # noqa: BLE001 - malformed declaration
+            pass
+    return base if base > 0 else None
+
+
+def tool_is_readonly(registry: Any, tool_name: str) -> bool:
+    """Return whether a tool is known to be side-effect free.
+
+    Args:
+        registry: Tool registry.
+        tool_name: Tool name.
+
+    Returns:
+        True only when the registry classifies the tool as readonly.
+    """
+    get_tool = getattr(registry, "get", None)
+    if not callable(get_tool):
+        return False
+    try:
+        tool_def = get_tool(tool_name)
+    except Exception:  # noqa: BLE001 - unknown classification is not readonly
+        return False
+    return bool(tool_def and getattr(tool_def, "is_readonly", False))
+
+
+def invoke_tool_guarded(
+    registry: Any,
+    tool_name: str,
+    args: Dict[str, Any],
+    *,
+    readonly: bool,
+    timeout: float | None,
+    emit: Callable[[str, Dict[str, Any]], None],
+    on_degraded: Callable[[], None] | None = None,
+) -> tuple[str, int]:
+    """Run one tool under the watchdog: thread + timeout + heartbeat + progress.
+
+    Extracted from ``AgentLoop._invoke_tool`` in V2 so the swarm worker runs
+    its tools through the SAME guard. The worker used to call
+    ``registry.execute`` inline, so a tool that hung inside an iteration
+    blocked forever — the worker only checked its deadline at iteration
+    boundaries, and the layer-level deadline in ``swarm/runtime.py`` then had
+    to wait ``layer_budget + 60s`` to notice.
+
+    Semantics are unchanged from the main loop: a readonly tool that overruns
+    is abandoned immediately with a structured ``tool_timeout``; a write tool
+    (which cannot be safely cancelled) warns at 1x and abandons at
+    ``WRITE_TOOL_TIMEOUT_FACTOR`` x, marking the run degraded. Late results are
+    discarded and the emitters suppressed via the ``timed_out`` flag.
+
+    Args:
+        registry: Tool registry exposing ``execute(name, args)``.
+        tool_name: Tool to run.
+        args: Tool arguments.
+        readonly: Whether the tool is known side-effect free.
+        timeout: Per-call hard timeout, already budget-capped by the caller
+            (None disables the watchdog).
+        emit: ``(event_type, payload)`` sink for progress/heartbeat events.
+        on_degraded: Called when a write tool is abandoned past its hard cap.
+
+    Returns:
+        Tuple of (result_str, elapsed_ms).
+    """
+    timed_out = threading.Event()
+
+    def _noop_degraded() -> None:
+        return None
+
+    if on_degraded is None:
+        on_degraded = _noop_degraded
+
+    def _on_progress(event: ProgressEvent) -> None:
+        if timed_out.is_set():
+            return
+        payload = event.to_dict()
+        payload["tool"] = tool_name
+        emit("tool_progress", payload)
+
+    def _on_heartbeat(payload: Dict[str, Any]) -> None:
+        if timed_out.is_set():
+            return
+        emit("tool_heartbeat", payload)
+
+    t0 = _time.perf_counter()
+    timeout_label = _format_timeout(timeout) if timeout is not None else ""
+
+    def _elapsed_ms() -> int:
+        """Return milliseconds elapsed since tool start.
+
+        Returns:
+            Elapsed wall-clock time in milliseconds.
+        """
+        return int((_time.perf_counter() - t0) * 1000)
+
+    def _heartbeat_timer() -> HeartbeatTimer:
+        """Build the per-invocation heartbeat timer.
+
+        Returns:
+            HeartbeatTimer wired to this invocation's heartbeat emitter.
+        """
+        return HeartbeatTimer(
+            tool_name=tool_name,
+            interval=HEARTBEAT_INTERVAL_S,
+            emit=_on_heartbeat,
+        )
+
+    def _emit_timeout_progress(stage: str, message: str, **extra: Any) -> int:
+        """Emit a timeout-related tool_progress event.
+
+        Args:
+            stage: Progress stage label ("timeout" or "timeout_warning").
+            message: Human-readable timeout message.
+            **extra: Additional payload fields.
+
+        Returns:
+            Elapsed milliseconds at emission time.
+        """
+        elapsed_ms = _elapsed_ms()
+        payload: Dict[str, Any] = {
+            "tool": tool_name,
+            "stage": stage,
+            "message": message,
+            "elapsed_s": round(elapsed_ms / 1000, 2),
+        }
+        payload.update(extra)
+        emit("tool_progress", payload)
+        return elapsed_ms
+
+    # Both read and write tools run in a worker thread so a hung tool
+    # becomes a bounded error: late results are discarded and the emitters
+    # are suppressed via the timed_out event. Write tools cannot be safely
+    # cancelled mid-flight, so they get a longer leash (see
+    # WRITE_TOOL_TIMEOUT_FACTOR): warn at 1× the timeout, abandon at 2×.
+    result_queue: queue.Queue[tuple[str | None, BaseException | None]] = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        _set_emitter(_on_progress)
+        try:
+            result_queue.put((registry.execute(tool_name, args), None))
+        except BaseException as exc:  # noqa: BLE001 - propagate through caller thread
+            result_queue.put((None, exc))
+        finally:
+            _set_emitter(None)
+
+    worker_ctx = contextvars.copy_context()
+    worker = threading.Thread(
+        target=lambda: worker_ctx.run(_worker),
+        name=f"tool-{tool_name}",
+        daemon=True,
+    )
+    worker.start()
+    with _heartbeat_timer():
+        try:
+            result, exc = result_queue.get(timeout=timeout)
+        except queue.Empty:
+            if readonly:
+                timed_out.set()
+                elapsed_ms = _emit_timeout_progress(
+                    "timeout", f"Tool exceeded {timeout_label} timeout"
+                )
+                return (
+                    json.dumps(
+                        {
+                            "status": "error",
+                            "error_code": "tool_timeout",
+                            "tool": tool_name,
+                            "timeout_seconds": timeout,
+                            "message": f"Tool exceeded {timeout_label} timeout",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    elapsed_ms,
+                )
+            # Write tool past 1× the timeout: warn once, then keep waiting
+            # up to the hard cap (it cannot be safely cancelled, but it
+            # must not be allowed to eat the whole attempt budget either).
+            _emit_timeout_progress(
+                "timeout_warning",
+                (
+                    f"Write tool exceeded {timeout_label} timeout; "
+                    "waiting up to the hard cap because it cannot be "
+                    "safely cancelled"
+                ),
+                readonly=False,
+            )
+            # The grace window is budget-capped too, so the total wait can
+            # never overshoot the attempt deadline past its reserve.
+            grace = (
+                _budget.cap_timeout(
+                    timeout * (WRITE_TOOL_TIMEOUT_FACTOR - 1.0),
+                    reserve_s=_TOOL_CAP_RESERVE_S,
+                    floor_s=_TOOL_GRACE_FLOOR_S,
+                )
+                if timeout is not None
+                else None
+            )
+            try:
+                result, exc = result_queue.get(timeout=grace)
+            except queue.Empty:
+                timed_out.set()
+                on_degraded()
+                hard_label = _format_timeout(
+                    (timeout or 0.0) * WRITE_TOOL_TIMEOUT_FACTOR
+                )
+                elapsed_ms = _emit_timeout_progress(
+                    "timeout",
+                    (
+                        f"Write tool exceeded the {hard_label} hard timeout "
+                        f"({WRITE_TOOL_TIMEOUT_FACTOR:g}x the regular limit); "
+                        "abandoning the wait"
+                    ),
+                    readonly=False,
+                )
+                return (
+                    json.dumps(
+                        {
+                            "status": "error",
+                            "error_code": "write_tool_timeout",
+                            "tool": tool_name,
+                            "timeout_seconds": (
+                                (timeout or 0.0) * WRITE_TOOL_TIMEOUT_FACTOR
+                            ),
+                            "degraded": True,
+                            "message": (
+                                f"Write tool exceeded the {hard_label} hard "
+                                "timeout and its result was abandoned. Its "
+                                "side effect may still complete in the "
+                                "background — verify before retrying, and "
+                                "do NOT assume the operation failed cleanly."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    elapsed_ms,
+                )
+    if exc is not None:
+        raise exc
+    return result or "", _elapsed_ms()
 
 
 class AgentLoop:
@@ -643,6 +1063,13 @@ class AgentLoop:
         self._stats: Dict[str, Any] = _new_run_stats()
         # (tool_name, raw_result) pairs feeding the finalization verifier (F1).
         self._grounding_results: List[tuple[str, str]] = []
+        # V2: Layer 1 hysteresis state (armed flag), carried across iterations.
+        self._microcompact_state: Dict[str, Any] = {}
+        # V2 circuit breaker: call_key -> consecutive failure count. Keyed the
+        # same way as the duplicate guard, which only ever registered SUCCESSES
+        # — so an identical failing call could repeat until the iteration cap.
+        self._consecutive_failures: Dict[str, int] = {}
+        self._session_id: str = ""
 
     def cancel(self) -> None:
         """Cancel the current loop.
@@ -676,9 +1103,16 @@ class AgentLoop:
         # Reset per-run state (safe for reuse across multiple run() calls)
         self._cancel_event.clear()
         self._called_ok = {}
-        self._previous_summary = ""
+        self._session_id = session_id or ""
+        # V2: resume Layer 5 from the session's stored handoff summary instead
+        # of restarting from zero. The next compaction then takes the iterative
+        # update path, so decisions and constraints compressed away in an
+        # earlier attempt are inherited rather than lost (no extra LLM call).
+        self._previous_summary = handoff.load(session_id) if session_id else ""
         self._stats = _new_run_stats()
         self._grounding_results = []
+        self._microcompact_state = {}
+        self._consecutive_failures = {}
         run_t0 = _time.perf_counter()
         _fetch_stats.start_collect()
         if deadline is None:
@@ -738,6 +1172,7 @@ class AgentLoop:
         iteration = 0
         final_content = ""
         empty_model_response_iter: int | None = None
+        empty_response_retries = 0
         llm_usage_summary = _new_llm_usage_summary(self.llm)
         goal_continuations = 0
         goal_last_progress: tuple[int, int] | None = None
@@ -766,8 +1201,8 @@ class AgentLoop:
                 # any compaction, so it never survives into summaries.
                 _remove_status_messages(messages)
 
-                # Layer 1: microcompact (threshold-triggered, see _microcompact)
-                _microcompact(messages)
+                # Layer 1: microcompact (threshold-triggered + armed hysteresis)
+                _microcompact(messages, state=self._microcompact_state)
 
                 # Layer 2: context collapse (fold long text, zero API cost)
                 tokens = estimate_tokens(messages)
@@ -1013,15 +1448,39 @@ class AgentLoop:
                 if not response.has_tool_calls:
                     final_content = response.content or ""
                     if not final_content:
+                        empty_payload = {
+                            "iter": current_iter,
+                            "provider": os.getenv("LANGCHAIN_PROVIDER", "openai"),
+                            "model": getattr(self.llm, "model_name", None) or os.getenv("LANGCHAIN_MODEL_NAME", ""),
+                        }
+                        # V2: one in-place retry with an explicit nudge before
+                        # writing off the attempt. The stream SUCCEEDED — this
+                        # is a degraded provider turn, not a transport failure,
+                        # so the STREAM_RETRIES path above never covered it.
+                        if empty_response_retries < EMPTY_RESPONSE_RETRIES:
+                            empty_response_retries += 1
+                            trace.write(
+                                {
+                                    "type": "empty_model_response_retry",
+                                    "attempt": empty_response_retries,
+                                    "max_retries": EMPTY_RESPONSE_RETRIES,
+                                    **empty_payload,
+                                }
+                            )
+                            self._emit(
+                                "empty_model_response_retry",
+                                {"attempt": empty_response_retries, **empty_payload},
+                            )
+                            # The nudge is appended (never rewritten), and the
+                            # retry consumes a normal iteration — rewinding the
+                            # counters would emit duplicate ``iter`` keys into
+                            # the trace the observability waterfall indexes by.
+                            messages.append(
+                                {"role": "user", "content": _EMPTY_RESPONSE_NUDGE}
+                            )
+                            continue
                         empty_model_response_iter = iteration
-                        trace.write(
-                            {
-                                "type": "empty_model_response",
-                                "iter": current_iter,
-                                "provider": os.getenv("LANGCHAIN_PROVIDER", "openai"),
-                                "model": getattr(self.llm, "model_name", None) or os.getenv("LANGCHAIN_MODEL_NAME", ""),
-                            }
-                        )
+                        trace.write({"type": "empty_model_response", **empty_payload})
                         break
                     should_continue_goal = False
                     continuation_snapshot = None
@@ -1149,6 +1608,20 @@ class AgentLoop:
                 "iterations": iteration,
                 "max_iterations": self.max_iterations,
             }
+
+        # V2 (P2-11): tidy the long-term memory index at run end when it nears
+        # its cap, instead of waiting for the model to act on the F7① "index is
+        # full" warning itself. Runs here, after the trajectory is finished, so
+        # the session-start snapshot frozen into the system prompt is never
+        # churned mid-run. Best effort — it never affects the result.
+        if self._persistent_memory is not None:
+            try:
+                consolidation = self._persistent_memory.maybe_auto_consolidate()
+                if consolidation:
+                    logger.info("Auto-consolidated memory index: %s", consolidation)
+                    trace.write({"type": "memory_auto_consolidated", **consolidation})
+            except Exception:  # noqa: BLE001 - memory tidying is never fatal
+                logger.debug("memory auto-consolidation skipped", exc_info=True)
 
         # Determine final status. The reason is also propagated into the
         # returned dict so SessionService can surface a meaningful UI
@@ -1348,9 +1821,61 @@ class AgentLoop:
                 trace.write({"type": "compact_requested", "iter": iteration})
                 continue
 
+            call_key = _tool_call_key(tc.name, tc.arguments)
+
+            # V2 circuit breaker (book §1.2 "Correct"): the duplicate guard
+            # only ever registered SUCCESSES, so an identical call that keeps
+            # failing — a dead upstream, a malformed argument the model won't
+            # revise — could repeat until the iteration cap or the wall-clock
+            # budget ran out. After TOOL_CIRCUIT_FAILURE_LIMIT consecutive
+            # failures of the SAME (tool, args) pair the call is refused with
+            # an actionable structured error instead of being executed again.
+            if self._consecutive_failures.get(call_key, 0) >= TOOL_CIRCUIT_FAILURE_LIMIT:
+                logger.warning(
+                    "Circuit open for %s (%d consecutive identical failures)",
+                    tc.name,
+                    self._consecutive_failures[call_key],
+                )
+                open_msg = json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "circuit_open",
+                        "tool": tc.name,
+                        "consecutive_failures": self._consecutive_failures[call_key],
+                        "message": (
+                            f"This exact {tc.name} call (same arguments) has "
+                            f"failed {self._consecutive_failures[call_key]} times "
+                            "in a row and is now blocked. Do NOT retry it "
+                            "unchanged: change the arguments, use a different "
+                            "tool or data source, or answer with the data you "
+                            "already have and state the gap explicitly."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+                messages.append(context.format_tool_result(tc.id, tc.name, open_msg))
+                trace.write(
+                    {
+                        "type": "tool_circuit_open",
+                        "iter": iteration,
+                        "tool": tc.name,
+                        "consecutive_failures": self._consecutive_failures[call_key],
+                    }
+                )
+                react_trace.append({"type": "tool_circuit_open", "tool": tc.name})
+                self._emit(
+                    "tool_circuit_open",
+                    {
+                        "tool": tc.name,
+                        "consecutive_failures": self._consecutive_failures[call_key],
+                        "iter": iteration,
+                    },
+                )
+                continue
+
             tool_def = self.registry.get(tc.name)
             is_repeatable = tool_def.repeatable if tool_def else False
-            prior = self._called_ok.get(_tool_call_key(tc.name, tc.arguments))
+            prior = self._called_ok.get(call_key)
             prior_intact = (
                 prior is not None
                 and isinstance(prior.get("content"), str)
@@ -1515,12 +2040,10 @@ class AgentLoop:
     def _invoke_tool(self, tool_name: str, args: Dict[str, Any]) -> tuple[str, int]:
         """Execute a tool with heartbeat + structured progress emission.
 
-        Installs a thread-local progress emitter so the tool may call
-        ``emit_progress()`` without taking a callback parameter, and runs a
-        background heartbeat timer that ticks every ``HEARTBEAT_INTERVAL_S``
-        seconds. Both event streams are forwarded through ``self._emit`` and
-        therefore land in the same SSE bus and CLI dashboard as normal
-        tool events.
+        Thin wrapper over :func:`invoke_tool_guarded`: resolves the per-tool
+        timeout, clamps it to the attempt budget, and wires the loop's event
+        sink. The guard body is shared with the swarm worker (V2) so the two
+        can no longer drift on timeout / heartbeat / budget-clamp semantics.
 
         Args:
             tool_name: Tool name to execute.
@@ -1529,192 +2052,55 @@ class AgentLoop:
         Returns:
             Tuple of (result_str, elapsed_ms).
         """
-        readonly = self._is_tool_readonly(tool_name)
-        timed_out = threading.Event()
-
-        def _on_progress(event: ProgressEvent) -> None:
-            if timed_out.is_set():
-                return
-            payload = event.to_dict()
-            payload["tool"] = tool_name
-            self._emit("tool_progress", payload)
-
-        def _on_heartbeat(payload: Dict[str, Any]) -> None:
-            if timed_out.is_set():
-                return
-            self._emit("tool_heartbeat", payload)
-
-        t0 = _time.perf_counter()
-        timeout = TOOL_TIMEOUT_SECONDS if TOOL_TIMEOUT_SECONDS > 0 else None
+        timeout = self._tool_timeout(tool_name)
         if timeout is not None:
             # Never let a single tool outlive the attempt budget (batch 3):
             # keep a reserve so the loop can still produce a final answer.
-            timeout = _budget.cap_timeout(timeout, reserve_s=45.0, floor_s=10.0)
-        timeout_label = _format_timeout(timeout) if timeout is not None else ""
-
-        def _elapsed_ms() -> int:
-            """Return milliseconds elapsed since tool start.
-
-            Returns:
-                Elapsed wall-clock time in milliseconds.
-            """
-            return int((_time.perf_counter() - t0) * 1000)
-
-        def _heartbeat_timer() -> HeartbeatTimer:
-            """Build the per-invocation heartbeat timer.
-
-            Returns:
-                HeartbeatTimer wired to this invocation's heartbeat emitter.
-            """
-            return HeartbeatTimer(
-                tool_name=tool_name,
-                interval=HEARTBEAT_INTERVAL_S,
-                emit=_on_heartbeat,
+            timeout = _budget.cap_timeout(
+                timeout, reserve_s=_TOOL_CAP_RESERVE_S, floor_s=_TOOL_CAP_FLOOR_S
             )
 
-        def _emit_timeout_progress(stage: str, message: str, **extra: Any) -> int:
-            """Emit a timeout-related tool_progress event.
+        def _mark_degraded() -> None:
+            self._stats["degraded"] = True
 
-            Args:
-                stage: Progress stage label ("timeout" or "timeout_warning").
-                message: Human-readable timeout message.
-                **extra: Additional payload fields.
-
-            Returns:
-                Elapsed milliseconds at emission time.
-            """
-            elapsed_ms = _elapsed_ms()
-            payload: Dict[str, Any] = {
-                "tool": tool_name,
-                "stage": stage,
-                "message": message,
-                "elapsed_s": round(elapsed_ms / 1000, 2),
-            }
-            payload.update(extra)
-            self._emit("tool_progress", payload)
-            return elapsed_ms
-
-        # Both read and write tools run in a worker thread so a hung tool
-        # becomes a bounded error: late results are discarded and the emitters
-        # are suppressed via the timed_out event. Write tools cannot be safely
-        # cancelled mid-flight, so they get a longer leash (see
-        # WRITE_TOOL_TIMEOUT_FACTOR): warn at 1× the timeout, abandon at 2×.
-        result_queue: queue.Queue[tuple[str | None, BaseException | None]] = queue.Queue(maxsize=1)
-
-        def _worker() -> None:
-            _set_emitter(_on_progress)
-            try:
-                result_queue.put((self.registry.execute(tool_name, args), None))
-            except BaseException as exc:  # noqa: BLE001 - propagate through caller thread
-                result_queue.put((None, exc))
-            finally:
-                _set_emitter(None)
-
-        worker_ctx = contextvars.copy_context()
-        worker = threading.Thread(
-            target=lambda: worker_ctx.run(_worker),
-            name=f"tool-{tool_name}",
-            daemon=True,
+        return invoke_tool_guarded(
+            self.registry,
+            tool_name,
+            args,
+            readonly=self._is_tool_readonly(tool_name),
+            timeout=timeout,
+            emit=self._emit,
+            on_degraded=_mark_degraded,
         )
-        worker.start()
-        with _heartbeat_timer():
-            try:
-                result, exc = result_queue.get(timeout=timeout)
-            except queue.Empty:
-                if readonly:
-                    timed_out.set()
-                    elapsed_ms = _emit_timeout_progress(
-                        "timeout", f"Tool exceeded {timeout_label} timeout"
-                    )
-                    return (
-                        json.dumps(
-                            {
-                                "status": "error",
-                                "error_code": "tool_timeout",
-                                "tool": tool_name,
-                                "timeout_seconds": timeout,
-                                "message": f"Tool exceeded {timeout_label} timeout",
-                            },
-                            ensure_ascii=False,
-                        ),
-                        elapsed_ms,
-                    )
-                # Write tool past 1× the timeout: warn once, then keep waiting
-                # up to the hard cap (it cannot be safely cancelled, but it
-                # must not be allowed to eat the whole attempt budget either).
-                _emit_timeout_progress(
-                    "timeout_warning",
-                    (
-                        f"Write tool exceeded {timeout_label} timeout; "
-                        "waiting up to the hard cap because it cannot be "
-                        "safely cancelled"
-                    ),
-                    readonly=False,
-                )
-                # The grace window is budget-capped too, so the total wait can
-                # never overshoot the attempt deadline past its reserve.
-                grace = (
-                    _budget.cap_timeout(
-                        timeout * (WRITE_TOOL_TIMEOUT_FACTOR - 1.0),
-                        reserve_s=45.0,
-                        floor_s=5.0,
-                    )
-                    if timeout is not None
-                    else None
-                )
-                try:
-                    result, exc = result_queue.get(timeout=grace)
-                except queue.Empty:
-                    timed_out.set()
-                    self._stats["degraded"] = True
-                    hard_label = _format_timeout(
-                        (timeout or 0.0) * WRITE_TOOL_TIMEOUT_FACTOR
-                    )
-                    elapsed_ms = _emit_timeout_progress(
-                        "timeout",
-                        (
-                            f"Write tool exceeded the {hard_label} hard timeout "
-                            f"({WRITE_TOOL_TIMEOUT_FACTOR:g}x the regular limit); "
-                            "abandoning the wait"
-                        ),
-                        readonly=False,
-                    )
-                    return (
-                        json.dumps(
-                            {
-                                "status": "error",
-                                "error_code": "write_tool_timeout",
-                                "tool": tool_name,
-                                "timeout_seconds": (
-                                    (timeout or 0.0) * WRITE_TOOL_TIMEOUT_FACTOR
-                                ),
-                                "degraded": True,
-                                "message": (
-                                    f"Write tool exceeded the {hard_label} hard "
-                                    "timeout and its result was abandoned. Its "
-                                    "side effect may still complete in the "
-                                    "background — verify before retrying, and "
-                                    "do NOT assume the operation failed cleanly."
-                                ),
-                            },
-                            ensure_ascii=False,
-                        ),
-                        elapsed_ms,
-                    )
-        if exc is not None:
-            raise exc
-        return result or "", _elapsed_ms()
+
+    def _tool_timeout(self, tool_name: str) -> float | None:
+        """Per-call hard timeout for ``tool_name`` (None = no watchdog).
+
+        Defaults to the tenant-wide ``TOOL_TIMEOUT_SECONDS``. A tool whose
+        NORMAL runtime legitimately exceeds it declares ``timeout_seconds``
+        (``run_swarm``: SWARM_TIMEOUT + margin). The declaration only RAISES
+        the base of the F2 1×-warn / 2×-abandon window, never lowers it, and
+        the attempt budget still clamps the result via ``cap_timeout`` at the
+        call site — so a hung tool can never outlive the caller's deadline
+        regardless of what it declares.
+
+        ``max()`` rather than a plain override is deliberate: an operator
+        lowering ``VIBE_TRADING_TOOL_TIMEOUT_SECONDS`` for a tenant must not
+        silently truncate a swarm (``SWARM_TIMEOUT`` is that knob), and a tool
+        author must not be able to shorten its own window and have its result
+        thrown away.
+
+        Args:
+            tool_name: Name of the tool about to be invoked.
+
+        Returns:
+            Timeout in seconds, or None when the watchdog is disabled.
+        """
+        return tool_timeout_for(self.registry, tool_name)
 
     def _is_tool_readonly(self, tool_name: str) -> bool:
         """Return whether a tool is known to be side-effect free."""
-        get_tool = getattr(self.registry, "get", None)
-        if not callable(get_tool):
-            return False
-        try:
-            tool_def = get_tool(tool_name)
-        except Exception:  # noqa: BLE001 - unknown classification is not readonly
-            return False
-        return bool(tool_def and getattr(tool_def, "is_readonly", False))
+        return tool_is_readonly(self.registry, tool_name)
 
     def _finalize_tool_result(
         self,
@@ -1752,18 +2138,36 @@ class AgentLoop:
             tool_stats["errors"] += 1
 
         status = "ok" if success else "error"
-        truncated = result[:TOOL_RESULT_LIMIT]
-        result_msg = context.format_tool_result(tc.id, tc.name, truncated)
+        # V2: oversized results go to disk and the model gets an EXPLICIT
+        # preview envelope pointing at the file. The raw ``result`` is
+        # deliberately still what the success classifier, the F1 grounding
+        # verifier and the trace consume — only the trajectory copy shrinks.
+        payload, offload_failed = prepare_for_context(
+            result,
+            base_dir=Path(self.memory.run_dir) if self.memory.run_dir else None,
+            iteration=iteration,
+            tool_name=tc.name,
+            call_id=getattr(tc, "id", "") or "",
+        )
+        if offload_failed:
+            self._stats["offload_failures"] = self._stats.get("offload_failures", 0) + 1
+        result_msg = context.format_tool_result(tc.id, tc.name, payload)
         messages.append(result_msg)
+        call_key = _tool_call_key(tc.name, tc.arguments)
         if success:
             # Keep the message REF so the duplicate guard can tell whether
             # _microcompact has since pruned this result (pruned -> re-allow).
-            self._called_ok[_tool_call_key(tc.name, tc.arguments)] = result_msg
+            self._called_ok[call_key] = result_msg
+            self._consecutive_failures.pop(call_key, None)
             # F1: keep raw grounding results for the finalization verifier.
             if tc.name in VERIFY_GROUNDING_TOOLS:
                 self._grounding_results.append((tc.name, result))
                 if len(self._grounding_results) > VERIFY_GROUNDING_MAX_RESULTS:
                     self._grounding_results.pop(0)
+        else:
+            self._consecutive_failures[call_key] = (
+                self._consecutive_failures.get(call_key, 0) + 1
+            )
 
         trace_result = _redact_trace_result(result)
         trace.write_tool_result(
@@ -1847,7 +2251,7 @@ class AgentLoop:
         focus_section = _FOCUS_SECTION.format(topic=focus_topic) if focus_topic else ""
 
         # Build summary prompt (structured template or iterative update)
-        conv_text = json.dumps(head, default=str, ensure_ascii=False)[:80000]
+        conv_text, dropped_msgs = _select_summary_input(head)
 
         if self._previous_summary:
             prompt = _ITERATIVE_UPDATE_PROMPT.format(
@@ -1859,12 +2263,38 @@ class AgentLoop:
             prompt = _STRUCTURED_SUMMARY_PROMPT.format(focus_section=focus_section) + conv_text
 
         compact_t0 = _time.perf_counter()
-        summary_resp = self.llm.chat([{"role": "user", "content": prompt}])
+        # V2: compaction is a CORRECT mechanism — it must never be the thing
+        # that kills an otherwise healthy run. Before this guard, one provider
+        # hiccup on the summary call propagated to run()'s top-level except and
+        # failed the whole attempt. On failure we degrade to the zero-LLM
+        # layers (L1/L2 already ran this iteration) and leave the trajectory
+        # untouched; the next iteration retries compaction.
+        try:
+            summary_resp = self.llm.chat([{"role": "user", "content": prompt}])
+            summary = summary_resp.content or ""
+        except Exception as exc:  # noqa: BLE001 - degrade, never fail the run
+            self._stats["llm_ms"] += int((_time.perf_counter() - compact_t0) * 1000)
+            self._stats["compact_failures"] = self._stats.get("compact_failures", 0) + 1
+            logger.warning("Auto compact LLM call failed, degrading to L1/L2: %s", exc)
+            payload = {"iter": iteration, "error": str(exc)[:300]}
+            try:
+                trace.write({"type": "compact_failed", **payload})
+            except Exception:  # noqa: BLE001 - trace must never break the run
+                logger.debug("compact_failed trace write failed", exc_info=True)
+            self._emit("compact_failed", payload)
+            return
         self._stats["compact_calls"] += 1
         self._stats["llm_calls"] += 1
         self._stats["llm_ms"] += int((_time.perf_counter() - compact_t0) * 1000)
-        summary = summary_resp.content or ""
+        if not summary.strip():
+            # An empty summary would erase the head without replacing it.
+            logger.warning("Auto compact produced an empty summary; skipping rebuild")
+            return
         self._previous_summary = summary
+        # V2: persist the moment it exists, not at run end — the attempt that
+        # times out or crashes is exactly the one whose summary the NEXT
+        # attempt needs. See src/session/handoff.py.
+        handoff.save(self._session_id, summary, attempt_iter=iteration)
 
         tokens_before = estimate_tokens(messages)
         trace.write_text_entry(
@@ -1873,6 +2303,7 @@ class AgentLoop:
                 "iter": iteration,
                 "tokens_before": tokens_before,
                 "focus_topic": focus_topic or "(none)",
+                "input_messages_dropped": dropped_msgs,
             },
             field="summary",
             value=summary,
@@ -1882,7 +2313,12 @@ class AgentLoop:
 
         # Reconstruct: system + summary + acknowledge + preserved tail
         state_summary = self.memory.to_summary()
-        compressed = f"[Conversation compressed — handoff summary. Transcript: {transcript_path}]\n\n{summary}"
+        # HANDOFF_PREFIX (not a literal) so Layer 2's skip rule and the
+        # session-level replay header recognise the same marker.
+        compressed = (
+            f"{HANDOFF_PREFIX} — handoff summary. "
+            f"Transcript: {transcript_path}]\n\n{summary}"
+        )
         if state_summary and state_summary != "(empty state)":
             compressed += f"\n\nCurrent agent state:\n{state_summary}"
 

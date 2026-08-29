@@ -296,7 +296,12 @@ class MCPServerConfig(ConfigBase):
     url: str = ""
     headers: dict[str, str] = Field(default_factory=dict)
     auth: MCPOAuthConfig | None = None
-    tool_timeout: float = Field(default=30.0, ge=0.1)
+    # V1: upper bound added. This value feeds the per-call client timeout AND
+    # (via MCPRemoteTool.timeout_seconds) the loop-side watchdog, so leaving it
+    # unbounded let a misconfigured server hold a write-tool slot for
+    # arbitrarily long. 1800s is generous for any legitimate MCP call and still
+    # comfortably inside a normal attempt budget.
+    tool_timeout: float = Field(default=30.0, ge=0.1, le=1800.0)
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])
 
     def resolved_transport(self) -> Literal["stdio", "sse", "streamableHttp"]:

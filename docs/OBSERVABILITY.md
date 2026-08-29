@@ -113,10 +113,20 @@ AgentLoop 在 **attempt 结束时**（成功/失败/取消/异常四条路径都
 
 ### 3.3 trace.jsonl 增量
 
-在上游既有类型（start/message/thinking/tool_call/tool_result/compact/end…）之上新增两类：
+在上游既有类型（start/message/thinking/tool_call/tool_result/compact/end…）之上新增：
 
 - `early_finalize`：`{iter, remaining_s, avg_iter_s}` —— deadline 驱动的强制收敛触发点；
-- `attempt_stats`：同 §3.2 全量字段，方便离线只读 trace 即可拿到汇总。
+- `attempt_stats`：同 §3.2 全量字段，方便离线只读 trace 即可拿到汇总；
+- `tool_circuit_open`：`{iter, tool, consecutive_failures}` —— 同一 (工具, 参数) 连续失败达 `VIBE_TOOL_CIRCUIT_FAILURE_LIMIT`（默认 3）后该调用被拒。重复调用守卫只登记**成功**调用，所以这是「同一个坏调用烧掉多少迭代」的唯一信号；
+- `empty_model_response_retry`：`{iter, attempt, max_retries, provider, model}` —— 流成功返回但既无 content 也无 tool_calls 时的就地重试（附一条 nudge，消耗一个正常迭代）。仍为空才写终态 `empty_model_response`；
+- `compact_failed`：`{iter, error}` —— L3 摘要的 LLM 调用失败，本轮降级为只做 L1/L2 剪裁。**出现它不代表 attempt 失败**（V2 之前会）；`attempt_stats.compact_failures` 是它的计数；
+- `memory_auto_consolidated`：`{duplicates_merged, entries, index_lines, index_full}` —— 索引 ≥180 行时 run 收尾自动跑的长期记忆整理。
+
+既有事件的字段增量：
+
+- `compact` 加 `input_messages_dropped` —— L3 摘要输入按 token 预算从**旧端**裁掉的消息条数（V2 之前是 `json.dumps(head)[:80000]` 从尾部砍，丢的恰是 head 里最新最密的轮次）；
+- swarm 的 `tool_result` 事件 `status` 改为按 `_is_error_result` 判定。V2 之前 worker 侧硬编码 `"ok"`，swarm 面板的 worker 工具错误率恒为 0，与主循环的 ok/error 双态口径不一致；
+- `attempt_stats` 可能出现 `offload_failures`（工具结果落盘失败次数，盘满/只读时降级为带标记的纯截断）。
 
 ### 3.4 fetch_stats 收集器（`src/core/fetch_stats.py`）
 
@@ -148,8 +158,11 @@ laicai timeoutS（默认 900s）
 
 | 项 | 机制 |
 |---|---|
-| 单工具超时 | `_invoke_tool`：`cap_timeout(VIBE_TRADING_TOOL_TIMEOUT_SECONDS, reserve=45s, floor=10s)` |
-| swarm 等待 | `swarm_tool`：`cap_timeout(SWARM_TIMEOUT, reserve=90s, floor=60s)` |
+| 单工具超时 | `_invoke_tool`：`cap_timeout(_tool_timeout(name), reserve=max(45s, VIBE_FINALIZE_RESERVE_S), floor=10s)`。base = `max(VIBE_TRADING_TOOL_TIMEOUT_SECONDS, tool.timeout_seconds)`——工具的声明只能放宽窗口不能收紧，且无论声明多少仍被 attempt 剩余预算钳制 |
+| 写工具 1×/2× 窗口 | 只读工具超时即放弃；**写工具**（`is_readonly=False`）不可安全取消，故 1× 发 `tool_progress{stage:"timeout_warning"}` 继续等，2×（宽限段同样被钳制，floor=5s）仍未归才放弃：标 `degraded=true` + 回 `write_tool_timeout`。分母是上一行的 per-tool base，不是全局常量 |
+| 声明了 `timeout_seconds` 的工具 | `run_swarm` = `SWARM_TIMEOUT + 120s`；`alpha_bench` = `VIBE_ALPHA_BENCH_BUDGET_S + 120s`；MCP 远端工具 = `tool_timeout + max(tool_timeout,30) + 30`。三者都**自带**预算并在耗尽时返回部分结果——只声明不自限等于把无界等待从循环挪进工具 |
+| swarm 等待 | `swarm_tool`：`cap_timeout(SWARM_TIMEOUT, reserve=90s, floor=60s)`。**嵌套不变式：swarm 自留 90s > loop 自留 60s，所以工具必然先于看门狗自收口**——这是 `wait_budget_exhausted` 打捞路径（带回 `run_id` 与部分报告的唯一出口）能被执行的前提，回归测试见 `agent/tests/test_swarm_timeout_nesting.py` |
+| bash 命令超时 | `VIBE_BASH_TIMEOUT_S`（默认 120s），同样被 attempt 剩余预算钳制（reserve 15s / floor 10s）；超时回 `bash_timeout` 并指向 `background_run` |
 | market_data 总预算 | `min(VIBE_TRADING_FETCH_BUDGET_S=120, 剩余预算)`，见 §5 |
 | 迭代上限 | `VIBE_MAX_ITERATIONS`（引擎默认 50 与上游一致；**router 给 laicai 租户同样下发 50**——曾下发 25，2026-08-26 因饿死 swarm 意图长任务调回） |
 | router 兜底取消 | `/ask` 未拿到答案（504/客户端断开/异常）一律 `POST /sessions/<sid>/cancel`，止住「超时后继续烧 + 拖死同租户重试」 |
@@ -261,8 +274,12 @@ laicai 侧实现在主仓库（桥接 `app/src/server/vibe-trading.ts`、落库 
 | `VIBE_LOG_LEVEL` | INFO | 结构化日志级别 |
 | `VIBE_MAX_ITERATIONS` | 50（**50**） | ReAct 迭代上限 |
 | `VIBE_FINALIZE_RESERVE_S` | 60 | 提前收敛的保底剩余秒数 |
-| `VIBE_TRADING_TOOL_TIMEOUT_SECONDS` | 1800（**300**） | 单只读工具硬超时（另被剩余预算钳制） |
-| `SWARM_TIMEOUT` | 7200（**7200**） | swarm 等待上限（另被剩余预算钳制；laicai 对 swarm 意图请求发 timeoutS=7200 与之配套） |
+| `VIBE_TRADING_TOOL_TIMEOUT_SECONDS` | 1800（**300**） | 单工具硬超时**默认值**（读写皆适用；写工具按 1× 警告 / 2× 放弃）。声明了 `timeout_seconds` 的工具取二者较大值，另被剩余预算钳制 |
+| `SWARM_TIMEOUT` | 7200（**7200**） | swarm 等待上限（另被剩余预算钳制）。**租户档由 router 的 `VIBE_SWARM_ASK_TIMEOUT_S` 派生下发**，与 `intent=deep_team` 的 ask 预算同源——不要在 router.env 里单独写 `SWARM_TIMEOUT` 再让两者漂移。同时是 `run_swarm` 向循环声明的 `timeout_seconds` 来源（+120s 余量），要收紧 swarm 应改这里而不是调低租户档工具超时 |
+| `VIBE_ALPHA_BENCH_BUDGET_S` | 1800 | alpha_bench 自身总预算；耗尽即停止起新 alpha 并返回部分 IC 表（`budget_exhausted`）。同时是它声明的 `timeout_seconds` 来源（+120s） |
+| `VIBE_BASH_TIMEOUT_S` | 120 | bash 单命令超时（另被剩余预算钳制）；长任务应走 `background_run` |
+| `VIBE_TOOL_CIRCUIT_FAILURE_LIMIT` | 3 | 同一 (工具, 参数) 连续失败几次后熔断该调用；命中写 `tool_circuit_open` |
+| `VIBE_EMPTY_RESPONSE_RETRIES` | 1 | 流成功但返回空 turn 时的就地重试次数（0 = 回到 V2 之前的「一次即判败」） |
 | `TIMEOUT_SECONDS` | 120（**300**） | LLM 流式读超时（httpx）；2026-08-24 swarm worker 因 opus 长上下文思考停顿 >120s 连续 ReadTimeout 整队报废后调升 |
 | `VIBE_TRADING_FETCH_BUDGET_S` | 120 | market_data 单次调用含降级链的总预算 |
 | `VIBE_SOCKET_TIMEOUT_S` | 30 | 阻塞 socket 默认超时兜底 |
