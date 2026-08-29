@@ -99,8 +99,8 @@ stateDiagram-v2
 | `VIBE_TRADING_TENANT_SAFE=1` | `build_registry` 排除**动钱红线**：`trading_*` 前缀全部工具 + `propose_mandate_profiles`。只读分析产品在任何配置下都不得触发真实下单/资金授权 |
 | `VIBE_TRADING_ENABLE_SHELL_TOOLS=1` | 放开 shell 类工具（上游默认关）——任意命令执行已被 MicroVM 圈住，视为安全 |
 | `API_AUTH_KEY=<随机>` | 引擎对非 loopback 调用方的 Bearer 鉴权 key，见 §5 |
-| `VIBE_MAX_ITERATIONS=25` | 租户档位：ReAct 迭代上限（引擎默认 50；router env 可覆盖） |
-| `VIBE_TRADING_TOOL_TIMEOUT_SECONDS=300` `SWARM_TIMEOUT=1800` | 租户档位：单工具/swarm 超时（引擎默认 1800；另被剩余预算动态钳制，见 §9） |
+| `VIBE_MAX_ITERATIONS=50` | 租户档位：ReAct 迭代上限（与引擎默认一致；router env 可覆盖） |
+| `VIBE_TRADING_TOOL_TIMEOUT_SECONDS=300` `SWARM_TIMEOUT=7200` | 租户档位：单工具/swarm 超时（引擎默认分别 1800/7200；另被剩余预算动态钳制，见 §9） |
 | `VIBE_TRADING_DATA_CACHE=1` | 开启 loader parquet 缓存（落租户数据盘，跨会话/重建持久） |
 | `VIBE_TRADING_SEARCH_BACKENDS=auto` | ddgs 搜索后端（9.x 已无 google/bing，auto 轮询全部引擎） |
 | `VIBE_TRADING_EGRESS_PROXY=http://127.0.0.1:8118` | 仅配置了 egress key 时注入；web_search/yfinance 专用出境代理（沙箱内加密隧道，见 §9） |
@@ -174,13 +174,15 @@ Bearer 鉴权与其余端点一致（无豁免）。池状态之外含进程内 
 
 ### 3.4 只读 `/obs/*` — 租户遥测在线回读
 
-laicai 管理端详情页（`/app/admin/deep-run/$id`）经这三个端点在浏览器里直接查看租户日志与 trace，排障不再需要 SSH。Bearer 鉴权同源；id 严格正则校验防路径穿越；只读尾部 4MB、单字段裁 600 字符：
+laicai 管理端详情页（`/app/admin/deep-run/$id`）经这五个端点在浏览器里直接查看租户日志与 trace，排障不再需要 SSH。Bearer 鉴权同源；id 严格正则校验防路径穿越；只读尾部 4MB、单字段裁 600 字符：
 
 | 端点 | 参数 | 数据源 |
 |---|---|---|
 | `GET /obs/ask-log` | `uid`、`attempt_id?`、`limit≤200` | router `ask_log.jsonl` 按租户（tk8）过滤 |
 | `GET /obs/engine-log` | `uid`、`attempt_id?`、`limit≤2000` | 租户 `logs/engine.jsonl`（宿主 bind-mount 直读） |
 | `GET /obs/trace` | `uid`、`session_id`、`limit≤2000` | 租户 `sessions/<sid>/trace.jsonl` |
+| `GET /obs/prompt` | `uid`、`session_id` | trace 中各 attempt 的 `start` 事件完整引擎输入 prompt（不受 600 字符裁剪，单 prompt 上限 64KB，最近 20 条） |
+| `GET /obs/swarm-events` | `uid`、`run_id`、`limit≤2000`、`skip_heartbeats?` | 租户 `.swarm/runs/<run_id>/events.jsonl` 尾读（`skip_heartbeats=1` 先滤心跳再截 limit，保住早期 task/tool 事件） |
 
 另有两个长期记忆端点（laicai「更多 → 来财AI → 深度引擎记忆」页，2026-08-27）：`GET /memory?uid=`（列出租户 `memory/*.md` 全文，排除 MEMORY.md 索引，按 mtime 倒序，单文件裁 64KB）与 `POST /memory/delete {uid,name}`（物理删文件 + 清 MEMORY.md 索引行；文件名防穿越校验、禁删 MEMORY.md）。宿主直读直删，无需沙箱在跑；与引擎并发写的竞态可接受（引擎容忍悬空索引行）。
 
@@ -215,7 +217,8 @@ flowchart LR
 - 入参校验：model 与 llm.model 过白名单正则（字母数字开头，≤100 字符）；`baseUrl` 须 `http(s)://` 且 ≤500 字符；`apiKey` 非空 ≤500 字符且无控制字符。BYOK apiKey 只进指纹哈希与引擎 env，不落日志。
 - **指纹即实例身份**：引擎子进程的 env 启动后不可变（`build_llm` 虽每 attempt 读 env，读的也是引擎自己进程的 env），所以任何 LLM 配置切换都表现为 launcher `/boot` 重启引擎。
 - **引擎侧鉴权**：经 cube-proxy 到达引擎的请求不是 loopback，引擎的 loopback 信任失效 → 引擎依赖 `API_AUTH_KEY` Bearer 校验。router 每次 boot 随机生成 32-hex key，注入引擎 env 并持久化到 state.json，之后对该实例的所有请求（sessions/messages/events）都带 `Authorization: Bearer <key>`。
-- 引擎侧兼容性（本 fork 差异）：`opus-4-8`/`fable`/`mythos` 模型省略 `temperature`；流式默认请求 usage 块，`llm_usage` SSE 事件（增量 input/output tokens）经 progress 帧到达 laicai 做用量记账。
+- 引擎侧兼容性（本 fork 差异）：`opus-4-7`/`opus-4-8`/`opus-5`/`sonnet-5`/`fable`/`mythos` 模型省略 `temperature`（可经 `LANGCHAIN_NO_TEMPERATURE_MODELS` 追加）；流式默认请求 usage 块，`llm_usage` SSE 事件（增量 input/output tokens）经 progress 帧到达 laicai 做用量记账。
+- **Anthropic 原生通道**：`LANGCHAIN_PROVIDER=anthropic` 时引擎走原生 `/v1/messages` API（`agent/src/providers/llm.py` `_build_native_anthropic`），SSE ping 端到端透传、去掉两层协议转换，治 OpenAI-compat 路径长思考停顿被中间设备静默掐断的问题；生产 v34 起内置模型即此通道。
 
 ## 6. 资源与网络边界
 

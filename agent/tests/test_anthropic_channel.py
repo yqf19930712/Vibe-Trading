@@ -128,3 +128,100 @@ class TestBuildAnthropicBranch:
         import os
 
         assert os.environ["OPENAI_BASE_URL"] == "https://openai.example/v1"
+
+
+class TestAnthropicCacheBreakpoints:
+    """E3: prompt-caching breakpoints injected into the native /v1/messages
+    payload — system tail, tools tail, newest non-status message."""
+
+    @staticmethod
+    def _apply(payload):
+        from src.providers.llm import _apply_anthropic_cache_breakpoints
+
+        _apply_anthropic_cache_breakpoints(payload)
+        return payload
+
+    def test_string_system_wrapped_with_cache_control(self):
+        payload = self._apply({"system": "you are an agent", "messages": []})
+        assert payload["system"] == [
+            {
+                "type": "text",
+                "text": "you are an agent",
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
+    def test_block_system_marks_last_block(self):
+        payload = self._apply(
+            {"system": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}
+        )
+        assert "cache_control" not in payload["system"][0]
+        assert payload["system"][1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_tools_tail_marked(self):
+        payload = self._apply(
+            {"tools": [{"name": "t1"}, {"name": "t2"}], "system": "s", "messages": []}
+        )
+        assert "cache_control" not in payload["tools"][0]
+        assert payload["tools"][1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_last_message_string_content_wrapped(self):
+        payload = self._apply(
+            {"messages": [{"role": "user", "content": "question"}]}
+        )
+        assert payload["messages"][0]["content"] == [
+            {"type": "text", "text": "question", "cache_control": {"type": "ephemeral"}}
+        ]
+
+    def test_status_bar_message_skipped(self):
+        """The per-iteration <agent_status> tail changes every turn — the
+        breakpoint must land on the newest stable message instead."""
+        payload = self._apply(
+            {
+                "messages": [
+                    {"role": "user", "content": "real question"},
+                    {"role": "user", "content": "<agent_status>\nNow: ...\n</agent_status>"},
+                ]
+            }
+        )
+        assert payload["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+        assert payload["messages"][1]["content"] == "<agent_status>\nNow: ...\n</agent_status>"
+
+    def test_block_content_marks_last_cacheable_block(self):
+        payload = self._apply(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                            {"type": "tool_result", "tool_use_id": "t2", "content": "ok"},
+                        ],
+                    }
+                ]
+            }
+        )
+        blocks = payload["messages"][0]["content"]
+        assert "cache_control" not in blocks[0]
+        assert blocks[1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_thinking_only_message_falls_back_to_older(self):
+        payload = self._apply(
+            {
+                "messages": [
+                    {"role": "user", "content": "stable question"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "thinking", "thinking": "..."}],
+                    },
+                ]
+            }
+        )
+        assert payload["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+        assert "cache_control" not in payload["messages"][1]["content"][0]
+
+    def test_malformed_payload_is_noop(self):
+        from src.providers.llm import _apply_anthropic_cache_breakpoints
+
+        _apply_anthropic_cache_breakpoints(None)
+        _apply_anthropic_cache_breakpoints({"messages": "not-a-list", "system": 3})

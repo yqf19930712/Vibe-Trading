@@ -3,20 +3,96 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
+import time
+from pathlib import Path
 from typing import Any
 
+from src.agent.progress import emit_progress
 from src.agent.tools import BaseTool
 
 _OUTPUT_LIMIT = 50_000
+# F4: head+tail truncation instead of a silent hard cut — long outputs keep
+# their beginning (setup, first errors) AND their end (final result, traceback
+# tail), and the full text is persisted to run_dir for read_file paging.
+_TRUNC_HEAD = 40_000
+_TRUNC_TAIL = 8_000
 _DEFAULT_TIMEOUT = 120
+
+# F4: dangerous-pattern AUDIT blacklist. Matching commands are NOT blocked —
+# the sandbox is the enforcement layer — but each match is recorded in the
+# result payload (which lands in the trace via the tool_result entry) and
+# emitted as a progress event, so the observability panel can review what the
+# model tried to run. Patterns are deliberately narrow: they target the classic
+# foot-guns, not every superficially similar command.
+_DANGEROUS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    # rm -rf (or -fr) aimed at /, /*, ~ or $HOME — filesystem-wide deletion.
+    ("rm_rf_root", re.compile(r"\brm\s+(-\w+\s+)*-\w*[rf]\w*\s+(/|/\*|~|\$HOME)(\s|$|;)")),
+    # Redirecting output to an absolute path outside the run_dir sandbox
+    # (/dev/null and /tmp are tolerated as benign).
+    ("abs_path_redirect", re.compile(r"(?<![0-9<>])>{1,2}\s*/(?!dev/null|tmp/)")),
+    # Piping a remote download straight into a shell interpreter.
+    ("curl_pipe_sh", re.compile(r"\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?(ba|z|da)?sh\b")),
+    # Privilege escalation attempts inside the sandbox.
+    ("sudo", re.compile(r"\bsudo\b")),
+    # Raw disk writes.
+    ("dd_to_device", re.compile(r"\bdd\b[^;|&]*\bof=/dev/")),
+    # Recursive permission blow-open on absolute paths.
+    ("chmod_777_abs", re.compile(r"\bchmod\s+(-\w+\s+)*777\s+/")),
+)
+
+
+def _audit_command(command: str) -> list[str]:
+    """Return the ids of dangerous patterns matched by ``command`` (F4)."""
+    return [name for name, pattern in _DANGEROUS_PATTERNS if pattern.search(command)]
+
+
+def _truncate_output(text: str, stream: str, run_dir: str | None) -> str:
+    """Head+tail truncate ``text``, persisting the full output when possible.
+
+    Args:
+        text: Raw stream output.
+        stream: Stream label ("stdout"/"stderr") used in the dump filename.
+        run_dir: Run directory to persist the full output into (may be None).
+
+    Returns:
+        The original text when within the limit, otherwise head + marker +
+        tail. The marker names the on-disk dump (readable via ``read_file``)
+        when persisting succeeded.
+    """
+    if len(text) <= _OUTPUT_LIMIT:
+        return text
+
+    dump_hint = ""
+    if run_dir:
+        try:
+            dump_name = f"bash_output_{stream}_{int(time.time() * 1000)}.log"
+            dump_path = Path(run_dir) / dump_name
+            dump_path.write_text(text, encoding="utf-8")
+            dump_hint = f" Full output saved to '{dump_name}' — use read_file (offset/limit) to inspect it."
+        except OSError:
+            dump_hint = ""
+
+    trimmed = len(text) - _TRUNC_HEAD - _TRUNC_TAIL
+    return (
+        text[:_TRUNC_HEAD]
+        + f"\n\n...[output truncated: {trimmed} chars omitted.{dump_hint}]...\n\n"
+        + text[-_TRUNC_TAIL:]
+    )
 
 
 class BashTool(BaseTool):
     """Execute shell commands in the working directory."""
 
     name = "bash"
-    description = "Execute a shell command in the working directory. Use for installing packages, running scripts, or inspecting files."
+    description = (
+        "Execute a shell command in the working directory. Use for installing "
+        "packages, running scripts, or inspecting files. Outbound network "
+        "access goes through a domain-whitelisted egress proxy — direct "
+        "connections to arbitrary hosts may be blocked; prefer the dedicated "
+        "web_search/read_url/get_market_data tools for data access."
+    )
     parameters = {
         "type": "object",
         "properties": {
@@ -39,6 +115,14 @@ class BashTool(BaseTool):
         command = kwargs["command"]
         cwd = kwargs.get("run_dir")
 
+        # F4: audit-only dangerous-pattern scan (never blocks — see constant).
+        audit_findings = _audit_command(str(command))
+        if audit_findings:
+            emit_progress(
+                stage="security_audit",
+                message=f"bash command matched dangerous patterns: {', '.join(audit_findings)}",
+            )
+
         try:
             result = subprocess.run(
                 command,
@@ -51,21 +135,28 @@ class BashTool(BaseTool):
                 encoding="utf-8",
                 errors="replace",
             )
-            stdout = result.stdout[:_OUTPUT_LIMIT] if len(result.stdout) > _OUTPUT_LIMIT else result.stdout
-            stderr = result.stderr[:_OUTPUT_LIMIT] if len(result.stderr) > _OUTPUT_LIMIT else result.stderr
-            return json.dumps({
+            payload: dict[str, Any] = {
                 "status": "ok" if result.returncode == 0 else "error",
                 "exit_code": result.returncode,
-                "stdout": stdout,
-                "stderr": stderr,
-            }, ensure_ascii=False)
+                "stdout": _truncate_output(result.stdout, "stdout", cwd),
+                "stderr": _truncate_output(result.stderr, "stderr", cwd),
+            }
+            if audit_findings:
+                payload["security_audit"] = audit_findings
+            return json.dumps(payload, ensure_ascii=False)
         except subprocess.TimeoutExpired:
-            return json.dumps({
+            payload = {
                 "status": "error",
                 "error": f"Command timed out after {_DEFAULT_TIMEOUT}s",
-            }, ensure_ascii=False)
+            }
+            if audit_findings:
+                payload["security_audit"] = audit_findings
+            return json.dumps(payload, ensure_ascii=False)
         except Exception as exc:
-            return json.dumps({
+            payload = {
                 "status": "error",
                 "error": str(exc),
-            }, ensure_ascii=False)
+            }
+            if audit_findings:
+                payload["security_audit"] = audit_findings
+            return json.dumps(payload, ensure_ascii=False)

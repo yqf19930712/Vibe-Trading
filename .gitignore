@@ -50,8 +50,9 @@ data/.duckdb_tmp/
 data/parquet/
 data/backup/
 
-# Internal docs (plans, specs)
-docs/
+# Internal docs (plans, specs) — 但顶层 docs/*.md 核心文档入库
+docs/*
+!docs/*.md
 !wiki/docs/
 !wiki/docs/**
 docs/screenshots/agent-run.png

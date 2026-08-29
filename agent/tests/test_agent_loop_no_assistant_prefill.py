@@ -120,8 +120,12 @@ def test_background_notifications_are_reintroduced_as_user_messages(
 
     assert result["status"] == "success"
     first_call_messages = llm.seen_messages[0]
+    # The trajectory tail is now the ephemeral <agent_status> bar (batch E);
+    # the background notification is the user message right before it.
     assert first_call_messages[-1]["role"] == "user"
-    assert "<background-results>" in first_call_messages[-1]["content"]
+    assert first_call_messages[-1]["content"].startswith("<agent_status>")
+    assert first_call_messages[-2]["role"] == "user"
+    assert "<background-results>" in first_call_messages[-2]["content"]
 
 
 def test_auto_compact_handoff_summary_is_reintroduced_as_user_message(

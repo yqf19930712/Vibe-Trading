@@ -121,7 +121,7 @@ Comprehensive knowledge base covering:
 
 Use `load_skill(name)` to access full methodology docs with code templates.
 
-## Available MCP Tools (35)
+## Available MCP Tools (36)
 
 | Tool | Description | API Key |
 |------|-------------|---------|
@@ -152,6 +152,7 @@ Use `load_skill(name)` to access full methodology docs with code templates.
 | `get_run_result` | Get final report and task summaries | None |
 | `list_runs` | List recent swarm runs with metadata | None |
 | `reap_stale_runs` | Finalize stale swarm runs | None |
+| `retry_run` | Relaunch a failed/stale/cancelled swarm run as a new run (same preset and variables) | None |
 | `trading_connections` | List selectable connector profiles | None |
 | `trading_select_connection` | Select the default connector profile | None |
 | `trading_check` | Check connector readiness | Connector app/OAuth |

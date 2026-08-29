@@ -525,6 +525,100 @@ def _normalize_ollama_base_url(base_url: str) -> str:
     return f"{url}/v1"
 
 
+# Prompt-caching breakpoint marker (Anthropic native channel only). Applied
+# at request-payload level: system tail, tools tail, and the newest stable
+# message. Meaningful because the system prompt is now byte-stable across
+# iterations and microcompact no longer rewrites the trajectory middle every
+# turn (context-engineering batch E).
+_ANTHROPIC_CACHE_CONTROL = {"type": "ephemeral"}
+
+# Content-block types that accept cache_control (thinking blocks do not).
+_ANTHROPIC_CACHEABLE_BLOCK_TYPES = {"text", "tool_result", "tool_use", "image", "document"}
+
+# The loop's ephemeral status bar changes every iteration; a breakpoint on it
+# would never be reusable, so the breakpoint goes on the newest message that
+# is NOT the status bar.
+_AGENT_STATUS_PREFIX = "<agent_status>"
+
+
+def _message_starts_with_status(message: dict) -> bool:
+    """Return True when an anthropic-format message is the loop's status bar."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.startswith(_AGENT_STATUS_PREFIX)
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return str(block.get("text") or "").startswith(_AGENT_STATUS_PREFIX)
+            break
+    return False
+
+
+def _apply_anthropic_cache_breakpoints(payload: dict) -> None:
+    """Mark prompt-cache breakpoints on a native /v1/messages payload dict.
+
+    Mutates ``payload`` in place. Three breakpoints (max 4 allowed by the
+    API): the last tool definition (tools precede system in the cache
+    prefix), the system block tail, and the newest non-status message's last
+    cacheable content block. On the next call the request prefix up to that
+    message is byte-identical, so Anthropic's longest-prefix lookup reuses
+    the cache even though the breakpoint itself advances every turn.
+    """
+    if not isinstance(payload, dict):
+        return
+
+    # Defensive sweep: if the converter ever passes content-block dicts by
+    # reference (instead of copying), a marker added on a previous call could
+    # survive on an old message — and >4 cache_control blocks is an API
+    # error. Strip stale markers before placing this call's breakpoints.
+    stale_msgs = payload.get("messages")
+    if isinstance(stale_msgs, list):
+        for stale in stale_msgs:
+            if not isinstance(stale, dict):
+                continue
+            stale_content = stale.get("content")
+            if isinstance(stale_content, list):
+                for block in stale_content:
+                    if isinstance(block, dict):
+                        block.pop("cache_control", None)
+
+    tools = payload.get("tools")
+    if isinstance(tools, list) and tools and isinstance(tools[-1], dict):
+        tools[-1]["cache_control"] = dict(_ANTHROPIC_CACHE_CONTROL)
+
+    system = payload.get("system")
+    if isinstance(system, str) and system:
+        payload["system"] = [
+            {"type": "text", "text": system, "cache_control": dict(_ANTHROPIC_CACHE_CONTROL)}
+        ]
+    elif isinstance(system, list) and system and isinstance(system[-1], dict):
+        system[-1]["cache_control"] = dict(_ANTHROPIC_CACHE_CONTROL)
+
+    msgs = payload.get("messages")
+    if not isinstance(msgs, list):
+        return
+    for message in reversed(msgs):
+        if not isinstance(message, dict):
+            continue
+        if _message_starts_with_status(message):
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            message["content"] = [
+                {"type": "text", "text": content, "cache_control": dict(_ANTHROPIC_CACHE_CONTROL)}
+            ]
+            return
+        if isinstance(content, list) and content:
+            for block in reversed(content):
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") in _ANTHROPIC_CACHEABLE_BLOCK_TYPES
+                ):
+                    block["cache_control"] = dict(_ANTHROPIC_CACHE_CONTROL)
+                    return
+        # Message had no cacheable block (e.g. thinking-only) — try older.
+
+
 def _build_native_anthropic(model: str, callbacks: Any = None) -> Any:
     """Build a native Anthropic Messages API client (LANGCHAIN_PROVIDER=anthropic).
 
@@ -571,7 +665,19 @@ def _build_native_anthropic(model: str, callbacks: Any = None) -> Any:
             return self._payload
 
     class ChatAnthropicCompat(ChatAnthropic):
-        """ChatAnthropic tolerant of relay-serialized stream-event fields."""
+        """ChatAnthropic tolerant of relay-serialized stream-event fields.
+
+        Also injects prompt-caching breakpoints into every outgoing payload
+        (see :func:`_apply_anthropic_cache_breakpoints`).
+        """
+
+        def _get_request_payload(self, *args: Any, **kwargs: Any) -> dict:
+            payload = super()._get_request_payload(*args, **kwargs)
+            try:
+                _apply_anthropic_cache_breakpoints(payload)
+            except Exception:  # noqa: BLE001 - caching is an optimization only
+                logger.debug("anthropic cache breakpoint injection skipped", exc_info=True)
+            return payload
 
         def _make_message_chunk_from_anthropic_event(self, event: Any, *args: Any, **kwargs: Any) -> Any:
             for holder in (event, getattr(event, "message", None)):
