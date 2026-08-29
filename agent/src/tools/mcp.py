@@ -555,6 +555,32 @@ class MCPRemoteTool(BaseTool):
         self.description = spec.description
         self.parameters = spec.parameters
 
+    @property
+    def timeout_seconds(self) -> float:
+        """Loop-side watchdog bound for this remote MCP tool (V1).
+
+        A remote call can legitimately take ``tool_timeout`` for the call plus
+        ``init_timeout`` for a cold-start connection (pip install, docker pull,
+        slow imports). With an operator-configured ``tool_timeout`` above the
+        tenant-wide tool timeout, the loop's write-tool window would otherwise
+        abandon a call the client itself has not given up on yet.
+        ``MCPRemoteTool`` is a write tool by default (only ``live/registry.py``
+        flips curated read-only broker tools), so this covers every ordinary
+        MCP server.
+
+        Safe to declare because the client enforces both component timeouts
+        itself and ``tool_timeout`` is schema-bounded (``le=1800``).
+
+        Returns:
+            Connection + call allowance plus a small margin, in seconds.
+        """
+        try:
+            call_timeout = float(self._adapter.server_config.tool_timeout)
+        except Exception:  # noqa: BLE001 - fall back to the loop's global
+            return 0.0
+        # Mirrors _build_client(): init_timeout = max(tool_timeout, 30.0).
+        return call_timeout + max(call_timeout, 30.0) + 30.0
+
     def execute(self, **kwargs: Any) -> str:
         """Execute the remote MCP tool and return normalized JSON.
 

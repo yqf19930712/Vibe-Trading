@@ -103,11 +103,30 @@ TOOL_TIMEOUT_SECONDS = float(os.getenv("VIBE_TRADING_TOOL_TIMEOUT_SECONDS", "180
 # a structured timeout error to the model, and discards the late result via the
 # same queue mechanism the readonly path uses (the worker thread may still
 # finish its side effect in the background — that is announced in the error).
+#
+# V1: the base of that 1×/2× window is per-tool (``_tool_timeout``), not the
+# tenant-wide constant. Pinning it to TOOL_TIMEOUT_SECONDS made the watchdog
+# fire at 600s on a run_swarm whose own wait budget is 7200s, so the two-hour
+# swarm tier was unreachable and the ``wait_budget_exhausted`` salvage path
+# (which is what carries the run_id back) never executed.
 WRITE_TOOL_TIMEOUT_FACTOR = 2.0
 # Batch 3: when an attempt deadline is bound, force the final text answer once
 # less than this many seconds (or ~1.2 avg iterations) remain — a partial
 # answer beats the caller timing out on nothing.
 FINALIZE_RESERVE_S = float(os.getenv("VIBE_FINALIZE_RESERVE_S", "60"))
+# V1: seconds held back when clamping a tool timeout to the attempt budget.
+# Keep at least as much back as the forced-finalize path needs — the literal
+# 45.0 used before was 15s SHORT of FINALIZE_RESERVE_S's default, so abandoning
+# a tool could leave the loop with less time than the forced-finalize path
+# requires and the "a partial answer beats a timeout" guarantee became nominal.
+_TOOL_CAP_RESERVE_S = max(45.0, FINALIZE_RESERVE_S)
+# Minimum window a tool gets even on a nearly-spent budget, so a late call
+# still gets one quick shot instead of an instant failure (batch 3 semantics,
+# unchanged). Promoted from call-site literals to named constants in V1 so the
+# nesting/clamp regressions can scale them, and so the overshoot they permit
+# (up to floor + grace floor past the deadline) is visible in one place.
+_TOOL_CAP_FLOOR_S = 10.0
+_TOOL_GRACE_FLOOR_S = 5.0
 GOAL_MAX_CONTINUATIONS = int(os.getenv("VIBE_TRADING_GOAL_MAX_CONTINUATIONS", "3"))
 LLM_USAGE_ARTIFACT = "llm_usage.json"
 
@@ -1545,11 +1564,13 @@ class AgentLoop:
             self._emit("tool_heartbeat", payload)
 
         t0 = _time.perf_counter()
-        timeout = TOOL_TIMEOUT_SECONDS if TOOL_TIMEOUT_SECONDS > 0 else None
+        timeout = self._tool_timeout(tool_name)
         if timeout is not None:
             # Never let a single tool outlive the attempt budget (batch 3):
             # keep a reserve so the loop can still produce a final answer.
-            timeout = _budget.cap_timeout(timeout, reserve_s=45.0, floor_s=10.0)
+            timeout = _budget.cap_timeout(
+                timeout, reserve_s=_TOOL_CAP_RESERVE_S, floor_s=_TOOL_CAP_FLOOR_S
+            )
         timeout_label = _format_timeout(timeout) if timeout is not None else ""
 
         def _elapsed_ms() -> int:
@@ -1656,8 +1677,8 @@ class AgentLoop:
                 grace = (
                     _budget.cap_timeout(
                         timeout * (WRITE_TOOL_TIMEOUT_FACTOR - 1.0),
-                        reserve_s=45.0,
-                        floor_s=5.0,
+                        reserve_s=_TOOL_CAP_RESERVE_S,
+                        floor_s=_TOOL_GRACE_FLOOR_S,
                     )
                     if timeout is not None
                     else None
@@ -1704,6 +1725,45 @@ class AgentLoop:
         if exc is not None:
             raise exc
         return result or "", _elapsed_ms()
+
+    def _tool_timeout(self, tool_name: str) -> float | None:
+        """Per-call hard timeout for ``tool_name`` (None = no watchdog).
+
+        Defaults to the tenant-wide ``TOOL_TIMEOUT_SECONDS``. A tool whose
+        NORMAL runtime legitimately exceeds it declares ``timeout_seconds``
+        (``run_swarm``: SWARM_TIMEOUT + margin). The declaration only RAISES
+        the base of the F2 1×-warn / 2×-abandon window, never lowers it, and
+        the attempt budget still clamps the result via ``cap_timeout`` at the
+        call site — so a hung tool can never outlive the caller's deadline
+        regardless of what it declares.
+
+        ``max()`` rather than a plain override is deliberate: an operator
+        lowering ``VIBE_TRADING_TOOL_TIMEOUT_SECONDS`` for a tenant must not
+        silently truncate a swarm (``SWARM_TIMEOUT`` is that knob), and a tool
+        author must not be able to shorten its own window and have its result
+        thrown away.
+
+        Args:
+            tool_name: Name of the tool about to be invoked.
+
+        Returns:
+            Timeout in seconds, or None when the watchdog is disabled.
+        """
+        base = TOOL_TIMEOUT_SECONDS
+        get_tool = getattr(self.registry, "get", None)
+        if callable(get_tool):
+            try:
+                # Read through the instance so a property-backed declaration
+                # (SwarmTool) is evaluated at call time.
+                declared = getattr(get_tool(tool_name), "timeout_seconds", None)
+            except Exception:  # noqa: BLE001 - unknown tool keeps the default
+                declared = None
+            try:
+                if declared:
+                    base = max(base, float(declared))
+            except (TypeError, ValueError):  # noqa: BLE001 - malformed declaration
+                pass
+        return base if base > 0 else None
 
     def _is_tool_readonly(self, tool_name: str) -> bool:
         """Return whether a tool is known to be side-effect free."""

@@ -110,7 +110,13 @@ def test_no_results_is_ok_empty_not_error(monkeypatch):
 
 
 def test_persistent_failure_returns_actionable_error(monkeypatch):
-    """When every attempt fails, the error names the retry/env/read_url remedies."""
+    """When every attempt fails, the error names remedies the MODEL can apply.
+
+    V1: the old text told the model to set ``VIBE_TRADING_SEARCH_BACKENDS`` —
+    an operator env var it cannot touch — and illustrated it with 'google, bing',
+    engines ddgs 9.x removed. Only retry and read_url survive; neither the env
+    var nor a dead engine name may reappear here.
+    """
     monkeypatch.setattr("src.tools.web_search_tool.time.sleep", lambda *_: None)
     calls = {"n": 0}
 
@@ -123,8 +129,10 @@ def test_persistent_failure_returns_actionable_error(monkeypatch):
 
     assert out["status"] == "error"
     assert calls["n"] == 3  # exhausted all attempts
-    assert "VIBE_TRADING_SEARCH_BACKENDS" in out["error"]
+    assert "retry" in out["error"].lower()
     assert "read_url" in out["error"]
+    assert "VIBE_TRADING_SEARCH_BACKENDS" not in out["error"]
+    assert "google" not in out["error"].lower()
 
 
 def test_max_results_capped_at_10(monkeypatch):

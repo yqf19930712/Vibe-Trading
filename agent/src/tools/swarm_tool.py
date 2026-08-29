@@ -21,6 +21,19 @@ logger = logging.getLogger(__name__)
 _POLL_INTERVAL_SECONDS = 5
 _MAX_WAIT_SECONDS = int(os.getenv("SWARM_TIMEOUT", "7200"))
 
+# Nesting invariant (V1). The tool's own wait keeps back MORE than the loop's
+# watchdog does, so on a bounded attempt budget the tool ALWAYS expires first
+# and gets to return ``wait_budget_exhausted`` + run_id + the partial report.
+# The loop's watchdog then only ever fires on a real hang (e.g. a wedged
+# store.load_run). Module constants rather than literals so the scaled-down
+# nesting regression can patch them — see tests/test_swarm_timeout_nesting.py.
+_WAIT_RESERVE_S = 90.0
+_WAIT_FLOOR_S = 60.0
+# Margin added on top of _MAX_WAIT_SECONDS when declaring the loop-side
+# watchdog bound. Covers the unbounded-budget case, where cap_timeout returns
+# the raw value on both sides and the two would otherwise expire in a dead heat.
+_LOOP_WATCHDOG_MARGIN_S = 120.0
+
 # F3 (batch F): code-level enforcement of the "salvage, don't re-run" rule the
 # system prompt only stated as prose. After a preset FAILS, an identical-preset
 # re-run within this window is refused with a structured rejection carrying the
@@ -31,6 +44,10 @@ _FAILURE_COOLDOWN_SECONDS = 30 * 60
 _SALVAGE_REPORT_MAX_CHARS = 4000
 _SALVAGE_TASK_MAX_CHARS = 1200
 _SALVAGE_MAX_TASKS = 12
+
+# Routing score reported for a preset the caller named outright — deliberately
+# above any achievable keyword score so "named" is distinguishable at a glance.
+_EXPLICIT_NAME_SCORE = 99.0
 
 # Preset matching: (preset_name, keyword_patterns, weight_boost). Patterns match user intent (EN + ZH).
 _PRESET_KEYWORDS: list[tuple[str, list[str], float]] = [
@@ -326,6 +343,70 @@ _PRESET_KEYWORDS: list[tuple[str, list[str], float]] = [
         ],
         0.9,
     ),
+    # V1: the four presets below shipped as YAML but had no keyword row, so
+    # they were unreachable — ``_PRESET_NAMES`` was derived from THIS table, so
+    # even an explicit ``preset_name="crypto_trading_desk"`` came back as
+    # "Unknown preset", and prose naming them silently scored onto a neighbour
+    # (「preset 用 macro_rates_fx_desk」 routed to macro_strategy_forum on the
+    # bare word "macro"). Their boosts sit ABOVE those neighbours because each
+    # is the more specific desk for its phrases.
+    (
+        "macro_rates_fx_desk",
+        [
+            r"rates?\s+and\s+fx",
+            r"\bFX\b",
+            r"foreign\s+exchange",
+            r"yield\s+curve",
+            r"cross[- ]asset\s+macro",
+            "外汇",
+            "汇率",
+            "利率曲线",
+            "国债收益率",
+            "跨资产宏观",
+        ],
+        0.95,
+    ),
+    (
+        "earnings_research_desk",
+        [
+            r"earnings\s+season",
+            r"earnings\s+preview",
+            r"earnings\s+research",
+            r"consensus\s+revision",
+            "财报季",
+            "业绩预告",
+            "一致预期",
+            "盈利预测",
+        ],
+        0.95,
+    ),
+    (
+        "global_equities_desk",
+        [
+            r"global\s+equit",
+            r"international\s+equit",
+            r"cross[- ]?market\s+stock",
+            "全球选股",
+            "跨市场选股",
+            "全球股票",
+        ],
+        0.95,
+    ),
+    (
+        "crypto_trading_desk",
+        [
+            r"funding\s+rate",
+            r"basis\s+trade",
+            r"\bperp(?:etual)?s?\b",
+            r"liquidation\s+(?:map|heat)",
+            r"crypto\s+(?:trading\s+)?desk",
+            "资金费率",
+            "永续合约",
+            "清算热力",
+            "加密.*执行",
+        ],
+        0.95,
+    ),
 ]
 
 # Market labels used in YAML templates (English, compatible with {market} placeholders).
@@ -362,6 +443,101 @@ _REVIEW_PERIOD_PATTERNS: list[tuple[str, list[str]]] = [
     ("quarterly", [r"\bquarter(?:ly)?\b", r"\bq[1-4]\b"]),
 ]
 
+# V1: the pattern tables below close a class of silent bugs where a variable
+# was hard-coded in ``_build_variables`` — commodity_research_team analysed
+# GOLD whatever the user asked about, crypto_research_lab always looked at
+# "BTC, ETH, SOL", derivatives always took a NEUTRAL view, factor research
+# always benched VALUE, the event desk always scanned "all types" and fund
+# selection always screened EQUITY funds. Each now reads the prompt first and
+# falls back to the old constant only when nothing matches; the presets that
+# most depended on it additionally receive ``{goal}`` (the user's own words)
+# so a miss degrades to "here is what was actually asked" rather than a
+# confidently wrong subject.
+
+_COMMODITY_PATTERNS: list[tuple[str, list[str]]] = [
+    ("crude oil", [r"\bcrude\b", r"\bbrent\b", r"\bWTI\b", r"\boil\b", "原油", "石油"]),
+    ("natural gas", [r"natural\s+gas", r"\bLNG\b", "天然气"]),
+    ("gold", [r"\bgold\b", r"\bXAU\b", "黄金", "金价"]),
+    ("silver", [r"\bsilver\b", r"\bXAG\b", "白银"]),
+    ("copper", [r"\bcopper\b", "铜"]),
+    ("aluminium", [r"\balumin(?:i)?um\b", "铝"]),
+    ("nickel", [r"\bnickel\b", "镍"]),
+    ("lithium", [r"\blithium\b", "锂"]),
+    ("iron ore", [r"iron\s+ore", "铁矿"]),
+    ("rebar", [r"\brebar\b", "螺纹钢"]),
+    ("soybeans", [r"\bsoybeans?\b", "大豆"]),
+    ("corn", [r"\bcorn\b", "玉米"]),
+    ("coal", [r"\bcoal\b", "煤炭", "动力煤"]),
+]
+
+# Horizon labels for commodity_research_team ({horizon} in the YAML).
+_HORIZON_PATTERNS: list[tuple[str, list[str]]] = [
+    ("1 month", [r"\b1\s*month\b", r"\bone\s+month\b", "一个月", "1个月"]),
+    ("6 months", [r"\b6\s*months\b", r"\bsix\s+months\b", "半年", "六个月", "6个月"]),
+    ("1 year", [r"\b1\s*year\b", r"\bone\s+year\b", r"\b12\s*months\b", "一年", "12个月"]),
+    ("3 months", [r"\b3\s*months\b", r"\bthree\s+months\b", r"\bquarter\b", "三个月", "3个月", "季度"]),
+]
+
+# Timeframe labels for crypto_research_lab / crypto_trading_desk /
+# macro_rates_fx_desk ({timeframe} in those YAMLs).
+_TIMEFRAME_PATTERNS: list[tuple[str, list[str]]] = [
+    ("intraday", [r"\bintraday\b", r"\bday\s+trad", "日内", "盘中"]),
+    ("short-term 1-4 weeks", [r"\bshort[- ]term\b", r"\bnext\s+few\s+weeks\b", "短线", "短期", "未来几周"]),
+    ("long-term 6-12 months", [r"\blong[- ]term\b", r"\b6-12\s*months\b", "长线", "长期"]),
+    ("medium-term 1-3 months", [r"\bmedium[- ]term\b", r"\bmid[- ]term\b", "中线", "中期"]),
+]
+
+# Directional view for derivatives_strategy_desk ({view} in the YAML).
+_VIEW_PATTERNS: list[tuple[str, list[str]]] = [
+    ("bullish", [r"\bbullish\b", r"\bupside\b", r"\brally\b", r"\blong\b", "看多", "看涨", "做多"]),
+    ("bearish", [r"\bbearish\b", r"\bdownside\b", r"\bcrash\b", r"\bshort\b", "看空", "看跌", "做空"]),
+    ("volatile", [r"\bvolatil", r"\bwhipsaw\b", r"\bbig\s+move\b", "波动放大", "大波动"]),
+    ("neutral", [r"\bneutral\b", r"\brange[- ]bound\b", "震荡", "中性"]),
+]
+
+# Factor family for factor_research_committee ({factor_type} in the YAML).
+_FACTOR_TYPE_PATTERNS: list[tuple[str, list[str]]] = [
+    ("momentum", [r"\bmomentum\b", r"\breversal\b", "动量", "反转"]),
+    ("quality", [r"\bquality\b", r"\bROE\b", r"\bprofitability\b", "质量", "盈利质量"]),
+    ("growth", [r"\bgrowth\b", "成长"]),
+    ("size", [r"\bsize\b", r"\bsmall[- ]cap\b", r"\bmarket\s+cap\b", "市值", "小盘"]),
+    ("volatility", [r"\bvolatility\s+factor\b", r"\blow[- ]vol\b", "低波", "波动率因子"]),
+    ("liquidity", [r"\bliquidity\b", "流动性"]),
+    ("value", [r"\bvalue\b", r"\bPB\b", r"\bPE\b", r"\bcheapness\b", "价值", "估值因子"]),
+]
+
+# Event family for event_driven_task_force ({event_type} in the YAML).
+_EVENT_TYPE_PATTERNS: list[tuple[str, list[str]]] = [
+    ("M&A", [r"M&A", r"\bmerger", r"\bacquisition", r"\btakeover\b", "并购", "重组"]),
+    ("earnings", [r"\bearnings\b", r"\bresults\s+announcement\b", "财报", "业绩"]),
+    ("regulatory / policy", [r"\bregulat", r"\bpolicy\b", r"\bsanction", "监管", "政策"]),
+    ("insider / ownership", [r"\binsider\b", r"\bbuyback\b", r"\bstake\b", "增持", "减持", "回购"]),
+    ("spin-off / restructuring", [r"\bspin[- ]off\b", r"\bdivest", "分拆", "剥离"]),
+    ("index rebalance", [r"index\s+rebalanc", r"\binclusion\b", "指数调样", "纳入"]),
+]
+
+# Fund family for fund_selection_panel ({fund_type} in the YAML).
+_FUND_TYPE_PATTERNS: list[tuple[str, list[str]]] = [
+    ("bond", [r"\bbond\s+fund", r"\bfixed[- ]income\b", "债基", "债券型", "固收"]),
+    ("money market", [r"money\s+market", "货币基金", "货基"]),
+    ("index / ETF", [r"\bindex\s+fund", r"\bETF\b", r"\bpassive\b", "指数基金", "被动"]),
+    ("QDII / overseas", [r"\bQDII\b", r"\boverseas\b", "海外基金", "跨境"]),
+    ("hybrid", [r"\bhybrid\b", r"\bbalanced\s+fund", "混合型", "偏股混合"]),
+    ("equity", [r"\bequity\s+fund", r"\bstock\s+fund", "股票型", "权益基金"]),
+]
+
+# Crypto tickers recognised for crypto_research_lab / crypto_trading_desk.
+_CRYPTO_TICKER_PATTERN = re.compile(
+    r"\b(BTC|XBT|ETH|SOL|BNB|XRP|ADA|DOGE|AVAX|DOT|MATIC|LINK|TON|TRX|LTC|ATOM|ARB|OP|SUI|APT)\b",
+    re.IGNORECASE,
+)
+_CRYPTO_NAME_ALIASES: list[tuple[str, str]] = [
+    (r"\bbitcoin\b|比特币", "BTC"),
+    (r"\bether(?:eum)?\b|以太坊", "ETH"),
+    (r"\bsolana\b", "SOL"),
+]
+_CRYPTO_DEFAULT_TARGET = "BTC, ETH, SOL"
+
 _SECTOR_PATTERNS: list[tuple[str, list[str]]] = [
     ("banks", [r"\bbank(?:s|ing)?\b", r"\bfinancials?\b"]),
     ("consumer", [r"\bconsumer\b", r"\bretail\b", r"\bstaples\b", r"\bdiscretionary\b"]),
@@ -376,6 +552,135 @@ _SECTOR_PATTERNS: list[tuple[str, list[str]]] = [
 ]
 
 
+def _discover_preset_names() -> frozenset[str]:
+    """Return the preset roster, sourced from the bundled YAML files (V1).
+
+    The single source of truth is ``agent/src/swarm/presets/*.yaml``, NOT the
+    keyword table. Deriving the roster from ``_PRESET_KEYWORDS`` (as it used to
+    be) silently made every preset without a keyword row unreachable: four
+    shipped YAMLs were rejected as "Unknown preset" on an explicit
+    ``preset_name``, and the system prompt's "29 swarm teams" was really 25.
+
+    The keyword names are unioned in as a floor so a hypothetical missing
+    package-data install degrades to the old behaviour instead of an empty
+    roster (``load_preset`` reports a missing file clearly anyway).
+
+    Returns:
+        Frozen set of valid preset names.
+    """
+    names: set[str] = set()
+    try:
+        from src.swarm.presets import PRESETS_DIR
+
+        names = {path.stem for path in PRESETS_DIR.glob("*.yaml")}
+    except Exception:  # noqa: BLE001 - fall back to the keyword table
+        logger.warning("SwarmTool: preset directory unreadable", exc_info=True)
+    return frozenset(names | {preset_name for preset_name, _, _ in _PRESET_KEYWORDS})
+
+
+_PRESET_NAMES = _discover_preset_names()
+# Longest-first so a name that is a prefix of another can never shadow it.
+_PRESET_NAMES_BY_LENGTH = sorted(_PRESET_NAMES, key=lambda n: (-len(n), n))
+
+
+def _exact_preset_name(prompt: str) -> str | None:
+    """Return the preset explicitly named in ``prompt``, if any.
+
+    Iterates the YAML-derived roster rather than the keyword table so newly
+    added presets are nameable the moment their YAML ships.
+
+    Args:
+        prompt: User's natural language prompt.
+
+    Returns:
+        The named preset, or None.
+    """
+    normalized_prompt = re.sub(r"[\s-]+", "_", prompt.strip().lower())
+    for preset_name in _PRESET_NAMES_BY_LENGTH:
+        if re.search(rf"(?<![a-z0-9]){re.escape(preset_name)}(?![a-z0-9])", normalized_prompt):
+            return preset_name
+    return None
+
+
+def _is_phrase_hit(matched_text: str) -> bool:
+    """Whether a keyword match counts as an exact-phrase (high-confidence) hit.
+
+    A multi-word English phrase ("funding rate", "sector rotation") or a CJK
+    term of 3+ characters ("资金费率") is specific evidence of intent; a single
+    short token ("crypto", "macro", "因子") is ambient vocabulary that shows up
+    in unrelated prompts too. Used only to break score ties (V1) — it never
+    changes a decision that the weighted score already settles.
+
+    Args:
+        matched_text: The substring a keyword pattern actually matched.
+
+    Returns:
+        True when the match is a phrase-level hit.
+    """
+    text = matched_text.strip()
+    if not text:
+        return False
+    if re.search(r"\s", text):
+        return True
+    return len(text) >= 3 and not text.isascii()
+
+
+def _score_presets(prompt: str) -> dict[str, tuple[float, int]]:
+    """Score every preset against ``prompt``.
+
+    Args:
+        prompt: User's natural language prompt.
+
+    Returns:
+        Mapping of preset name to (weighted score, exact-phrase hit count).
+    """
+    scores: dict[str, tuple[float, int]] = {}
+    for preset_name, keywords, boost in _PRESET_KEYWORDS:
+        score = 0.0
+        phrase_hits = 0
+        for kw in keywords:
+            match = re.search(kw, prompt, re.IGNORECASE)
+            if match is None:
+                continue
+            score += boost
+            if _is_phrase_hit(match.group(0)):
+                phrase_hits += 1
+        scores[preset_name] = (score, phrase_hits)
+    return scores
+
+
+def _match_preset_scored(prompt: str) -> tuple[str, float]:
+    """Match a prompt to the best preset, returning the routing score too.
+
+    Args:
+        prompt: User's natural language prompt.
+
+    Returns:
+        Tuple of (preset name, routing score). An explicitly named preset
+        scores ``_EXPLICIT_NAME_SCORE``; the ``equity_research_team`` fallback
+        scores 0.0.
+    """
+    named = _exact_preset_name(prompt)
+    if named is not None:
+        return named, _EXPLICIT_NAME_SCORE
+
+    scores = _score_presets(prompt)
+    order = {name: idx for idx, (name, _, _) in enumerate(_PRESET_KEYWORDS)}
+    # Tie-break (V1): on equal weighted score, prefer the preset with more
+    # exact-phrase hits — "crypto funding rate" ties crypto_research_lab (the
+    # bare word "crypto") against crypto_trading_desk ("funding rate"), and the
+    # phrase is the one that actually identifies the desk. Table order is the
+    # final, deterministic fallback.
+    best = min(
+        scores,
+        key=lambda name: (-scores[name][0], -scores[name][1], order[name]),
+    )
+    if scores[best][0] > 0:
+        return best, scores[best][0]
+
+    return "equity_research_team", 0.0
+
+
 def _match_preset(prompt: str) -> str:
     """Match user prompt to best preset using keyword scoring.
 
@@ -385,27 +690,27 @@ def _match_preset(prompt: str) -> str:
     Returns:
         Best matching preset name.
     """
-    normalized_prompt = re.sub(r"[\s-]+", "_", prompt.strip().lower())
-    for preset_name, _, _ in _PRESET_KEYWORDS:
-        if re.search(rf"(?<![a-z0-9]){re.escape(preset_name)}(?![a-z0-9])", normalized_prompt):
-            return preset_name
-
-    scores: dict[str, float] = {}
-    for preset_name, keywords, boost in _PRESET_KEYWORDS:
-        score = 0.0
-        for kw in keywords:
-            if re.search(kw, prompt, re.IGNORECASE):
-                score += boost
-        scores[preset_name] = score
-
-    best = max(scores, key=scores.get)  # type: ignore[arg-type]
-    if scores[best] > 0:
-        return best
-
-    return "equity_research_team"
+    return _match_preset_scored(prompt)[0]
 
 
-_PRESET_NAMES = {preset_name for preset_name, _, _ in _PRESET_KEYWORDS}
+def _preset_route_score(prompt: str, preset_name: str) -> float:
+    """Routing confidence for ``preset_name`` given ``prompt`` (V1).
+
+    Surfaced as ``preset_score`` next to ``auto_variables`` so a reader of the
+    result (model, trace, ops tab) can tell a confident keyword match from the
+    ``equity_research_team`` fallback, which today look identical.
+
+    Args:
+        prompt: The prompt the run was routed from.
+        preset_name: The preset that was actually resolved.
+
+    Returns:
+        ``_EXPLICIT_NAME_SCORE`` when the preset was named outright, otherwise
+        the weighted keyword score (0.0 for a pure fallback).
+    """
+    if _exact_preset_name(prompt) == preset_name:
+        return _EXPLICIT_NAME_SCORE
+    return _score_presets(prompt).get(preset_name, (0.0, 0))[0]
 _CONTINUATION_PATTERNS = (
     r"^\s*continue\b",
     r"^\s*resume\b",
@@ -428,10 +733,8 @@ def _normalize_preset_name(value: str) -> str | None:
 
 def _has_preset_signal(prompt: str) -> bool:
     """Return whether prompt contains an explicit preset name or routing keyword."""
-    normalized_prompt = re.sub(r"[\s-]+", "_", prompt.strip().lower())
-    for preset_name, _, _ in _PRESET_KEYWORDS:
-        if re.search(rf"(?<![a-z0-9]){re.escape(preset_name)}(?![a-z0-9])", normalized_prompt):
-            return True
+    if _exact_preset_name(prompt) is not None:
+        return True
     for _, keywords, _ in _PRESET_KEYWORDS:
         for kw in keywords:
             if re.search(kw, prompt, re.IGNORECASE):
@@ -575,6 +878,87 @@ def _extract_sector(prompt: str) -> str:
     return ""
 
 
+def _first_label(prompt: str, table: list[tuple[str, list[str]]], default: str) -> str:
+    """Return the first label in ``table`` whose patterns match ``prompt``.
+
+    Args:
+        prompt: User's natural language prompt.
+        table: (label, patterns) rows, most specific first.
+        default: Label used when nothing matches.
+
+    Returns:
+        The matched label, or ``default``.
+    """
+    for label, patterns in table:
+        for pat in patterns:
+            if re.search(pat, prompt, re.IGNORECASE):
+                return label
+    return default
+
+
+def _extract_commodity(prompt: str) -> str | None:
+    """Extract the commodity under discussion (V1).
+
+    Returns:
+        A commodity label, or None when the prompt names none — the caller
+        then leans on ``{goal}`` instead of silently analysing gold.
+    """
+    found = _first_label(prompt, _COMMODITY_PATTERNS, "")
+    return found or None
+
+
+def _extract_horizon(prompt: str) -> str:
+    """Extract an investment horizon label (commodity_research_team)."""
+    return _first_label(prompt, _HORIZON_PATTERNS, "3 months")
+
+
+def _extract_timeframe(prompt: str, default: str = "medium-term 1-3 months") -> str:
+    """Extract a trading/analysis timeframe label."""
+    return _first_label(prompt, _TIMEFRAME_PATTERNS, default)
+
+
+def _extract_view(prompt: str) -> str:
+    """Extract a directional view (derivatives_strategy_desk)."""
+    return _first_label(prompt, _VIEW_PATTERNS, "neutral")
+
+
+def _extract_factor_type(prompt: str) -> str:
+    """Extract a factor family (factor_research_committee)."""
+    return _first_label(prompt, _FACTOR_TYPE_PATTERNS, "value")
+
+
+def _extract_event_type(prompt: str) -> str:
+    """Extract an event family (event_driven_task_force)."""
+    return _first_label(prompt, _EVENT_TYPE_PATTERNS, "all types")
+
+
+def _extract_fund_type(prompt: str) -> str:
+    """Extract a fund family (fund_selection_panel)."""
+    return _first_label(prompt, _FUND_TYPE_PATTERNS, "equity")
+
+
+def _extract_crypto_targets(prompt: str) -> str:
+    """Extract the crypto assets named in ``prompt`` (V1).
+
+    Args:
+        prompt: User's natural language prompt.
+
+    Returns:
+        Comma-separated uppercase tickers in first-appearance order, or the
+        ``BTC, ETH, SOL`` majors when the prompt names none.
+    """
+    found: list[str] = []
+    for match in _CRYPTO_TICKER_PATTERN.finditer(prompt):
+        ticker = match.group(1).upper()
+        ticker = "BTC" if ticker == "XBT" else ticker
+        if ticker not in found:
+            found.append(ticker)
+    for pattern, ticker in _CRYPTO_NAME_ALIASES:
+        if re.search(pattern, prompt, re.IGNORECASE) and ticker not in found:
+            found.append(ticker)
+    return ", ".join(found) if found else _CRYPTO_DEFAULT_TARGET
+
+
 def _snippet(prompt: str, max_len: int = 240) -> str:
     """Trim prompt for auxiliary fields."""
     s = prompt.strip()
@@ -602,11 +986,24 @@ def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
         "equity_research_team": {"market": market, "goal": g},
         "quant_strategy_desk": {"market": market, "goal": g},
         "risk_committee": {"goal": g},
-        "factor_research_committee": {"market": market, "factor_type": "value"},
-        "event_driven_task_force": {"market": market, "event_type": "all types"},
+        "factor_research_committee": {
+            "market": market,
+            "factor_type": _extract_factor_type(prompt),
+        },
+        "event_driven_task_force": {
+            "market": market,
+            "event_type": _extract_event_type(prompt),
+        },
         "etf_allocation_desk": {"risk_profile": _risk_to_etf_profile(risk), "market": market},
-        "derivatives_strategy_desk": {"target": g, "view": "neutral"},
-        "crypto_research_lab": {"target": "BTC, ETH, SOL", "timeframe": "medium-term 1-3 months"},
+        "derivatives_strategy_desk": {"target": g, "view": _extract_view(prompt)},
+        "crypto_research_lab": {
+            "target": _extract_crypto_targets(prompt),
+            "timeframe": _extract_timeframe(prompt),
+            # The extractor falls back to the majors when no ticker is named;
+            # {goal} keeps the user's actual ask in front of the workers so a
+            # fallback reads as "these majors, for THIS question".
+            "goal": g,
+        },
         "credit_research_team": {"target": g, "market": "China credit bonds"},
         "convertible_bond_team": {
             "market": "A-share convertible bonds",
@@ -614,8 +1011,15 @@ def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
             "strategy_type": _extract_strategy_type(prompt),
         },
         "fundamental_research_team": {"target": g, "market": market},
-        "commodity_research_team": {"commodity": "gold", "horizon": "3 months"},
-        "fund_selection_panel": {"fund_type": "equity", "goal": g},
+        "commodity_research_team": {
+            # No hard-coded "gold": an unnamed commodity now defers to {goal}
+            # rather than sending a three-agent team to research bullion the
+            # user never mentioned.
+            "commodity": _extract_commodity(prompt) or "the commodity named in the request below",
+            "horizon": _extract_horizon(prompt),
+            "goal": g,
+        },
+        "fund_selection_panel": {"fund_type": _extract_fund_type(prompt), "goal": g},
         "social_alpha_team": {"target": g, "timeframe": "daily"},
         "geopolitical_war_room": {"crisis": g, "market": market},
         "pairs_research_lab": {"market": market, "sector": _extract_sector(prompt)},
@@ -627,6 +1031,16 @@ def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
         "sector_rotation_team": {"market": market, "goal": g},
         "portfolio_review_board": {"portfolio": g, "review_period": _extract_review_period(prompt), "goal": g},
         "ml_quant_lab": {"market": market, "target_variable": _extract_target_variable(prompt), "goal": g},
+        # V1: the four presets below had YAMLs but no builder row, so even once
+        # reachable they would have fallen through to the {market, goal}
+        # default and left their own template variables unsubstituted.
+        "macro_rates_fx_desk": {"goal": g, "timeframe": _extract_timeframe(prompt, "quarterly")},
+        "earnings_research_desk": {"target": g},
+        "global_equities_desk": {"goal": g, "risk_tolerance": risk},
+        "crypto_trading_desk": {
+            "target": _extract_crypto_targets(prompt),
+            "timeframe": _extract_timeframe(prompt),
+        },
     }
 
     return builders.get(preset_name, {"market": market, "goal": g})
@@ -645,6 +1059,11 @@ class SwarmTool(BaseTool):
         "Provide a natural language prompt and, when known, an explicit preset_name from agent/src/swarm/presets "
         "(e.g. equity_research_team, quant_strategy_desk, global_allocation_committee, risk_committee) "
         "so follow-up/continuation prompts do not lose routing context. "
+        "A swarm normally runs for tens of minutes; this call blocks until the run "
+        "finishes or the wait budget runs out. If it returns wait_budget_exhausted=true, "
+        "the run is STILL RUNNING in the background — call run_swarm again with that "
+        "run_id (no prompt needed) to keep waiting on the SAME run instead of starting "
+        "a new one. "
         "Example: run_swarm(prompt='Analyze A-share new energy opportunities for Q2 2026', preset_name='equity_research_team')"
     )
     parameters = {
@@ -652,17 +1071,47 @@ class SwarmTool(BaseTool):
         "properties": {
             "prompt": {
                 "type": "string",
-                "description": "Natural language description of the analysis task.",
+                "description": "Natural language description of the analysis task. Omit only when resuming via run_id.",
             },
             "preset_name": {
                 "type": "string",
                 "description": "Optional explicit swarm preset name when the user named one or this is a continuation.",
             },
+            "run_id": {
+                "type": "string",
+                "description": (
+                    "Resume waiting on an existing background run (the run_id returned "
+                    "alongside wait_budget_exhausted=true). Starts no new run and costs "
+                    "no extra tokens; prompt/preset_name are ignored when set."
+                ),
+            },
         },
-        "required": ["prompt"],
+        "required": [],
     }
     is_readonly = False
     repeatable = True  # loop.py dedups by tool name; each prompt is a distinct run (#42)
+
+    @property
+    def timeout_seconds(self) -> float:
+        """Loop-side watchdog bound for run_swarm (V1).
+
+        A swarm is a multi-layer DAG of LLM workers; tens of minutes is its
+        NORMAL runtime, not a hang. The tool runs its own budget-clamped wait
+        (``cap_timeout(SWARM_TIMEOUT, reserve_s=_WAIT_RESERVE_S)``) and returns
+        ``wait_budget_exhausted`` with the run_id when that expires — the
+        loop's watchdog must sit strictly OUTSIDE it so it only ever fires on a
+        real hang. Pinning the watchdog to the tenant-wide tool timeout instead
+        made it fire at 600s and discard the run_id, which is the P0 this
+        property fixes.
+
+        A property (not a class attribute) so ``SWARM_TIMEOUT`` / test
+        monkeypatching of ``_MAX_WAIT_SECONDS`` still apply at call time;
+        ``getattr(instance, "timeout_seconds")`` evaluates it normally.
+
+        Returns:
+            The swarm wait budget plus the dead-heat margin, in seconds.
+        """
+        return float(_MAX_WAIT_SECONDS) + _LOOP_WATCHDOG_MARGIN_S
 
     def __init__(
         self,
@@ -777,16 +1226,29 @@ class SwarmTool(BaseTool):
         """Start a swarm run: auto-match preset, extract variables, wait for completion.
 
         Args:
-            **kwargs: Must include prompt (str).
+            **kwargs: Must include prompt (str), unless run_id is given to
+                resume waiting on an existing background run.
 
         Returns:
             JSON string with status, preset, variables, final_report, tasks, token_usage.
         """
+        # V1: resume takes precedence — a caller holding a run_id wants MORE
+        # waiting on that run, never a second run.
+        resume_run_id = str(kwargs.get("run_id") or "").strip()
+        if resume_run_id:
+            return self._resume_run(resume_run_id)
+
         prompt = kwargs.get("prompt", "")
 
         if not prompt:
             return json.dumps(
-                {"status": "error", "error": "Missing 'prompt' parameter"},
+                {
+                    "status": "error",
+                    "error": (
+                        "Missing 'prompt' parameter. Pass a prompt to start a new "
+                        "swarm, or run_id to resume waiting on an existing run."
+                    ),
+                },
                 ensure_ascii=False,
             )
 
@@ -805,6 +1267,13 @@ class SwarmTool(BaseTool):
             return rejection
 
         variables = _build_variables(preset, prompt)
+        # An explicitly passed preset_name is by definition an explicit choice;
+        # otherwise report how confidently the keywords picked it (V1).
+        preset_score = (
+            _EXPLICIT_NAME_SCORE
+            if kwargs.get("preset_name")
+            else _preset_route_score(prompt, preset)
+        )
 
         # Per-attempt swarm accounting (surfaces in attempt_stats.swarm_runs).
         from src.core.fetch_stats import record_swarm
@@ -904,19 +1373,67 @@ class SwarmTool(BaseTool):
             )
         pending_live_events.clear()
 
+        return self._wait_for_run(
+            store=store,
+            run_id=run_id,
+            preset=preset,
+            variables=variables,
+            run_agents=run_agents,
+            run_tasks=run_tasks,
+            record=_record,
+            preset_score=preset_score,
+        )
+
+    def _wait_for_run(
+        self,
+        *,
+        store: Any,
+        run_id: str,
+        preset: str,
+        variables: dict[str, str],
+        run_agents: int,
+        run_tasks: int,
+        record: Any,
+        resumed: bool = False,
+        preset_score: float | None = None,
+    ) -> str:
+        """Poll an in-flight swarm run until terminal state or wait budget.
+
+        Shared by a fresh ``run_swarm`` call and a ``run_id`` resume so both
+        paths produce byte-identical result envelopes and identical accounting.
+
+        Args:
+            store: SwarmStore used to load/reconcile the run.
+            run_id: Run being waited on.
+            preset: Preset name (for accounting and the result envelope).
+            variables: Template variables the run was started with.
+            run_agents: Agent count, for accounting.
+            run_tasks: Task count, for accounting.
+            record: ``_record``-shaped callable for per-attempt swarm stats.
+            resumed: Whether this wait resumed an existing background run.
+            preset_score: Routing confidence for the chosen preset (V1).
+
+        Returns:
+            JSON result string (terminal result, wait_budget_exhausted, or error).
+        """
         # Cap the wait by the attempt's remaining wall-clock budget (batch 3):
         # a swarm wait must never outlive the caller's own deadline — keep a
         # reserve so the main loop can still turn partial results into an answer.
+        # V1: the loop's own watchdog now sits OUTSIDE this (see
+        # ``SwarmTool.timeout_seconds``), so this is the wait that actually
+        # expires first and the salvage return below is reachable again.
         from src.core.budget import cap_timeout
 
-        max_wait = cap_timeout(float(_MAX_WAIT_SECONDS), reserve_s=90.0, floor_s=60.0)
+        max_wait = cap_timeout(
+            float(_MAX_WAIT_SECONDS), reserve_s=_WAIT_RESERVE_S, floor_s=_WAIT_FLOOR_S
+        )
         t0 = time.monotonic()
         while time.monotonic() - t0 < max_wait:
             time.sleep(_POLL_INTERVAL_SECONDS)
 
             loaded = store.load_run(run_id)
             if loaded is None:
-                _record("error", run_id, agents=run_agents, tasks=run_tasks)
+                record("error", run_id, agents=run_agents, tasks=run_tasks)
                 return json.dumps(
                     {"status": "error", "error": f"Run {run_id} disappeared"},
                     ensure_ascii=False,
@@ -924,7 +1441,7 @@ class SwarmTool(BaseTool):
 
             reconciled = store.reconcile_run(loaded, write=True)
             if reconciled.status.value in ("completed", "failed", "cancelled"):
-                _record(
+                record(
                     reconciled.status.value, run_id, agents=run_agents, tasks=run_tasks,
                     llm_ms=reconciled.total_llm_ms, tool_ms=reconciled.total_tool_ms,
                     input_tokens=reconciled.total_input_tokens,
@@ -934,7 +1451,10 @@ class SwarmTool(BaseTool):
                 if reconciled.status.value == "failed":
                     # F3: arm the cooldown with salvageable worker products.
                     self._record_preset_failure(preset, reconciled)
-                return _format_result(reconciled, preset, variables)
+                return _format_result(
+                    reconciled, preset, variables,
+                    resumed=resumed, preset_score=preset_score,
+                )
 
         # Wait budget elapsed but the run is still in flight. Do NOT cancel —
         # the daemon thread keeps working and the agent can decide to wait
@@ -943,7 +1463,7 @@ class SwarmTool(BaseTool):
         # whenever a preset legitimately ran past the budget.
         loaded = store.load_run(run_id)
         if loaded is not None:
-            _record(
+            record(
                 "wait_budget_exhausted", run_id, agents=run_agents, tasks=run_tasks,
                 llm_ms=loaded.total_llm_ms, tool_ms=loaded.total_tool_ms,
                 input_tokens=loaded.total_input_tokens,
@@ -953,13 +1473,78 @@ class SwarmTool(BaseTool):
             # the background and that tail is knowingly under-reported.
             self._emit_swarm_usage(run_id, loaded)
             return _format_result(
-                store.reconcile_run(loaded, write=True), preset, variables, timed_out=True
+                store.reconcile_run(loaded, write=True),
+                preset,
+                variables,
+                timed_out=True,
+                resumed=resumed,
+                preset_score=preset_score,
             )
 
-        _record("timeout", run_id, agents=run_agents, tasks=run_tasks)
+        record("timeout", run_id, agents=run_agents, tasks=run_tasks)
         return json.dumps(
             {"status": "timeout", "error": f"Swarm run {run_id} timed out after {_MAX_WAIT_SECONDS}s"},
             ensure_ascii=False,
+        )
+
+    def _resume_run(self, run_id: str) -> str:
+        """Resume waiting on an existing background run (V1 / F).
+
+        ``wait_budget_exhausted`` has always told the model to "re-invoke with
+        the returned run_id", but ``parameters`` carried no such field, so the
+        only executable option was starting a whole new run. This closes that
+        gap: no new workers, no new tokens, just more waiting on the run that
+        is already burning in the background.
+
+        Args:
+            run_id: The run to resume waiting on.
+
+        Returns:
+            JSON result string, or a structured error when the run is unknown.
+        """
+        from src.core.fetch_stats import record_swarm
+        from src.swarm.store import SwarmStore, swarm_runs_root
+
+        store = SwarmStore(base_dir=swarm_runs_root())
+        loaded = store.load_run(run_id)
+        if loaded is None:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error_code": "swarm_run_not_found",
+                    "run_id": run_id,
+                    "message": (
+                        f"No swarm run '{run_id}' in this workspace. Only a run_id "
+                        "returned by an earlier run_swarm call in this session can be "
+                        "resumed; to start fresh work, call run_swarm with a prompt."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        preset = getattr(loaded, "preset_name", "") or ""
+        variables = dict(getattr(loaded, "user_vars", None) or {})
+        t_exec = time.monotonic()
+
+        def _record(status: str, rid: str | None = None, **extra: Any) -> None:
+            record_swarm(
+                preset, rid, status, int((time.monotonic() - t_exec) * 1000),
+                resumed=True, **extra,
+            )
+
+        logger.info("SwarmTool: resuming wait on run %s (preset=%s)", run_id, preset)
+        return self._wait_for_run(
+            store=store,
+            run_id=run_id,
+            preset=preset,
+            variables=variables,
+            run_agents=len(getattr(loaded, "agents", None) or []),
+            run_tasks=len(getattr(loaded, "tasks", None) or []),
+            record=_record,
+            resumed=True,
+            # The route was decided by the original call; a resume neither
+            # re-routes nor re-scores.
+            preset_score=_EXPLICIT_NAME_SCORE if preset else None,
         )
 
 
@@ -968,6 +1553,8 @@ def _format_result(
     preset: str,
     variables: dict[str, str],
     timed_out: bool = False,
+    resumed: bool = False,
+    preset_score: float | None = None,
 ) -> str:
     """Format a SwarmRun into a JSON result string.
 
@@ -976,6 +1563,8 @@ def _format_result(
         preset: Matched preset name.
         variables: Extracted variables.
         timed_out: Whether the run was terminated due to timeout.
+        resumed: Whether this result came from a run_id resume.
+        preset_score: Routing confidence for the chosen preset (V1).
 
     Returns:
         JSON string with run status, report, task summaries, and token usage.
@@ -988,12 +1577,17 @@ def _format_result(
     # itself is still progressing in the background. Surface the run's real
     # status so a downstream agent can re-invoke with the run_id (or end its
     # turn with a "still working" message) instead of treating it as failure.
-    result = {
+    result: dict[str, Any] = {
         "status": run.status.value,
         "wait_budget_exhausted": timed_out,
         "run_id": run.id,
         "preset": preset,
         "auto_variables": variables,
+        # V1: routing confidence next to the variables it produced. 99.0 = the
+        # preset was named outright; a low positive score = a weak keyword
+        # match; 0.0 = nothing matched and this is the equity_research_team
+        # fallback. Previously indistinguishable from a confident route.
+        "preset_score": preset_score,
         "final_report": run.final_report or "",
         "error": run_level_error(run),
         "tasks": task_summaries,
@@ -1008,4 +1602,14 @@ def _format_result(
             "tools": run.total_tool_ms,
         },
     }
+    if resumed:
+        result["resumed"] = True
+    if timed_out:
+        # Spell out the executable next step: the run_id above is now an
+        # accepted parameter, so "wait more" is a real option (V1).
+        result["next_step"] = (
+            "This run is still executing in the background. To keep waiting, call "
+            f"run_swarm(run_id='{run.id}') — it starts no new run and costs no extra "
+            "tokens. Otherwise report the partial results above as partial."
+        )
     return json.dumps(result, ensure_ascii=False, indent=2)

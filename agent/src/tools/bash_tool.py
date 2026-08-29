@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import time
@@ -18,7 +19,29 @@ _OUTPUT_LIMIT = 50_000
 # tail), and the full text is persisted to run_dir for read_file paging.
 _TRUNC_HEAD = 40_000
 _TRUNC_TAIL = 8_000
-_DEFAULT_TIMEOUT = 120
+# V1: was a bare hard-coded 120 with no way to tune it and no relationship to
+# the tenant's own budget. Now configurable, and clamped per call by the
+# attempt's remaining budget (``_effective_timeout``) so bash always returns
+# its own actionable "use background_run" error BEFORE the loop's write-tool
+# watchdog abandons the call with a generic one.
+_DEFAULT_TIMEOUT = float(os.getenv("VIBE_BASH_TIMEOUT_S", "120"))
+# Kept back so the JSON error can still be built and returned after the cut-off.
+_TIMEOUT_RESERVE_S = 15.0
+_TIMEOUT_FLOOR_S = 10.0
+
+
+def _effective_timeout() -> float:
+    """Per-call bash timeout, clamped by the attempt's remaining budget.
+
+    Returns:
+        Timeout in seconds to hand ``subprocess.run``.
+    """
+    from src.core.budget import cap_timeout
+
+    return cap_timeout(
+        _DEFAULT_TIMEOUT, reserve_s=_TIMEOUT_RESERVE_S, floor_s=_TIMEOUT_FLOOR_S
+    )
+
 
 # F4: dangerous-pattern AUDIT blacklist. Matching commands are NOT blocked —
 # the sandbox is the enforcement layer — but each match is recorded in the
@@ -87,11 +110,16 @@ class BashTool(BaseTool):
 
     name = "bash"
     description = (
-        "Execute a shell command in the working directory. Use for installing "
-        "packages, running scripts, or inspecting files. Outbound network "
+        "Execute a shell command in the working directory and wait for it. Use for "
+        "installing packages, running scripts, or inspecting files. Outbound network "
         "access goes through a domain-whitelisted egress proxy — direct "
         "connections to arbitrary hosts may be blocked; prefer the dedicated "
-        "web_search/read_url/get_market_data tools for data access."
+        "web_search/read_url/get_market_data tools for data access. "
+        f"The command is killed after ~{_DEFAULT_TIMEOUT:.0f}s (less when the turn's "
+        "remaining budget is shorter), so this tool is for work that finishes in "
+        "well under that. For anything longer — model training, bulk data "
+        "processing, large installs — use background_run instead: it returns a "
+        "task_id immediately and you poll it with check_background."
     )
     parameters = {
         "type": "object",
@@ -123,6 +151,7 @@ class BashTool(BaseTool):
                 message=f"bash command matched dangerous patterns: {', '.join(audit_findings)}",
             )
 
+        timeout_s = _effective_timeout()
         try:
             result = subprocess.run(
                 command,
@@ -131,7 +160,7 @@ class BashTool(BaseTool):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=_DEFAULT_TIMEOUT,
+                timeout=timeout_s,
                 encoding="utf-8",
                 errors="replace",
             )
@@ -147,7 +176,19 @@ class BashTool(BaseTool):
         except subprocess.TimeoutExpired:
             payload = {
                 "status": "error",
-                "error": f"Command timed out after {_DEFAULT_TIMEOUT}s",
+                "error_code": "bash_timeout",
+                "timeout_seconds": timeout_s,
+                # The old message said only that it timed out, leaving the model
+                # to re-run the same doomed command. Name the escape hatch.
+                "error": (
+                    f"Command timed out after {timeout_s:.0f}s and was killed. "
+                    "bash waits synchronously and is only for short commands — "
+                    "re-running it will time out again. For long-running work "
+                    "use background_run(command=...), which returns a task_id "
+                    "immediately, then poll check_background(task_id=...). "
+                    "Otherwise narrow the command (smaller date range, fewer "
+                    "symbols, one file at a time)."
+                ),
             }
             if audit_findings:
                 payload["security_audit"] = audit_findings

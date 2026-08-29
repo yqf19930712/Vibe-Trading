@@ -37,7 +37,9 @@ class SaveSkillTool(BaseTool):
         "The skill will be available in future sessions via load_skill. "
         "A new skill's body should include a 'Related' section linking at "
         "least 2 relevant existing skills (by load_skill name) so the skill "
-        "graph stays navigable — check list_skills for candidates first."
+        "graph stays navigable — pick candidates from the Skills summary in "
+        "the system prompt and confirm each name with load_skill before "
+        "linking it."
     )
     is_readonly = False
     parameters = {

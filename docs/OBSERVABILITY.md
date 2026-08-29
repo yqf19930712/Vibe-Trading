@@ -148,8 +148,11 @@ laicai timeoutS（默认 900s）
 
 | 项 | 机制 |
 |---|---|
-| 单工具超时 | `_invoke_tool`：`cap_timeout(VIBE_TRADING_TOOL_TIMEOUT_SECONDS, reserve=45s, floor=10s)` |
-| swarm 等待 | `swarm_tool`：`cap_timeout(SWARM_TIMEOUT, reserve=90s, floor=60s)` |
+| 单工具超时 | `_invoke_tool`：`cap_timeout(_tool_timeout(name), reserve=max(45s, VIBE_FINALIZE_RESERVE_S), floor=10s)`。base = `max(VIBE_TRADING_TOOL_TIMEOUT_SECONDS, tool.timeout_seconds)`——工具的声明只能放宽窗口不能收紧，且无论声明多少仍被 attempt 剩余预算钳制 |
+| 写工具 1×/2× 窗口 | 只读工具超时即放弃；**写工具**（`is_readonly=False`）不可安全取消，故 1× 发 `tool_progress{stage:"timeout_warning"}` 继续等，2×（宽限段同样被钳制，floor=5s）仍未归才放弃：标 `degraded=true` + 回 `write_tool_timeout`。分母是上一行的 per-tool base，不是全局常量 |
+| 声明了 `timeout_seconds` 的工具 | `run_swarm` = `SWARM_TIMEOUT + 120s`；`alpha_bench` = `VIBE_ALPHA_BENCH_BUDGET_S + 120s`；MCP 远端工具 = `tool_timeout + max(tool_timeout,30) + 30`。三者都**自带**预算并在耗尽时返回部分结果——只声明不自限等于把无界等待从循环挪进工具 |
+| swarm 等待 | `swarm_tool`：`cap_timeout(SWARM_TIMEOUT, reserve=90s, floor=60s)`。**嵌套不变式：swarm 自留 90s > loop 自留 60s，所以工具必然先于看门狗自收口**——这是 `wait_budget_exhausted` 打捞路径（带回 `run_id` 与部分报告的唯一出口）能被执行的前提，回归测试见 `agent/tests/test_swarm_timeout_nesting.py` |
+| bash 命令超时 | `VIBE_BASH_TIMEOUT_S`（默认 120s），同样被 attempt 剩余预算钳制（reserve 15s / floor 10s）；超时回 `bash_timeout` 并指向 `background_run` |
 | market_data 总预算 | `min(VIBE_TRADING_FETCH_BUDGET_S=120, 剩余预算)`，见 §5 |
 | 迭代上限 | `VIBE_MAX_ITERATIONS`（引擎默认 50 与上游一致；**router 给 laicai 租户同样下发 50**——曾下发 25，2026-08-26 因饿死 swarm 意图长任务调回） |
 | router 兜底取消 | `/ask` 未拿到答案（504/客户端断开/异常）一律 `POST /sessions/<sid>/cancel`，止住「超时后继续烧 + 拖死同租户重试」 |
@@ -261,8 +264,10 @@ laicai 侧实现在主仓库（桥接 `app/src/server/vibe-trading.ts`、落库 
 | `VIBE_LOG_LEVEL` | INFO | 结构化日志级别 |
 | `VIBE_MAX_ITERATIONS` | 50（**50**） | ReAct 迭代上限 |
 | `VIBE_FINALIZE_RESERVE_S` | 60 | 提前收敛的保底剩余秒数 |
-| `VIBE_TRADING_TOOL_TIMEOUT_SECONDS` | 1800（**300**） | 单只读工具硬超时（另被剩余预算钳制） |
-| `SWARM_TIMEOUT` | 7200（**7200**） | swarm 等待上限（另被剩余预算钳制；laicai 对 swarm 意图请求发 timeoutS=7200 与之配套） |
+| `VIBE_TRADING_TOOL_TIMEOUT_SECONDS` | 1800（**300**） | 单工具硬超时**默认值**（读写皆适用；写工具按 1× 警告 / 2× 放弃）。声明了 `timeout_seconds` 的工具取二者较大值，另被剩余预算钳制 |
+| `SWARM_TIMEOUT` | 7200（**7200**） | swarm 等待上限（另被剩余预算钳制；laicai 对 swarm 意图请求发 timeoutS=7200 与之配套）。同时是 `run_swarm` 向循环声明的 `timeout_seconds` 来源（+120s 余量），要收紧 swarm 应改这里而不是调低租户档工具超时 |
+| `VIBE_ALPHA_BENCH_BUDGET_S` | 1800 | alpha_bench 自身总预算；耗尽即停止起新 alpha 并返回部分 IC 表（`budget_exhausted`）。同时是它声明的 `timeout_seconds` 来源（+120s） |
+| `VIBE_BASH_TIMEOUT_S` | 120 | bash 单命令超时（另被剩余预算钳制）；长任务应走 `background_run` |
 | `TIMEOUT_SECONDS` | 120（**300**） | LLM 流式读超时（httpx）；2026-08-24 swarm worker 因 opus 长上下文思考停顿 >120s 连续 ReadTimeout 整队报废后调升 |
 | `VIBE_TRADING_FETCH_BUDGET_S` | 120 | market_data 单次调用含降级链的总预算 |
 | `VIBE_SOCKET_TIMEOUT_S` | 30 | 阻塞 socket 默认超时兜底 |

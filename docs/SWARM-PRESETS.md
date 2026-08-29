@@ -5,10 +5,15 @@
 ## 触发策略（来财AI）
 
 - **引擎侧白名单**（`context.py` 系统提示）：仅当 query 明确要求团队/委员会/swarm 分析时才调用 `run_swarm`；用户点名 preset 就传 `preset_name`，否则由关键词打分自动选择（`_resolve_preset`，兜底 `equity_research_team`）；追问「继续/完成报告」不得开新 run。
-- **laicai 侧**（`app/src/server/chat-tools.ts`）：chat 模型仅在两类场景把 swarm 意图写进 query——① 用户明确要求多视角/团队/委员会式研判；② 重大资金决策（具体金额的加仓/清仓/大类配置）且用户要求全面论证。命中 swarm 意图正则的调用自动获得 **2 小时预算**（`timeoutS=7200`，普通深度分析 15 分钟），与引擎租户档位 `SWARM_TIMEOUT=7200` 配套；等待仍被 attempt 剩余预算钳制（`cap_timeout`，reserve 90s），不会倒挂。
-- 等待预算耗尽时 run **不取消、后台继续**（`wait_budget_exhausted`），工具返回 run_id 与部分结果；模型据此如实汇报。
+- **preset 名单的唯一真源是 `agent/src/swarm/presets/*.yaml` 的目录清单**（`_discover_preset_names`），不是关键词表。关键词表只决定「没点名时选谁」，缺一行不影响该 preset 能被点名。
+- **关键词打分平分时**优先精确短语命中数更多者（多词英文短语或 3 字以上中文词，如 "funding rate" / "资金费率"；单个泛词如 "crypto"、"macro" 不计），仍平分则按表内顺序。路由置信度随结果返回（`preset_score`：99 = 点名、正数 = 关键词命中、0 = 兜底到 `equity_research_team`）。
+- **变量抽取**（`_build_variables`）逐 preset 从 prompt 里读 commodity / crypto 标的 / 方向观点 / 因子族 / 事件类型 / 基金类型等，抽不到才回落到默认值；`commodity_research_team` 与 `crypto_research_lab` 的模板另带 `{goal}`（用户原话），确保回落时 worker 看到的是真实诉求而不是一个自信的错主题。
+- **laicai 侧**（`app/src/server/chat-tools.ts`）：chat 模型仅在两类场景把 swarm 意图写进 query——① 用户明确要求多视角/团队/委员会式研判；② 重大资金决策（具体金额的加仓/清仓/大类配置）且用户要求全面论证。命中 swarm 意图正则的调用自动获得 **2 小时预算**（`timeoutS=7200`，普通深度分析 15 分钟），与引擎租户档位 `SWARM_TIMEOUT=7200` 配套。
+- **两层等待的嵌套关系**（决定上一条是否真的可达）：工具自己的等待是 `cap_timeout(SWARM_TIMEOUT, reserve 90s, floor 60s)`；循环侧的写工具看门狗按 `run_swarm` 声明的 `timeout_seconds`（=`SWARM_TIMEOUT + 120s`）计算并自留 60s。**swarm 自留得更多，所以工具必然先于看门狗自收口。** 看门狗曾经按租户档工具超时（300s）计算，于是每次 swarm 在第 600 秒被丢弃、两小时档实际不可达——见 [HISTORY.md](HISTORY.md) 2026-08-29 条目。
+- 等待预算耗尽时 run **不取消、后台继续**（`wait_budget_exhausted`），工具返回 run_id 与部分结果；模型可据此如实汇报，或用 `run_swarm(run_id=…)` 继续等**同一个** run（不起新 run、不产生额外 worker token）。
+- **失败冷却（F3）**：同一 SwarmTool 实例内某 preset 失败后 **30 分钟**（`_FAILURE_COOLDOWN_SECONDS`）内再调同 preset 直接拒绝（`swarm_preset_cooldown`），并附上次失败 run 已完成 worker 的产物供打捞——systemic 上游故障重跑还是会死，代价是几十分钟。冷却只在工具真的返回过失败时装填，所以它同样依赖上面的嵌套关系成立。
 
-## Preset 清单（29 个）
+## Preset 清单（29 个，真源 = `agent/src/swarm/presets/*.yaml`）
 
 | preset | 用途 | 结构 |
 |---|---|---|

@@ -19,7 +19,17 @@ class LoadSkillTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "name": {"type": "string", "description": "Skill name (e.g. 'strategy-generate', 'momentum')"},
+            # Both examples must name skills that actually exist under
+            # src/skills/. 'momentum' did not — a phantom example teaches the
+            # model to invent plausible-sounding names and burn a call
+            # discovering they are not there.
+            "name": {
+                "type": "string",
+                "description": (
+                    "Skill name, exactly as listed in the Skills summary of the "
+                    "system prompt (e.g. 'strategy-generate', 'technical-basic')"
+                ),
+            },
         },
         "required": ["name"],
     }
