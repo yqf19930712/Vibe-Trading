@@ -7,3 +7,7 @@ __pycache__/
 runs/
 
 .env
+
+# Runtime engine logs. agent/logs/engine.jsonl was tracked until V2 and its
+# first line leaked the internal LLM gateway host — logs are never artifacts.
+logs/

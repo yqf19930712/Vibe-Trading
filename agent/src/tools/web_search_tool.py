@@ -18,7 +18,7 @@ import time
 from typing import Any
 
 from src.agent.tools import BaseTool
-from src.security.scanner import with_security_warnings
+from src.security.scanner import with_security_warnings, wrap_external_content
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +178,23 @@ class WebSearchTool(BaseTool):
                 payload,
                 fields=("results.*.title", "results.*.snippet"),
             )
+            # V2: snippets are attacker-controlled text (anyone can put a
+            # sentence on a page a search engine indexes). Declare each one as
+            # untrusted DATA rather than pasting it bare into the trajectory.
+            findings = payload.get("security_warnings")
+            for idx, item in enumerate(payload["results"]):
+                if not item.get("snippet"):
+                    continue
+                item["snippet"] = wrap_external_content(
+                    item["snippet"],
+                    source=item.get("url") or f"result {idx}",
+                    kind="search_result",
+                    findings=[
+                        f
+                        for f in (findings or [])
+                        if str(f.get("field", "")).startswith(f"results.{idx}.")
+                    ],
+                )
             return json.dumps(payload, ensure_ascii=False)
 
         return json.dumps(

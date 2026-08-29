@@ -69,7 +69,10 @@ def test_unknown_extension_treated_as_text(tmp_path: Path) -> None:
     result = _call(p)
     assert result["status"] == "ok"
     assert result["format"] == "text"
-    assert result["text"] == "abc"
+    # V2: the body is wrapped in the untrusted <external-content>
+    # declaration, so assert containment rather than equality.
+    assert "abc" in result["text"]
+    assert result["text"].startswith("<external-content ")
 
 
 def test_csv_read_as_text(tmp_path: Path) -> None:

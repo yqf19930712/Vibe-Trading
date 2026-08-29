@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 import mcp_server
@@ -581,20 +582,34 @@ def test_heartbeat_interval_env_var_is_robust_to_garbage(monkeypatch):
 
 
 def test_worker_source_wires_heartbeat_around_tool_execute():
-    """Belt-and-braces: assert worker.py wraps registry.execute in HeartbeatTimer.
+    """Worker tool calls must still emit ``task_heartbeat`` while running.
 
     A pure-source check (no LLM/tool needed) guards against accidental
     refactors that re-expose the silent-tool-call symptom from #132.
+
+    V2: the worker no longer calls ``registry.execute`` itself — it delegates
+    to the main loop's ``invoke_tool_guarded``, which owns the HeartbeatTimer
+    (and adds the hard per-tool timeout the worker previously lacked). The
+    invariant is asserted on both halves: the worker routes tool execution
+    through the guard, and it translates the guard's ``tool_heartbeat`` into
+    the ``task_heartbeat`` event the stale-run reaper watches.
     """
     import inspect
+    from src.agent import loop as loop_mod
+
     source = inspect.getsource(worker_mod)
-    assert "HeartbeatTimer(" in source
+    assert "invoke_tool_guarded(" in source
     assert "task_heartbeat" in source
-    # The wrapping must enclose registry.execute, not sit beside it.
-    timer_idx = source.find("with HeartbeatTimer(")
-    exec_idx = source.find("registry.execute(", timer_idx)
-    next_dedent = source.find("\n        ", exec_idx)  # exit the `with` block
-    assert 0 < timer_idx < exec_idx < next_dedent
+    # The guard's heartbeat must be forwarded, not swallowed.
+    guard_emit_idx = source.find('if event_type == "tool_heartbeat":')
+    forward_idx = source.find('"task_heartbeat"', guard_emit_idx)
+    assert 0 < guard_emit_idx < forward_idx
+    # And the guard itself must wrap the blocking wait in a HeartbeatTimer.
+    guard_source = inspect.getsource(loop_mod.invoke_tool_guarded)
+    assert "HeartbeatTimer(" in guard_source
+    timer_idx = guard_source.find("with _heartbeat_timer():")
+    exec_idx = guard_source.find("result_queue.get(", timer_idx)
+    assert 0 < timer_idx < exec_idx
 
 
 def test_swarm_tool_forwards_started_and_live_events(monkeypatch):
@@ -614,6 +629,11 @@ def test_swarm_tool_forwards_started_and_live_events(monkeypatch):
 
         def reconcile_run(self, loaded, write=False):
             return loaded
+
+        def run_dir(self, run_id):
+            # V2: _format_result asks the store for the run directory so the
+            # task previews can point at artifacts/<agent>/report.md.
+            return Path(self.base_dir) / run_id
 
     class FakeRuntime:
         def __init__(self, store, max_workers=4, agent_config=None):
@@ -667,6 +687,11 @@ def test_swarm_tool_without_session_callback_preserves_plain_runtime(monkeypatch
 
         def reconcile_run(self, loaded, write=False):
             return loaded
+
+        def run_dir(self, run_id):
+            # V2: _format_result asks the store for the run directory so the
+            # task previews can point at artifacts/<agent>/report.md.
+            return Path(self.base_dir) / run_id
 
     class FakeRuntime:
         def __init__(self, store, max_workers=4, agent_config=None):

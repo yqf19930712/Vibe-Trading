@@ -113,10 +113,20 @@ AgentLoop 在 **attempt 结束时**（成功/失败/取消/异常四条路径都
 
 ### 3.3 trace.jsonl 增量
 
-在上游既有类型（start/message/thinking/tool_call/tool_result/compact/end…）之上新增两类：
+在上游既有类型（start/message/thinking/tool_call/tool_result/compact/end…）之上新增：
 
 - `early_finalize`：`{iter, remaining_s, avg_iter_s}` —— deadline 驱动的强制收敛触发点；
-- `attempt_stats`：同 §3.2 全量字段，方便离线只读 trace 即可拿到汇总。
+- `attempt_stats`：同 §3.2 全量字段，方便离线只读 trace 即可拿到汇总；
+- `tool_circuit_open`：`{iter, tool, consecutive_failures}` —— 同一 (工具, 参数) 连续失败达 `VIBE_TOOL_CIRCUIT_FAILURE_LIMIT`（默认 3）后该调用被拒。重复调用守卫只登记**成功**调用，所以这是「同一个坏调用烧掉多少迭代」的唯一信号；
+- `empty_model_response_retry`：`{iter, attempt, max_retries, provider, model}` —— 流成功返回但既无 content 也无 tool_calls 时的就地重试（附一条 nudge，消耗一个正常迭代）。仍为空才写终态 `empty_model_response`；
+- `compact_failed`：`{iter, error}` —— L3 摘要的 LLM 调用失败，本轮降级为只做 L1/L2 剪裁。**出现它不代表 attempt 失败**（V2 之前会）；`attempt_stats.compact_failures` 是它的计数；
+- `memory_auto_consolidated`：`{duplicates_merged, entries, index_lines, index_full}` —— 索引 ≥180 行时 run 收尾自动跑的长期记忆整理。
+
+既有事件的字段增量：
+
+- `compact` 加 `input_messages_dropped` —— L3 摘要输入按 token 预算从**旧端**裁掉的消息条数（V2 之前是 `json.dumps(head)[:80000]` 从尾部砍，丢的恰是 head 里最新最密的轮次）；
+- swarm 的 `tool_result` 事件 `status` 改为按 `_is_error_result` 判定。V2 之前 worker 侧硬编码 `"ok"`，swarm 面板的 worker 工具错误率恒为 0，与主循环的 ok/error 双态口径不一致；
+- `attempt_stats` 可能出现 `offload_failures`（工具结果落盘失败次数，盘满/只读时降级为带标记的纯截断）。
 
 ### 3.4 fetch_stats 收集器（`src/core/fetch_stats.py`）
 
@@ -268,6 +278,8 @@ laicai 侧实现在主仓库（桥接 `app/src/server/vibe-trading.ts`、落库 
 | `SWARM_TIMEOUT` | 7200（**7200**） | swarm 等待上限（另被剩余预算钳制；laicai 对 swarm 意图请求发 timeoutS=7200 与之配套）。同时是 `run_swarm` 向循环声明的 `timeout_seconds` 来源（+120s 余量），要收紧 swarm 应改这里而不是调低租户档工具超时 |
 | `VIBE_ALPHA_BENCH_BUDGET_S` | 1800 | alpha_bench 自身总预算；耗尽即停止起新 alpha 并返回部分 IC 表（`budget_exhausted`）。同时是它声明的 `timeout_seconds` 来源（+120s） |
 | `VIBE_BASH_TIMEOUT_S` | 120 | bash 单命令超时（另被剩余预算钳制）；长任务应走 `background_run` |
+| `VIBE_TOOL_CIRCUIT_FAILURE_LIMIT` | 3 | 同一 (工具, 参数) 连续失败几次后熔断该调用；命中写 `tool_circuit_open` |
+| `VIBE_EMPTY_RESPONSE_RETRIES` | 1 | 流成功但返回空 turn 时的就地重试次数（0 = 回到 V2 之前的「一次即判败」） |
 | `TIMEOUT_SECONDS` | 120（**300**） | LLM 流式读超时（httpx）；2026-08-24 swarm worker 因 opus 长上下文思考停顿 >120s 连续 ReadTimeout 整队报废后调升 |
 | `VIBE_TRADING_FETCH_BUDGET_S` | 120 | market_data 单次调用含降级链的总预算 |
 | `VIBE_SOCKET_TIMEOUT_S` | 30 | 阻塞 socket 默认超时兜底 |

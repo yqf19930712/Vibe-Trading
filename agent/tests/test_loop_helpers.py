@@ -212,8 +212,10 @@ class TestContextCollapse:
 
         _context_collapse(messages)
 
-        # Early messages should be collapsed
-        assert "collapsed" in messages[1]["content"]
+        # Early messages should be collapsed. Index 2, not 1: since V2 the
+        # FIRST user message gets the looser FIRST_USER rule (see
+        # TestContextCollapsePolicy below).
+        assert "collapsed" in messages[2]["content"]
         # Recent messages should be intact
         assert "collapsed" not in messages[-1]["content"]
 
@@ -251,7 +253,9 @@ class TestContextCollapse:
 
         _context_collapse(messages)
 
-        collapsed_msg = messages[1]["content"]
+        # messages[1] is the first user message and folds under the looser
+        # FIRST_USER rule; messages[2] is an ordinary one.
+        collapsed_msg = messages[2]["content"]
         assert "HEAD_MARKER" in collapsed_msg
         assert "TAIL_MARKER" in collapsed_msg
         assert "collapsed" in collapsed_msg

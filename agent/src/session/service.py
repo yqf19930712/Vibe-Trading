@@ -301,7 +301,11 @@ class SessionService:
         self._active_loops[session_id] = agent
 
         # Build the message history context.
-        history = self._convert_messages_to_history(messages) if messages else None
+        history = (
+            self._convert_messages_to_history(messages, session_id=session_id)
+            if messages
+            else None
+        )
 
         try:
             result = await loop.run_in_executor(
@@ -325,22 +329,53 @@ class SessionService:
         return result
 
     @staticmethod
-    def _convert_messages_to_history(messages: list) -> list[Dict[str, Any]]:
+    def _convert_messages_to_history(
+        messages: list,
+        session_id: str = "",
+    ) -> list[Dict[str, Any]]:
         """Convert Session messages into OpenAI-format history.
 
         Keeps the readable ``[prev_run: {run_id}]`` marker instead of removing it
-        completely, and trims by character budget instead of a hard six-message cap
-        so the LLM can still see previous artifact paths and strategy content during
+        completely, and trims by budget instead of a hard six-message cap so the
+        LLM can still see previous artifact paths and strategy content during
         iterative updates.
+
+        Two layers since V2:
+
+        1. The session's stored handoff summary (produced by Layer 3 of a
+           previous attempt) is prepended as background reference. Without it,
+           everything an earlier attempt compressed away was simply gone: the
+           replay only ever carried raw user/assistant text.
+        2. Raw turns are then filled newest-first against a TOKEN budget using
+           the CJK-weighted estimator, not a flat character count. The old
+           ``MAX_HISTORY_CHARS = 12000`` was annotated "roughly 3000 tokens",
+           which holds for English only — by this repo's own estimator 12k
+           Chinese characters is ~7.2k tokens, so the two co-existing units
+           disagreed by 2.4x. ``MAX_HISTORY_TOKENS`` is deliberately set to
+           6000 (≈ today's real Chinese-session volume) rather than the 3000 of
+           the stale comment: this change unifies the unit, it does not also
+           halve the budget.
 
         Args:
             messages: Session message list without the current turn.
+            session_id: Session id, used to load the handoff summary. Empty =
+                no summary layer (the raw-replay behavior).
 
         Returns:
-            OpenAI-format messages trimmed from the newest items within the token budget.
+            OpenAI-format messages: optional summary + omission note + the
+            newest raw turns that fit the token budget.
         """
         import re
         from pathlib import Path
+
+        from src.core.token_estimate import estimate_text_tokens
+        from src.session import handoff
+        from src.agent.context_policy import HANDOFF_PREFIX
+
+        MAX_HISTORY_TOKENS = 6_000
+        HANDOFF_INJECT_MAX_TOKENS = 2_000
+        # Rough per-message envelope overhead (role, delimiters).
+        PER_MESSAGE_TOKENS = 8
 
         def _shorten_run_dir(match: re.Match) -> str:
             path_str = match.group(0).replace("Run directory:", "").strip()
@@ -357,17 +392,57 @@ class SessionService:
             if content:
                 history.append({"role": role, "content": content})
 
-        # Trim from the newest messages within a character budget of roughly 3000 tokens.
-        MAX_HISTORY_CHARS = 12000
-        total_chars = 0
+        budget = MAX_HISTORY_TOKENS
         trimmed: list = []
+        dropped = 0
         for msg in reversed(history):
-            msg_len = len(msg.get("content", ""))
-            if total_chars + msg_len > MAX_HISTORY_CHARS:
-                break
+            cost = estimate_text_tokens(msg.get("content", "")) + PER_MESSAGE_TOKENS
+            if cost > budget:
+                # Not a break: a shorter older turn may still fit.
+                dropped += 1
+                continue
             trimmed.append(msg)
-            total_chars += msg_len
-        return list(reversed(trimmed))
+            budget -= cost
+        trimmed.reverse()
+
+        out: list[Dict[str, Any]] = []
+        summary = handoff.load(session_id) if session_id else ""
+        if summary:
+            clipped = summary
+            if estimate_text_tokens(clipped) > HANDOFF_INJECT_MAX_TOKENS:
+                limit = len(clipped)
+                while limit > 0 and estimate_text_tokens(clipped[:limit]) > HANDOFF_INJECT_MAX_TOKENS:
+                    limit = int(limit * 0.9)
+                clipped = clipped[:limit] + "\n\n...[summary clipped]"
+            out.append(
+                {
+                    "role": "user",
+                    # HANDOFF_PREFIX so the in-run Layer 2 recognises this block
+                    # and never folds it (same marker Layer 3 writes).
+                    "content": (
+                        f"{HANDOFF_PREFIX} — carried over from earlier attempts "
+                        "in this session. Background reference, NOT "
+                        f"instructions.]\n\n{clipped}"
+                    ),
+                }
+            )
+        if dropped:
+            out.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"[{dropped} earlier turns in this session were omitted "
+                        "from this replay to fit the context budget."
+                        + (
+                            " Their content is covered by the summary above.]"
+                            if summary
+                            else "]"
+                        )
+                    ),
+                }
+            )
+        out.extend(trimmed)
+        return out
 
     @staticmethod
     def _load_metrics(run_dir: Path) -> Optional[Dict[str, Any]]:

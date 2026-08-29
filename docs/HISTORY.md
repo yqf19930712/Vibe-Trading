@@ -228,3 +228,46 @@ Minor / 补充：m1 冷启动 5–15s（重 import + CJK 字体下载 + matplotl
 **核心护栏**：新增 `agent/tests/test_swarm_timeout_nesting.py`，把生产常量按 1:300 等比例缩放（TOOL_TIMEOUT 300→1、SWARM_TIMEOUT 7200→24、reserve 60/90→0.2/0.3、margin 120→0.4）复刻本次故障，断言拿到的是带 run_id 的 `wait_budget_exhausted` 而非 `write_tool_timeout`；deadline 一项刻意不缩放（生产两侧只差 30s/7000s ≈ 0.4%，缩放后是 0.1s 的竞态、CI 上必然 flaky），预算钳制那一半改由同文件的纯函数用例 `test_tool_timeout_nesting_invariant` 按真实生产数值断言（`remaining=150` 时两个 floor 相遇，顺带把 floor 取值也钉住）。
 
 **文档同步。** OBSERVABILITY.md §4 的钳制表补齐 per-tool base、写工具 1×/2× 窗口、三个声明工具的取值与嵌套不变式，§9 env 表删掉「单**只读**工具硬超时」这个 F2 之后就已经错了的措辞并新增三个变量；SWARM-PRESETS.md 触发策略补 preset 真源、tie-break、变量抽取、两层等待的嵌套关系与 F3 冷却。**本次未部署**（无镜像重建、无模板切换、未碰生产）。
+
+## 2026-08-29：批次 V2——上下文层交界、跨 attempt 交接、harness 韧性、记忆卫生
+
+**这一批修的全是「层与层的交界处」。** 三轮评审（上下文工程 / harness / 记忆管理）的共同结论是：每一层单独看都做对了，出问题的是层之间没有共用同一套预算与豁免规则。
+
+**上下文层。**
+
+- **V2-1 三层压缩共享一份保护规则**（新 `agent/context_policy.py`）。此前 L1 有一份私有的 `MICROCOMPACT_PROTECTED_TOOLS`、L2 只认一个 `startswith("[cleared")`、L3 什么都不认，于是 **L2 会把 L1 明确免删的 grounding 结果拦腰折断**（`get_market_data`/`backtest`/`run_swarm` 的大 JSON 中段被剪掉，「所有被引用数字可溯源」的立意在下一层被推翻），也会折断 L3 刚花一次 LLM 调用产出的交接摘要。关键设计选择是**分级而非布尔豁免**：一律豁免会让首条 user 消息（原始请求 + goal + `<recalled-memories>`，长会话里最大的一条）永远压不下去，所以改成 `DEFAULT(2400/900/500)` / `FIRST_USER(9600/3000/1200)` / `SKIP` / `PROTECTED_HARD_CAP(24000/6000/3000)` 四档。最后一档是逃生阀——没有它，一个畸形巨结果能把上下文顶爆而三层都不敢动它。
+- **V2-2 工具结果落盘 + 显式截断标记**（新 `agent/tool_result_store.py`）。原先是 `result[:10_000]`，**不追加任何标记**：模型拿到一份 40k JSON 的前 10k，会把它当完整文档解析，并把被砍掉的行报成「数据源没有」。现在超限结果写进 `run_dir/tool-results/{iter:03d}-{tool}-{callid8}.{json,txt}`，轨迹里放 `<tool-result-truncated total_chars=… shown=…>` 包裹的 head+tail 预览 + 磁盘路径 + 「这是预览，不要整体解析，也不要据此断言数据缺失」的指引。文件名是 (iter, tool, call_id) 的确定性函数，重放不产生新文件、预览文案字节稳定（书 §2.3.4）。盘满时 `OSError` 降级为「带标记的纯截断」并计 `attempt_stats.offload_failures`。**原始 result 一字未动**——错误判定、F1 grounding 校验器、trace 三条路径继续吃全量，只有进 messages 的那份变预览。
+- **V2-3 `run_swarm` 单独收口**。它在免删名单里（重跑要几十分钟），但**入场那一刻就已经被砍**：返回体是 `final_report` + 每个 task 的 report.md **全文**，多 worker preset 轻易几十 KB，10k 的刀正好落在 JSON 中部 → 模型收到的是非法 JSON 且后面的 task 凭空消失。改为 task summary 800 字符预览 + `report_path` 指针，`final_report` 拿**实测剩余额度**。这里与设计稿有偏差：稿子同时写了「final_report 封顶 20k」和「返回天生 <10k」，两者不可能同时成立——20k 单项就已经超了限。改成先序列化其余字段量出开销、再把剩下的给 final_report，并让 task 预览随团队规模收缩（`TASKS_BLOCK_TARGET_CHARS`，下限 250 字符）。实测 1/3/6/8/12 任务的 preset 全部落在 9748 字符，最宽的已发布 preset 是 12 任务的 `technical_analysis_panel`。
+- **V2-4 跨 attempt 交接**（新 `session/handoff.py`）。`_previous_summary` 是实例态、每次 `run()` 归零，所以上一 attempt 压缩掉的决策/约束在下一 attempt **完全不可见**，laicai 同线程追问只剩一个 12k 字符的滑窗。现在 L3 摘要在 `_auto_compact` 产出的**当下**就原子写进 `sessions/<sid>/handoff.json`（不是等 run 结束——崩溃/超时的 attempt 恰恰是最需要这份摘要的），下次 `run()` 从 `handoff.load()` 复原，L5 因此走增量更新而非从零重建，零额外 LLM 调用。sidecar 而非 `messages.jsonl` 里的一条 Message：后者是 append-only 且用户可见（前端会看到一条用户没说过的话），可覆写的派生状态不该进去。
+- **V2-5 会话历史两层化 + token 口径统一**。`MAX_HISTORY_CHARS=12000` 的注释写「roughly 3000 tokens」，但按本仓自己的 CJK 估算器，中文 12k 字符 ≈ 7.2k token——同一个仓库两套口径。换成 `MAX_HISTORY_TOKENS`，但**取 6000 而不是注释里的 3000**：直接按注释改会把中文会话的历史砍掉一半以上，这一步只统一口径、不同时缩预算。被裁的旧轮次留一行「N 轮已省略」的显式占位（P2-9）。
+- **V2-6 microcompact 滞回**。单条触发线导致越线之后**每轮**重算 keep 集合、新结果不断把老结果挤出预算，于是每轮都有一两条老结果在轨迹深处变占位符 → provider cache 从该 diff 点起逐轮重建。批次 E 消除了「无条件逐轮清」，阈值以上区间实际又回到了逐轮改写。改为 armed 滞回：越 0.5 线触发并**深切一刀**（keep 0.25→0.15），保持 armed 直到回落 0.35 解除；中间隔开多轮全热缓存（书 §2.7.3）。状态由调用方持有（`state` 参数），主循环与 swarm worker 各自一份，不引入全局。
+- **V2-7 `_auto_compact` 输入按 token 从旧端裁**。`json.dumps(head)[:80000]` 是从**尾部**砍，砍掉的是 head 里最新、信息密度最高的轮次；40k token ≈ 160k ASCII 字符 >> 80k，英文重会话几乎必然触发。改为按 `TOKEN_THRESHOLD*0.5` 的 token 预算从最新往回装、丢旧端，并在输入前缀写明丢了几条。
+
+**harness 韧性。**
+
+- **V2-8 per-(tool,args) 连续失败熔断**。重复调用守卫只登记**成功**调用（`if success:`），所以同一工具同一参数的失败可以无限重复到迭代上限——一个挂了的上游能吃掉 40+ 迭代的 LLM 费用。复用 `_tool_call_key` 基建，连续 3 次（`VIBE_TOOL_CIRCUIT_FAILURE_LIMIT`）后返回结构化 `circuit_open` 拒绝，文案给出可执行的三条出路（换参数/换工具/带缺口作答）而不只是说「不行」。成功一次即清零。
+- **V2-9 swarm worker 复用主循环工具看门狗**。`_invoke_tool` 的机体提取为模块级 `invoke_tool_guarded(registry, name, args, *, readonly, timeout, emit, on_degraded)`，主循环退化为薄壳。worker 此前是 `registry.execute` 内联，**没有任何超时**：挂死的工具在迭代内无限阻塞（worker 只在迭代边界查自己的 deadline），只能等 runtime 的层级 deadline 在 `layer_budget+60s` 后把整层判掉。现在 worker 的每个工具调用被 `min(工具声明超时, worker 剩余时间)` 钳制，再经 `cap_timeout` 被 attempt 预算钳一次，嵌套仍是「内层 ≤ 外层」。心跳同步接上（worker 把守卫的 `tool_heartbeat` 翻译成 `task_heartbeat`，stale-run reaper 依赖的信号不变）。
+- **V2-10 worker `tool_result` 事件 status 改按 `_is_error_result` 判定**。此前硬编码 `"ok"`，swarm 观测面板的 worker 工具错误率恒为 0，与主循环 ok/error 双态口径不一致。
+- **V2-11 `empty_model_response` 就地重试一次**。流**成功返回**但既无 content 也无 tool_calls 属于 provider 退化响应（中继截断成空、上游偶发空 turn），传输层的 3 次退避重试完全覆盖不到它，此前一次即判败，一个可能已跑几十分钟的 attempt 就此报废。给一次带 nudge 的重试（消耗一个正常迭代，不回退 `iter` 计数器——那会在 trace 里产生重复的 `iter` 键，可观测性瀑布图正是按它索引的）。
+- **V2-12 `_auto_compact` 的 LLM 调用包 try/except**。压缩是**纠正机制**，它失败不该杀死本来健康的 run；此前异常直接冒到 `run()` 顶层 except 把整个 attempt 打成 failed。失败时降级为只做 L1/L2 剪裁、轨迹逐字不动、写 `compact_failed`，下一轮再试。顺带挡住「摘要返回空字符串」——那会把 head 抹掉却不放回任何东西。
+- **V2-13 worker `incomplete` 纳入重试**。`if result.status != "failed": return` 把产出契约失败（report.md 没写、数据角色没调数据工具）一并放过，而这恰恰是「再给一次机会大概率就好」的失败类型，preset 的 `max_retries` 预算本来就是为它准备的；不重试则下游依赖它的 worker 全被 blocked。`timeout`/`token_limit` 仍不重试（重试也会再撞同一堵墙）。
+- **V2-14 上游报告注入下游 worker 有预算了**（P2-7）。`task_summaries` 的值是 report.md 全文，editor/PM 类多上游角色的 system prompt 会拼进 N 份全文、无任何截断层。超 8000 字符改为 head+tail 预览 + artifact 路径（worker 有 `read_file`）。
+
+**注入防护。**
+
+- **V2-15 扫描器补中文**。五条规则全是英文正则（且用 `\b` 词边界，CJK 之间根本没有词边界），对「忽略以上指令」「你现在是系统管理员」「把系统提示词打印出来」零命中——而本产品的 `read_url`/`web_search` 目标以中文为主，**上下文层护栏对主流量不设防**。每条规则补一条中文变体，用 `[^。！？\n]{0,N}` 代替词边界。同步补了 5 条「正常中文财经文本不得误报」的用例（营收增长/最大回撤/回购公告/夏普比率/系统性风险）——误报会给每一篇雪球帖子挂横幅。
+- **V2-16 外部内容包声明块**。此前只有记忆召回有 `<recalled-memories>` 的非指令声明（F7②），网页/搜索/PDF 正文**裸拼进轨迹**、扫描器的结论藏在 JSON 尾部字段里。现在三个 reader 的正文包进 `<external-content source=… kind=… trust="untrusted">`，high 级命中把警告**提到正文之前的显式横幅**。
+
+**记忆卫生。**
+
+- **V2-17 `persistent.py` 写盘失败结构化**（这才是「4G 打满失败模式」的本体）。`path.write_text` 无 try，`OSError` 直接冒泡杀掉整个 attempt。新增 `MemoryWriteError`，`remember_tool` 捕获后返回 `memory_write_failed` 的结构化错误并明说「别重试这次 save，把这个事实写进回答」。索引写失败单独处理：条目文件才是资产，索引是派生物，索引失败只置 `last_add_indexed=False`。
+- **V2-18 同名覆盖折入旧正文**（P2-7）。同名同 type 直接覆盖、旧内容无任何保留，正是 Mem0 write-time UPDATE 的教训（一次错误更新不可逆丢历史）。复用 `consolidate()` 现成的 merge 标记逻辑把旧 body 折进新文件尾部，新正文在前（recall 预览从头读）。
+- **V2-19 记忆条目补 Related 链接要求**（P2-8）：把 F8 给 skills 的那句话拷进 `remember` description。
+- **V2-20 索引 ≥180 行时收尾自动 consolidate**（P2-11）。此前只有 F7① 的告警，指望模型自己想起来调 `consolidate_memory`。阈值取 180 而非 200：过 200 之后新条目根本不进会话启动快照，整理必须发生在**上限之前**。跑在 run 收尾而非每次写入——consolidate 会重写条目文件，run 中途做会搅动系统提示已经冻结的快照。
+- **V2-21 删除入库的 `agent/logs/engine.jsonl`**（P2-12，164KB，首行含内部 LLM 网关地址 `sub2api.laicai8.co`）并把 `logs/` 加进 `agent/.gitignore`。
+
+**结果。** 全量回归 3395 passed / 5 failed / 2 skipped（V1 基线）→ **3525 passed / 5 failed / 2 skipped**，失败清单逐项相同（3 条 anthropic 凭据缺失 + 1 条 dotenv latch 的套件顺序依赖 + 1 条 web_search backend 断言，均为本地环境因素），**零新增失败**，净增 130。新增 7 个测试文件：`test_context_policy.py`（14，分级策略与 L2 实际行为）、`test_tool_result_store.py`（13，含字节稳定性与盘满降级）、`test_session_handoff.py`（17）、`test_v2_harness_resilience.py`（13）、`test_v2_swarm_result_budget.py`（15）、`test_v2_memory_hygiene.py`（15）、`test_v2_injection_defense.py`（32）、`test_v2_loop_integration.py`（11）。
+
+既有测试的语义更新（都是行为确实变了，不是迁就实现）：`test_loop_helpers` 的两条折叠用例从 `messages[1]` 改看 `messages[2]`（下标 1 现在是走 FIRST_USER 分档的首条 user）；两条 `empty_model_response` 用例的断言从 "iteration 1" 改 "iteration 2"（多了一次重试）；`test_swarm_status_hydration` 的心跳源码检查从「worker 必须用 HeartbeatTimer 包住 registry.execute」改为「worker 必须走 `invoke_tool_guarded` 且转发它的心跳 + 守卫自身必须包住阻塞等待」；三处 FakeStore/\_Store 测试替身补 `run_dir()`；doc_reader / web_search 的三条相等断言改为包含断言（正文现在带 `<external-content>` 包裹）。
+
+**本次未部署**（无镜像重建、无模板切换、未碰生产）。

@@ -20,6 +20,30 @@ logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SECONDS = 5
 _MAX_WAIT_SECONDS = int(os.getenv("SWARM_TIMEOUT", "7200"))
+# V2 payload budget for the ``run_swarm`` return. The whole point is that the
+# result arrives as VALID JSON inside the loop's ``TOOL_RESULT_LIMIT`` (10k
+# chars) instead of being cut mid-document on the way into the trajectory, so
+# the target sits just under it with room for the JSON scaffolding.
+#
+# NOTE the spike proposed a flat 20k ``final_report`` cap alongside a "natively
+# under 10k" goal — those two cannot both hold. The cap is kept as an upper
+# bound for the rare tiny-team run, but the operative limit is the measured
+# leftover computed in ``_format_result``: everything else is serialized first
+# and ``final_report`` gets what remains. The full document is always on disk
+# at ``final_report_path``.
+PAYLOAD_TARGET_CHARS = 9_500
+FINAL_REPORT_CAP = 20_000
+# Per-task summary preview floor. Below this a preview stops carrying a usable
+# conclusion and the pointer is all that is left.
+MIN_SUMMARY_PREVIEW_CHARS = 250
+# How much of the payload the task-summary block may claim before the previews
+# start shrinking (a 12-agent preset at 800 chars each would otherwise spend
+# the entire allowance on summaries and leave nothing for the final report).
+TASKS_BLOCK_TARGET_CHARS = 4_800
+# Fixed JSON scaffolding each serialized task costs at indent=2 (ids, status,
+# timestamps, dependency lists, the report pointer). Subtracted from the block
+# target so the preview budget reflects what is actually left for prose.
+_TASK_FIXED_OVERHEAD_CHARS = 400
 
 # Nesting invariant (V1). The tool's own wait keeps back MORE than the loop's
 # watchdog does, so on a bounded attempt budget the tool ALWAYS expires first
@@ -1454,6 +1478,7 @@ class SwarmTool(BaseTool):
                 return _format_result(
                     reconciled, preset, variables,
                     resumed=resumed, preset_score=preset_score,
+                    run_dir=store.run_dir(run_id),
                 )
 
         # Wait budget elapsed but the run is still in flight. Do NOT cancel —
@@ -1479,6 +1504,7 @@ class SwarmTool(BaseTool):
                 timed_out=True,
                 resumed=resumed,
                 preset_score=preset_score,
+                run_dir=store.run_dir(run_id),
             )
 
         record("timeout", run_id, agents=run_agents, tasks=run_tasks)
@@ -1555,8 +1581,19 @@ def _format_result(
     timed_out: bool = False,
     resumed: bool = False,
     preset_score: float | None = None,
+    run_dir: Any = None,
 ) -> str:
     """Format a SwarmRun into a JSON result string.
+
+    V2 budget: this payload is what the main loop injects back into its
+    trajectory, and it used to be ``final_report`` plus EVERY task's whole
+    report.md. A multi-worker preset routinely produced tens of KB, which the
+    loop then clipped at 10k characters — mid-JSON, so the model received an
+    unparseable document with the later tasks silently gone. Each summary is
+    now an 800-character preview with a ``report_path`` pointer and the final
+    report is capped, so the return is natively valid JSON well under the
+    limit. The full text is on disk and the model has ``read_file`` (book
+    §2.7.6: isolate, then return conclusions plus a pointer).
 
     Args:
         run: SwarmRun instance.
@@ -1565,13 +1602,48 @@ def _format_result(
         timed_out: Whether the run was terminated due to timeout.
         resumed: Whether this result came from a run_id resume.
         preset_score: Routing confidence for the chosen preset (V1).
+        run_dir: Run directory, used to build artifact pointers (V2). Omitted
+            = previews carry no ``report_path``.
 
     Returns:
         JSON string with run status, report, task summaries, and token usage.
     """
-    from src.swarm.serialization import run_level_error, serialize_task
+    from src.swarm.serialization import (
+        SUMMARY_PREVIEW_CHARS,
+        run_level_error,
+        serialize_task,
+    )
 
-    task_summaries = [serialize_task(task) for task in run.tasks]
+    def _report_path(task: Any) -> str | None:
+        if run_dir is None:
+            return None
+        agent_id = getattr(task, "agent_id", "") or ""
+        if not agent_id:
+            return None
+        return str(Path(run_dir) / "artifacts" / agent_id / "report.md")
+
+    # Per-task preview budget. A 12-task preset at the nominal 800 chars each
+    # would spend the whole payload allowance on task summaries alone, so the
+    # preview shrinks (never below MIN_SUMMARY_PREVIEW_CHARS) as the team
+    # grows. Purely a function of the task count, so the bytes stay stable
+    # across a replay of the same run.
+    task_count = max(1, len(run.tasks))
+    preview_chars = max(
+        MIN_SUMMARY_PREVIEW_CHARS,
+        min(
+            SUMMARY_PREVIEW_CHARS,
+            TASKS_BLOCK_TARGET_CHARS // task_count - _TASK_FIXED_OVERHEAD_CHARS,
+        ),
+    )
+    task_summaries = [
+        serialize_task(
+            task,
+            summary_preview_chars=preview_chars,
+            report_path=_report_path(task),
+        )
+        for task in run.tasks
+    ]
+    any_truncated = any(t.get("summary_truncated") for t in task_summaries)
 
     # ``timed_out`` only means the SwarmTool's wait budget elapsed — the run
     # itself is still progressing in the background. Surface the run's real
@@ -1588,7 +1660,9 @@ def _format_result(
         # match; 0.0 = nothing matched and this is the equity_research_team
         # fallback. Previously indistinguishable from a confident route.
         "preset_score": preset_score,
-        "final_report": run.final_report or "",
+        # Filled in below, once everything else has been measured.
+        "final_report": "",
+        "final_report_truncated": False,
         "error": run_level_error(run),
         "tasks": task_summaries,
         "token_usage": {
@@ -1602,6 +1676,29 @@ def _format_result(
             "tools": run.total_tool_ms,
         },
     }
+    if run_dir is not None:
+        result["final_report_path"] = str(Path(run_dir) / "artifacts" / "final_report.md")
+
+    # Give ``final_report`` whatever the rest of the payload left over, so the
+    # WHOLE return lands inside the loop's tool-result limit natively rather
+    # than being cut mid-JSON on the way in. Measuring first (instead of using
+    # a fixed cap) is what makes the guarantee hold for a 3-agent preset and a
+    # 12-agent one alike; the full document is always on disk at
+    # ``final_report_path``.
+    full_report = run.final_report or ""
+    overhead = len(json.dumps(result, ensure_ascii=False, indent=2))
+    report_budget = max(0, PAYLOAD_TARGET_CHARS - overhead)
+    report_budget = min(FINAL_REPORT_CAP, report_budget)
+    result["final_report"] = full_report[:report_budget]
+    result["final_report_truncated"] = len(full_report) > report_budget
+
+    if any_truncated or result["final_report_truncated"]:
+        result["reading_note"] = (
+            "task[].summary is a PREVIEW whenever summary_truncated is true — "
+            "read report_path with read_file before citing any number that is "
+            "not visible in the preview. The same applies to final_report when "
+            "final_report_truncated is true."
+        )
     if resumed:
         result["resumed"] = True
     if timed_out:

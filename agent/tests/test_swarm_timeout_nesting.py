@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -101,6 +102,11 @@ def _install_scaled_swarm(monkeypatch, run: SwarmRun) -> None:
 
         def reconcile_run(self, loaded, write=False):
             return loaded
+
+        def run_dir(self, run_id):
+            # V2: _format_result asks the store for the run directory so the
+            # task previews can point at artifacts/<agent>/report.md.
+            return Path(self.base_dir) / run_id
 
     class _Runtime:
         def __init__(self, store, max_workers=4, agent_config=None):
@@ -226,6 +232,11 @@ def test_run_swarm_accepts_a_run_id_to_resume_an_existing_run(monkeypatch) -> No
 
         def reconcile_run(self, loaded, write=False):
             return loaded
+
+        def run_dir(self, run_id):
+            # V2: _format_result asks the store for the run directory so the
+            # task previews can point at artifacts/<agent>/report.md.
+            return Path(self.base_dir) / run_id
 
     class _Runtime:
         def __init__(self, store, max_workers=4, agent_config=None):

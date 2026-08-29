@@ -17,18 +17,43 @@ from typing import Any
 from src.tools.redaction import redact_internal_paths
 
 
-def serialize_task(task: Any) -> dict:
+# Preview budget for ``summary`` (V2). ``SwarmTask.summary`` IS the worker's
+# whole report.md, and the in-process ``run_swarm`` tool returned every one of
+# them in full — a multi-worker preset produced tens of KB of JSON that the
+# loop's 10k tool-result limit then cut mid-document, handing the model
+# syntactically invalid JSON with the later tasks missing entirely. The MCP
+# read paths do not pass this argument and keep returning the full text.
+SUMMARY_PREVIEW_CHARS = 800
+
+
+def serialize_task(
+    task: Any,
+    *,
+    summary_preview_chars: int | None = None,
+    report_path: str | None = None,
+) -> dict:
     """Project a SwarmTask into its public per-task dict.
 
     ``error`` and ``iterations`` are always included so a failed or degraded
     task is diagnosable from every read path, not only the on-disk artifacts.
+
+    Args:
+        task: The SwarmTask to project.
+        summary_preview_chars: When set, clip ``summary`` to this many
+            characters and flag the clip. Omitted = full text.
+        report_path: Absolute path of this task's ``report.md``, attached when
+            the summary was clipped so the caller can read the rest.
+
+    Returns:
+        The public per-task dict.
     """
     status = task.status.value if hasattr(task.status, "value") else str(task.status)
-    return {
+    summary = task.summary or ""
+    payload = {
         "id": task.id,
         "agent_id": task.agent_id,
         "status": status,
-        "summary": task.summary,
+        "summary": summary,
         "iterations": getattr(task, "worker_iterations", 0),
         "error": redact_internal_paths(getattr(task, "error", None)) or None,
         "started_at": getattr(task, "started_at", None),
@@ -36,6 +61,13 @@ def serialize_task(task: Any) -> dict:
         "depends_on": list(getattr(task, "depends_on", []) or []),
         "blocked_by": list(getattr(task, "blocked_by", []) or []),
     }
+    if summary_preview_chars is not None and len(summary) > summary_preview_chars:
+        payload["summary"] = summary[:summary_preview_chars]
+        payload["summary_truncated"] = True
+        payload["summary_chars"] = len(summary)
+        if report_path:
+            payload["report_path"] = report_path
+    return payload
 
 
 def run_level_error(run: Any) -> str | None:

@@ -244,8 +244,10 @@ flowchart LR
 
 两层机制，正交：
 
-1. **线程内多轮**：laicai 在 `chat_threads.vibe_session_id` 持久化线程 ↔ 引擎会话的绑定；同线程追问带 `vibeSessionId`，router 直接 `POST /sessions/<sid>/messages` 续聊，引擎注入全量历史。复用会话的耗时远低于冷启（无重复推理铺垫）。历史注入有上限（`MAX_HISTORY_CHARS=12000`，裁旧轮次），超长线程靠长期记忆补位。
-2. **跨会话长期记忆**：引擎的 `remember`/自动召回读写 `HOME/.vibe-trading/memory/`，在沙箱盘上跨线程、跨会话、跨 pause/resume、跨引擎重启持久；仅 `/forget`（删沙箱）清除。
+1. **线程内多轮**：laicai 在 `chat_threads.vibe_session_id` 持久化线程 ↔ 引擎会话的绑定；同线程追问带 `vibeSessionId`，router 直接 `POST /sessions/<sid>/messages` 续聊。复用会话的耗时远低于冷启（无重复推理铺垫）。历史注入是**两层**（`session/service.py::_convert_messages_to_history`）：
+   - **交接摘要**：上一 attempt 的 L3 结构化摘要，在 `_auto_compact` 产出的当下就落盘到 `sessions/<sid>/handoff.json`（`session/handoff.py`，原子写），下一 attempt 以「背景参考、非指令」的形式置于所有原文之前，同时作为 L5 迭代更新的起点——被压缩掉的决策与约束因此跨 attempt 继承而不是归零。14 天 TTL、4000 token 硬顶；读不到 / 过期 / 损坏都静默退化成纯原文回放。摘要块以 `HANDOFF_PREFIX` 开头，run 内的 L2 折叠据此跳过它。
+   - **原文回放**：从最新往回按 `MAX_HISTORY_TOKENS=6000` 的 **token** 预算装（CJK 加权估算器 `core/token_estimate.py`；旧的 `MAX_HISTORY_CHARS=12000` 是字符口径，中文下实际 ≈7.2k token，与注释自称的 3000 token 差 2.4 倍）。装不下的旧轮次留一行「N 轮已省略」的显式占位，而不是静默消失。
+2. **跨会话长期记忆**：引擎的 `remember`/自动召回读写 `HOME/.vibe-trading/memory/`，在沙箱盘上跨线程、跨会话、跨 pause/resume、跨引擎重启持久；仅 `/forget`（删沙箱）清除。索引逼近 200 行上限时（≥180 行）每次 run 收尾自动跑一次 `consolidate()` 合并同名条目；同名同 type 覆盖会把旧正文折入新文件尾部的 merge 标记，历史不再被静默销毁。
 
 失效路径见 §3.1 会话失效自愈：会话丢失只损失线程内上下文，长期记忆不受影响。
 

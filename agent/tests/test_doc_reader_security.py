@@ -44,5 +44,6 @@ def test_read_document_allows_configured_import_root(
     result = _read_json(read_document(str(doc)))
 
     assert result["status"] == "ok"
-    assert result["text"] == "VT_DOC_OK"
+    # V2: body is wrapped in the untrusted <external-content> declaration.
+    assert "VT_DOC_OK" in result["text"]
     assert safe_document_path(str(doc)) == doc.resolve()
