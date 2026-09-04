@@ -78,9 +78,23 @@ class SessionService:
         return self.store.list_sessions(limit)
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session."""
+        """Delete a session: cancel its live loop, drop files, events and FTS rows.
+
+        The search index (``sessions.db``) used to keep the deleted session's
+        rows, so ``session_search`` kept returning dead links (P1 2026-09-04).
+        """
+        self.cancel_current(session_id)
         self.event_bus.clear(session_id)
-        return self.store.delete_session(session_id)
+        deleted = self.store.delete_session(session_id)
+        try:
+            self._search_index.delete_session(session_id)
+        except Exception as exc:  # noqa: BLE001 - index cleanup is best-effort
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "search index cleanup failed for session %s: %s", session_id, exc
+            )
+        return deleted
 
     async def send_message(
         self,
@@ -184,6 +198,14 @@ class SessionService:
             if attempt.run_dir:
                 reply_metadata["run_id"] = Path(attempt.run_dir).name
             reply_metadata["status"] = attempt.status.value
+            # Machine-readable outcome (P1 2026-09-04): the router used to
+            # take ANY non-empty assistant message linked to the attempt as
+            # the answer, so "Execution failed: …" prose was forwarded to the
+            # user as if it were the research result. Keep the prose, add
+            # the flag; the router keys on it.
+            reply_metadata["ok"] = attempt.status == AttemptStatus.COMPLETED
+            if attempt.status != AttemptStatus.COMPLETED:
+                reply_metadata["error"] = attempt.error or "unknown error"
             if attempt.metrics:
                 reply_metadata["metrics"] = attempt.metrics
 
@@ -298,6 +320,12 @@ class SessionService:
             max_iterations=max_iterations,
             persistent_memory=pm,
         )
+        # A second attempt on the same session used to silently overwrite
+        # the registry entry, orphaning the first loop: unreachable by
+        # cancel_current, still burning tokens (P1 2026-09-04).
+        previous = self._active_loops.get(session_id)
+        if previous is not None and previous is not agent:
+            previous.cancel()
         self._active_loops[session_id] = agent
 
         # Build the message history context.
@@ -318,7 +346,9 @@ class SessionService:
                 ),
             )
         finally:
-            self._active_loops.pop(session_id, None)
+            # Only drop OUR entry — a newer loop may have replaced it.
+            if self._active_loops.get(session_id) is agent:
+                self._active_loops.pop(session_id, None)
 
         # Load metrics from the run output when available.
         if result.get("run_dir"):

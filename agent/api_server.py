@@ -252,7 +252,11 @@ class SessionResponse(BaseModel):
 
 class SendMessageRequest(BaseModel):
     """Send chat message: natural-language strategy description."""
-    content: str = Field(..., description="Natural language strategy description", min_length=1, max_length=5000)
+    # 20000 (was 5000): laicai injects the user's real portfolio context in
+    # front of the question, and a moderately sized book already blew the
+    # old cap into a bare 422 (P1 2026-09-04). The router maps a 422 here to
+    # an explicit "问题过长" error frame.
+    content: str = Field(..., description="Natural language strategy description", min_length=1, max_length=20000)
     # Wall-clock budget for this attempt (seconds). When set, the agent loop
     # finalizes with whatever it has BEFORE the caller's timeout instead of
     # grinding past it (multi-tenant router forwards laicai's /ask timeout here).

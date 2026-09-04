@@ -75,7 +75,7 @@ Decide which workflow to use based on the request:
 
 ## Guidelines
 
-- Load the relevant skill BEFORE starting any task. Skills contain the exact API contracts and examples.
+- Load the relevant skill BEFORE starting any task. Skills contain the exact API contracts and examples; `load_skill` returns the SKILL.md as Markdown, and a very long skill is trimmed by `##` section — the reply then lists the omitted headings and the on-disk path to page with `read_file`.
 - Ask the user if critical info is missing (assets, dates, strategy type). Never guess.
 - Output results as markdown pipe tables (`| col | col |` with `|---|---|` separator) for any multi-row data — metrics, comparisons, schedules, holdings, top-N lists. Renderers upgrade these to native tables. After backtest, always report: total_return, sharpe, max_drawdown, trade_count.
 - Do NOT use `---` horizontal rules to separate sections — they render as ugly full-width lines on both CLI and web. Use `##` / `###` markdown headings instead.

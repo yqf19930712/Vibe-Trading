@@ -9,15 +9,23 @@ Per-tenant layout inside the sandbox (template default):
   - launcher on :8898 — `GET /health`, `POST /boot {env}`, `POST /stop`
   - engine   on :8899 — `vibe-trading serve`, spawned by the launcher with the
     per-tenant env the router sends (LLM creds / BYOK / tenant flags)
-  - HOME=/home/vibe, VIBE_DATA_DIR=/home/vibe/.vibe-trading → sessions/memory
-    persist on the sandbox's writable layer across pause/resume.
+  - HOME=/home/vibe, VIBE_DATA_DIR=/home/vibe/.vibe-trading — a host-mount of
+    DATA_ROOT/<tenant_key> (default /data/shared/vibe/<tk>), so sessions /
+    memory / trace / uploads live on the host and survive pause/resume AND
+    sandbox rebuilds (template switch). The sandbox's writable layer holds
+    nothing tenant-specific.
 
 Lifecycle mapping (v1 → v2):
   spawn process   → create sandbox (E2B-compatible CubeAPI) + POST /boot
   kill idle       → pause sandbox (disk + memory state kept; resume is fast)
   LLM switch      → POST /boot with new env (engine restart inside the guest;
                     no sandbox respawn, sessions untouched)
-  forget          → delete sandbox + drop state row
+  template switch → delete sandbox, recreate from the new template on the
+                    next /ask (data dir is host-mounted: lossless)
+  forget          → delete sandbox + rmtree the host data dir + drop state row
+                    (500 {ok:false} if either fails so laicai retries)
+  session delete  → POST /sessions/delete: DELETE on the engine when the
+                    sandbox is up, else remove the host session dir
 
 Sandbox data-plane access goes through cube-proxy's E2B-style host routing:
   http://<port>-<sandbox_id>.<SANDBOX_DOMAIN>/   (host DNS resolves *.cube.app
@@ -37,6 +45,7 @@ import logging
 import os
 import re
 import shutil
+import stat as stat_mod
 import subprocess
 import time
 from collections import deque
@@ -45,7 +54,7 @@ from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 log = logging.getLogger("cube-router")
@@ -308,13 +317,14 @@ async def sbx_pause(sandbox_id: str) -> None:
         log.warning("pause %s failed: %s", sandbox_id[:12], e)
 
 
-async def sbx_delete(sandbox_id: str) -> None:
-    """Delete a sandbox, resuming it first if needed.
+async def sbx_delete(sandbox_id: str) -> bool:
+    """Delete a sandbox, resuming it first if needed. Returns success.
 
     CubeAPI refuses to delete a paused sandbox ("sandbox not in normal state")
     and answers 500 — which httpx does not raise on, so without the status check
     below the failure is swallowed and the sandbox leaks forever, holding disk
-    and a slot against VIBE_MAX_INSTANCES.
+    and a slot against VIBE_MAX_INSTANCES. Callers that must know (``/forget``,
+    P1 2026-09-04) read the bool; the self-heal paths ignore it as before.
     """
     try:
         await sbx_resume(sandbox_id)
@@ -324,8 +334,11 @@ async def sbx_delete(sandbox_id: str) -> None:
         r = await api.delete(f"/sandboxes/{sandbox_id}")
         if r.status_code not in (200, 202, 204, 404):
             log.warning("delete %s -> %s %s", sandbox_id[:12], r.status_code, r.text[:200])
+            return False
+        return True
     except Exception as e:
         log.warning("delete %s failed: %s", sandbox_id[:12], e)
+        return False
 
 
 def guest_url(sandbox_id: str, port: int) -> str:
@@ -548,8 +561,61 @@ async def _post_turn(
     r = await _vibe(inst, "POST", f"/sessions/{sid}/messages", json=payload)
     if r.status_code == 404:
         raise _SessionGone()
+    if r.status_code == 422:
+        # Pydantic validation on the engine side. The one users actually hit
+        # is the input length cap (portfolio context + question); say so
+        # instead of surfacing a bare 422 (P1 2026-09-04).
+        raise HTTPException(400, _engine_422_detail(r))
     r.raise_for_status()
     return r.json().get("attempt_id")
+
+
+ENGINE_QUERY_MAX_CHARS = 20000  # mirrors SendMessageRequest.content max_length
+
+
+def _engine_422_detail(r: "httpx.Response") -> str:
+    """Human-readable detail for an engine 422 (length cap vs other)."""
+    text = r.text or ""
+    if "content" in text and ("string_too_long" in text or "max_length" in text or "too_long" in text):
+        return (
+            f"问题过长，请精简后重试（引擎单次输入上限 {ENGINE_QUERY_MAX_CHARS} 字符，"
+            "含注入的持仓上下文）"
+        )
+    return f"引擎拒绝了请求参数: {text[:200]}"
+
+
+class _EngineFailed(HTTPException):
+    """The engine finished the attempt with status=failed (not a timeout)."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__(502, f"deep engine failed: {error}")
+        self.engine_error = error
+
+
+def _classify_answer_message(msg: dict, attempt_id: Optional[str]) -> tuple[str, str]:
+    """Classify one stored engine message for ``_wait_answer``.
+
+    Returns ``(kind, text)`` with kind ∈ {"skip", "answer", "failed"}. Pure
+    so the router test can pin it without an engine.
+
+    A failed attempt used to be forwarded as the answer: the engine writes
+    an assistant message "Execution failed: …" linked to the attempt, and
+    the old loop accepted any non-empty linked assistant text (P1
+    2026-09-04). The engine now stamps ``metadata.ok`` / ``metadata.error``;
+    ``metadata.status == "failed"`` (which older engines already wrote)
+    is honoured as well.
+    """
+    if msg.get("role") != "assistant":
+        return "skip", ""
+    content = (msg.get("content") or "").strip()
+    if not content:
+        return "skip", ""
+    if attempt_id and msg.get("linked_attempt_id") not in (attempt_id, None):
+        return "skip", ""
+    meta = msg.get("metadata") or {}
+    if isinstance(meta, dict) and (meta.get("ok") is False or meta.get("status") == "failed"):
+        return "failed", str(meta.get("error") or content)[:500]
+    return "answer", content
 
 
 async def _wait_answer(
@@ -563,14 +629,11 @@ async def _wait_answer(
             continue
         msgs = m.json()
         for msg in reversed(msgs):
-            if msg.get("role") != "assistant":
-                continue
-            content = (msg.get("content") or "").strip()
-            if not content:
-                continue
-            if attempt_id and msg.get("linked_attempt_id") not in (attempt_id, None):
-                continue
-            return content
+            kind, text = _classify_answer_message(msg, attempt_id)
+            if kind == "answer":
+                return text
+            if kind == "failed":
+                raise _EngineFailed(text)
     raise HTTPException(504, "deep engine timed out")
 
 
@@ -708,7 +771,9 @@ def _frame(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=False) + "\n"
 
 
-def _classify_status(status_code: int) -> str:
+def _classify_status(status_code: int, exc: Optional[HTTPException] = None) -> str:
+    if isinstance(exc, _EngineFailed):
+        return "engine_failed"
     return {503: "busy", 504: "timeout", 502: "upstream_failed"}.get(status_code, "error")
 
 
@@ -836,7 +901,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
             finally:
                 inst.refcount -= 1
     except HTTPException as e:
-        stats["outcome"] = _classify_status(e.status_code)
+        stats["outcome"] = _classify_status(e.status_code, e)
         stats["error"] = str(e.detail)[:300]
         stats["total_ms"] = int((time.monotonic() - t_req) * 1000)
         yield _frame({
@@ -894,13 +959,148 @@ async def forget(body: dict, authorization: Optional[str] = Header(None)):
     async with pool_mutex:
         inst = pool.pop(tk, None)
     sandbox_id = inst.sandbox_id if inst else (state.get(tk) or {}).get("sandbox_id")
+    errors: list[str] = []
+    sandbox_ok = True
     if sandbox_id:
-        await sbx_delete(sandbox_id)
+        try:
+            sandbox_ok = await sbx_delete(sandbox_id)
+        except Exception as e:  # noqa: BLE001 - must reach the response body
+            sandbox_ok = False
+            log.warning("forget: sandbox delete %s raised: %s", sandbox_id[:12], e)
+        if not sandbox_ok:
+            errors.append(f"sandbox {sandbox_id[:12]} delete failed")
     # Tenant data now outlives the sandbox, so forgetting must remove it here too.
-    shutil.rmtree(DATA_ROOT / tk, ignore_errors=True)
-    state.pop(tk, None)
-    _save_state()
+    rm_err = await asyncio.to_thread(_rmtree_tenant_dir, DATA_ROOT / tk)
+    if rm_err:
+        errors.append(rm_err)
+    if sandbox_ok:
+        # Keep the mapping while the sandbox still exists so the nightly
+        # retry can find it again; a leftover dir alone needs no state.
+        state.pop(tk, None)
+        _save_state()
+    if errors:
+        # laicai's engine-forget job keys on `res.ok` (engine-forget.ts): a
+        # non-2xx keeps the job pending for the 23:30 retry instead of
+        # marking a half-done purge as finished (P1 2026-09-04).
+        detail = "; ".join(errors)
+        log.warning("forget tenant %s incomplete: %s", tk[:8], detail)
+        return JSONResponse(status_code=500, content={"ok": False, "error": detail})
     return {"ok": True}
+
+
+def _rmtree_tenant_dir(path: Path) -> Optional[str]:
+    """Remove a tenant dir; return an error string instead of raising.
+
+    A symlinked tenant dir is refused (rmtree would follow nothing but the
+    link itself is a sign of tampering, and the target may be host data).
+    """
+    if path.is_symlink():
+        return f"tenant dir {path.name[:8]} is a symlink; refusing to remove"
+    if not path.exists():
+        return None
+    failures: list[str] = []
+
+    def _onerror(_fn: Any, p: Any, exc_info: Any) -> None:
+        failures.append(f"{Path(str(p)).name}: {exc_info[1]}")
+
+    shutil.rmtree(path, onerror=_onerror)
+    if failures or path.exists():
+        return f"tenant dir removal incomplete ({len(failures)} errors: {'; '.join(failures[:3])})"
+    return None
+
+
+# ── Per-session deletion (laicai "删除对话" → engine session) ────────────────
+# laicai deletes a chat thread; the bound engine session (messages.jsonl,
+# trace.jsonl with every prompt, transcript_*.jsonl compaction dumps,
+# handoff.json) used to stay on the host forever — the only purge path was
+# the whole-tenant /forget at account deletion (P1 2026-09-04).
+#
+# Two modes, chosen by the router, reported back in ``mode``:
+#   engine  — the tenant's sandbox is up: DELETE /sessions/{id} on the engine,
+#             which cancels a live loop, drops the dir AND its sessions.db FTS
+#             rows (search would otherwise keep returning a dead session).
+#   offline — no running sandbox (never created / paused / evicted): the
+#             session dir is removed straight off the host bind-mount. FTS
+#             rows in sessions.db are NOT touched from the host (the engine
+#             may hold WAL state in the frozen VM); the engine's session_search
+#             tolerates a missing dir and the row is dropped on the next
+#             reindex.
+# Idempotent: a session that is already gone answers ok=true, deleted=false.
+
+
+class SessionDeleteBody(BaseModel):
+    uid: str
+    session_id: str
+
+
+def _remove_session_dir(uid: str, session_id: str) -> tuple[bool, Optional[str]]:
+    """Remove ``DATA_ROOT/<tk>/sessions/<sid>`` from the host.
+
+    Returns:
+        ``(removed, error)`` — ``removed`` is False when nothing was there;
+        ``error`` is set when the dir exists but could not be removed
+        (or is a symlink, which is refused rather than followed).
+    """
+    root = _tenant_root(uid)
+    candidate = root / "sessions" / session_id
+    if candidate.is_symlink():
+        return False, f"session dir {session_id} is a symlink; refusing to remove"
+    path = _safe_tenant_path(root, candidate)
+    if path is None or not path.is_dir():
+        return False, None
+    failures: list[str] = []
+
+    def _onerror(_fn: Any, p: Any, exc_info: Any) -> None:
+        failures.append(f"{Path(str(p)).name}: {exc_info[1]}")
+
+    shutil.rmtree(path, onerror=_onerror)
+    if failures or path.exists():
+        return False, f"session dir removal incomplete ({'; '.join(failures[:3])})"
+    return True, None
+
+
+@app.post("/sessions/delete")
+async def sessions_delete(
+    body: SessionDeleteBody, authorization: Optional[str] = Header(None)
+):
+    """Delete one engine session of a tenant (see the section comment).
+
+    Response: ``{"ok": true, "mode": "engine"|"offline", "deleted": bool}``;
+    ``deleted=false`` means the session was already gone. A host-side removal
+    failure answers 500 ``{"ok": false, "mode": ..., "error": ...}`` so the
+    caller can retry, mirroring ``/forget``.
+    """
+    _auth(authorization)
+    sid = body.session_id
+    if not _OBS_ID_RE.fullmatch(sid):
+        raise HTTPException(400, "invalid session_id")
+    tk = tenant_key(body.uid)
+    inst = pool.get(tk)
+    mode = "offline"
+    engine_deleted = False
+    if inst is not None and not inst.paused:
+        # Live sandbox: the engine owns sessions.db, so let it do the delete
+        # (loop cancel + dir + FTS rows). Any failure falls through to the
+        # host-side removal so the data still goes away.
+        try:
+            r = await _vibe(inst, "DELETE", f"/sessions/{sid}", timeout=15.0)
+            if r.status_code in (200, 404):
+                mode = "engine"
+                engine_deleted = r.status_code == 200
+                inst.last_activity = time.monotonic()
+            else:
+                log.warning("sessions/delete: engine %s -> %s %s; falling back to host",
+                            sid, r.status_code, r.text[:200])
+        except Exception as e:  # noqa: BLE001 - offline path takes over
+            log.warning("sessions/delete: engine unreachable for %s (%s); host removal",
+                        sid, e)
+    removed, err = await asyncio.to_thread(_remove_session_dir, body.uid, sid)
+    if err:
+        log.warning("sessions/delete tenant %s sid %s: %s", tk[:8], sid, err)
+        return JSONResponse(
+            status_code=500, content={"ok": False, "mode": mode, "error": err}
+        )
+    return {"ok": True, "mode": mode, "deleted": engine_deleted or removed}
 
 
 # ── Read-only tenant observability (laicai admin deep-run detail page) ───────
@@ -911,6 +1111,49 @@ async def forget(body: dict, authorization: Optional[str] = Header(None)):
 
 _OBS_ID_RE = re.compile(r"[A-Za-z0-9_-]{4,64}")
 _OBS_TAIL_BYTES = 4_000_000
+
+
+def _safe_tenant_path(base: Path, p: Path) -> Optional[Path]:
+    """Return ``p`` only when it is a real file/dir INSIDE ``base``.
+
+    The engine runs as uid 1000 inside the tenant's own bind-mount and can
+    create symlinks there at will; the router runs as root on the host and
+    read/wrote whatever those paths pointed at (P0 2026-09-04: a tenant
+    ``memory/x.md -> /etc/shadow`` was readable through ``/memory``, and
+    ``MEMORY.md -> /root/.ssh/authorized_keys`` writable through
+    ``/memory/delete``). Rules:
+
+    * ``p`` itself must not be a symlink;
+    * ``p.resolve()`` must be ``base.resolve()`` or below it (this also
+      rejects a symlinked PARENT directory pointing outside the tenant).
+
+    Args:
+        base: The tenant's root (or a subdir of it) that ``p`` must stay in.
+        p: Candidate path (need not exist).
+
+    Returns:
+        ``p`` unchanged when safe, ``None`` when it must be treated as absent.
+    """
+    try:
+        if p.is_symlink():
+            return None
+        base_r = base.resolve()
+        real = p.resolve()
+    except OSError:
+        return None
+    if real != base_r and base_r not in real.parents:
+        return None
+    return p
+
+
+def _tenant_root(uid: str) -> Path:
+    return DATA_ROOT / tenant_key(uid)
+
+
+def _tenant_file(uid: str, *parts: str) -> Optional[Path]:
+    """``DATA_ROOT/<tk>/<parts…>`` guarded by :func:`_safe_tenant_path`."""
+    root = _tenant_root(uid)
+    return _safe_tenant_path(root, root.joinpath(*parts))
 
 
 def _obs_tail_lines(path: Path, max_bytes: int = _OBS_TAIL_BYTES) -> list[str]:
@@ -943,8 +1186,8 @@ async def obs_engine_log(
     if attempt_id and not _OBS_ID_RE.fullmatch(attempt_id):
         raise HTTPException(400, "invalid attempt_id")
     limit = max(1, min(limit, 2000))
-    path = DATA_ROOT / tenant_key(uid) / "logs" / "engine.jsonl"
-    if not path.exists():
+    path = _tenant_file(uid, "logs", "engine.jsonl")
+    if path is None or not path.is_file():
         return {"lines": [], "truncated": False}
     raw = await asyncio.to_thread(_obs_tail_lines, path)
     out = []
@@ -999,8 +1242,8 @@ async def obs_trace(
     if not _OBS_ID_RE.fullmatch(session_id):
         raise HTTPException(400, "invalid session_id")
     limit = max(1, min(limit, 2000))
-    path = DATA_ROOT / tenant_key(uid) / "sessions" / session_id / "trace.jsonl"
-    if not path.exists():
+    path = _tenant_file(uid, "sessions", session_id, "trace.jsonl")
+    if path is None or not path.is_file():
         return {"entries": [], "truncated": False}
     raw = await asyncio.to_thread(_obs_tail_lines, path)
     out = []
@@ -1032,8 +1275,8 @@ async def obs_prompt(
     _auth(authorization)
     if not _OBS_ID_RE.fullmatch(session_id):
         raise HTTPException(400, "invalid session_id")
-    path = DATA_ROOT / tenant_key(uid) / "sessions" / session_id / "trace.jsonl"
-    if not path.exists():
+    path = _tenant_file(uid, "sessions", session_id, "trace.jsonl")
+    if path is None or not path.is_file():
         return {"starts": []}
 
     def _read_starts() -> list[dict[str, Any]]:
@@ -1075,8 +1318,8 @@ async def obs_swarm_events(
     if not _OBS_ID_RE.fullmatch(run_id):
         raise HTTPException(400, "invalid run_id")
     limit = max(1, min(limit, 2000))
-    path = DATA_ROOT / tenant_key(uid) / ".swarm" / "runs" / run_id / "events.jsonl"
-    if not path.exists():
+    path = _tenant_file(uid, ".swarm", "runs", run_id, "events.jsonl")
+    if path is None or not path.is_file():
         return {"entries": [], "truncated": False}
     raw = await asyncio.to_thread(_obs_tail_lines, path)
     out = []
@@ -1131,10 +1374,15 @@ async def memory_list(uid: str, authorization: Optional[str] = Header(None)):
     d = _mem_dir(uid)
 
     def _read() -> list[dict]:
-        if not d.is_dir():
+        if _safe_tenant_path(_tenant_root(uid), d) is None or not d.is_dir():
             return []
         out = []
         for p in d.iterdir():
+            # Symlink entries are skipped outright (P0 2026-09-04): is_file()
+            # follows links, so without this a tenant-planted link read
+            # arbitrary host files through the memory page.
+            if _safe_tenant_path(d, p) is None:
+                continue
             if not p.is_file() or not _safe_mem_name(p.name) or p.name == "MEMORY.md":
                 continue
             try:
@@ -1166,19 +1414,27 @@ async def memory_delete(body: dict, authorization: Optional[str] = Header(None))
     if not isinstance(name, str) or not _safe_mem_name(name) or name == "MEMORY.md":
         raise HTTPException(400, "invalid name")
     d = _mem_dir(uid)
-    path = d / name
+    if _safe_tenant_path(_tenant_root(uid), d) is None:
+        raise HTTPException(404, "memory dir unavailable")
+    path = _safe_tenant_path(d, d / name)
+    if path is None:
+        raise HTTPException(404, "not found")
 
     def _delete() -> bool:
         existed = path.is_file()
         if existed:
             path.unlink()
-        idx = d / "MEMORY.md"
-        if idx.is_file():
+        # The index is rewritten in place: refuse when it is (or sits under)
+        # a symlink, otherwise root would write through it (P0 2026-09-04).
+        idx = _safe_tenant_path(d, d / "MEMORY.md")
+        if idx is not None and idx.is_file():
             try:
                 lines = idx.read_text("utf-8", "replace").splitlines(keepends=True)
                 kept = [l for l in lines if f"({name})" not in l]
                 if len(kept) != len(lines):
-                    idx.write_text("".join(kept), encoding="utf-8")
+                    tmp = idx.with_name(f".{idx.name}.{os.getpid()}.tmp")
+                    tmp.write_text("".join(kept), encoding="utf-8")
+                    tmp.replace(idx)
             except OSError:
                 pass  # index cleanup is best-effort; the engine tolerates drift
         return existed
@@ -1218,18 +1474,40 @@ _du_cache: dict[str, tuple[float, int]] = {}
 
 
 def _dir_bytes(path: Path) -> int:
-    """Apparent size of one tenant dir. Returns 0 for a missing/unreadable dir."""
+    """Apparent size of one tenant dir. Returns 0 for a missing/unreadable dir.
+
+    Walks with ``followlinks=False`` and skips symlinked files: a tenant can
+    plant ``big -> /`` inside its bind-mount and the old ``rglob`` (which
+    descends into symlinked directories) would have walked the whole host
+    filesystem as root (P0 2026-09-04).
+    """
+    if path.is_symlink() or not path.is_dir():
+        return 0
     total = 0
     try:
-        for p in path.rglob("*"):
-            try:
-                if p.is_file() and not p.is_symlink():
-                    total += p.stat().st_size
-            except OSError:
-                continue  # racing with the engine writing/rotating files
+        for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+            for name in filenames:
+                p = Path(dirpath) / name
+                try:
+                    st = p.lstat()  # never follow: a link's own size is what we count
+                except OSError:
+                    continue  # racing with the engine writing/rotating files
+                if stat_mod.S_ISREG(st.st_mode):
+                    total += st.st_size
     except OSError:
         return 0
     return total
+
+
+def _disk_used_pct(path: Path) -> Optional[float]:
+    """Host filesystem usage (percent) of the volume holding ``path``."""
+    try:
+        du = shutil.disk_usage(path if path.exists() else path.parent)
+    except OSError:
+        return None
+    if not du.total:
+        return None
+    return round(du.used / du.total * 100, 1)
 
 
 def _tenant_usage_sync() -> list[dict]:
@@ -1237,7 +1515,7 @@ def _tenant_usage_sync() -> list[dict]:
     now = time.monotonic()
     out: list[dict] = []
     try:
-        dirs = [d for d in DATA_ROOT.iterdir() if d.is_dir()]
+        dirs = [d for d in DATA_ROOT.iterdir() if d.is_dir() and not d.is_symlink()]
     except OSError as e:
         log.warning("usage: DATA_ROOT unreadable: %s", e)
         return out
@@ -1275,6 +1553,11 @@ async def tenant_usage() -> list[dict]:
     return await asyncio.to_thread(_tenant_usage_sync)
 
 
+def _over_watermark_tk8s(rows: list[dict]) -> list[str]:
+    """tk8 of every tenant past the disk watermark (largest first)."""
+    return [r["tk8"] for r in rows if r.get("over_watermark")]
+
+
 @app.get("/tenants/usage")
 async def tenants_usage(
     limit: int = 20, authorization: Optional[str] = Header(None)
@@ -1286,8 +1569,11 @@ async def tenants_usage(
         "quota_bytes": TENANT_QUOTA_BYTES,
         "watermark": TENANT_WATERMARK,
         "data_root_bytes": sum(r["disk_bytes"] for r in rows),
+        "disk_used_pct": _disk_used_pct(DATA_ROOT),
         "tenants_total": len(rows),
-        "over_watermark": sum(1 for r in rows if r["over_watermark"]),
+        # tk8 list (was a bare count, P1 2026-09-04): a consumer could see
+        # THAT someone was over the line but not WHO, so nothing could act.
+        "over_watermark": _over_watermark_tk8s(rows),
         "tenants": rows[: max(1, min(limit, 200))],
     }
 
@@ -1318,7 +1604,12 @@ async def healthz(authorization: Optional[str] = Header(None)):
             "quota_bytes": TENANT_QUOTA_BYTES,
             "watermark": TENANT_WATERMARK,
             "tenants_total": len(usage),
-            "over_watermark": sum(1 for u in usage if u["over_watermark"]),
+            # tk8 list of tenants past the watermark (was a count; the list
+            # is what an operator / laicai ops page can actually act on).
+            "over_watermark": _over_watermark_tk8s(usage),
+            # Host filesystem fill level of the volume holding DATA_ROOT —
+            # per-tenant quotas are meaningless once the disk itself is full.
+            "disk_used_pct": _disk_used_pct(DATA_ROOT),
         },
         "tenants": [
             {

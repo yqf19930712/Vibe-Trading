@@ -16,7 +16,16 @@ from src.core import fetch_stats as _fetch_stats
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_ROWS = 250
+# Per-symbol row cap. 120 daily bars ≈ half a trading year; together with the
+# compact table shape below a default single-symbol call stays under the
+# 10k-char trajectory budget (``tool_result_store.TOOL_RESULT_LIMIT``) instead
+# of being offloaded to disk on every call (250 indented records ≈ 56–63k).
+DEFAULT_MAX_ROWS = 120
+# Numeric columns are rounded to this many decimals in the tool payload.
+PRICE_DECIMALS = 4
+# Key of the per-symbol row table (``{"columns": [...], "rows": [[...]]}``).
+TABLE_COLUMNS_KEY = "columns"
+TABLE_ROWS_KEY = "rows"
 
 # Total wall-clock budget for one fetch_market_data call INCLUDING the
 # fallback chain (further capped by the attempt deadline when one is bound).
@@ -90,13 +99,120 @@ def cap_rows(records: list, max_rows: int) -> list | dict[str, object]:
 
 
 def _json_safe(value: Any) -> Any:
+    """Coerce one cell into a compact, strict-JSON-safe scalar.
+
+    Timestamps become ISO strings (a midnight time part is dropped so daily
+    bars carry a bare ``YYYY-MM-DD``); floats are rounded to
+    :data:`PRICE_DECIMALS` and integral floats (volume, amount) lose their
+    ``.0``; NaN/inf become ``None`` so ``allow_nan=False`` never raises.
+    """
     if hasattr(value, "isoformat"):
-        return value.isoformat()
+        text = value.isoformat()
+        if text.endswith("T00:00:00"):
+            text = text[: -len("T00:00:00")]
+        return text
     if hasattr(value, "item"):
         value = value.item()
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        value = round(value, PRICE_DECIMALS)
+        if value.is_integer() and abs(value) < 1e15:
+            return int(value)
+        return value
     return value
+
+
+def _summarize(records: list[dict[str, Any]], columns: list[str]) -> dict[str, Any]:
+    """Build the per-symbol ``summary`` block from the (already capped) rows.
+
+    The summary is what survives structured truncation
+    (``tool_result_store``) — start/end date, row count, first/last close,
+    range high/low and the period return — so the model can still reason
+    about the series when the middle rows have been dropped.
+    """
+    if not records:
+        return {"rows": 0}
+    date_col = columns[0] if columns else None
+    first, last = records[0], records[-1]
+    summary: dict[str, Any] = {"rows": len(records)}
+    if date_col is not None:
+        summary["start"] = first.get(date_col)
+        summary["end"] = last.get(date_col)
+
+    def _num(row: dict[str, Any], key: str) -> float | None:
+        v = row.get(key)
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    first_close, last_close = _num(first, "close"), _num(last, "close")
+    if first_close is not None:
+        summary["first_close"] = first_close
+    if last_close is not None:
+        summary["last_close"] = last_close
+    if first_close and last_close is not None:
+        summary["change_pct"] = round((last_close / first_close - 1.0) * 100.0, 2)
+    highs = [v for v in (_num(r, "high" if "high" in columns else "close") for r in records) if v is not None]
+    lows = [v for v in (_num(r, "low" if "low" in columns else "close") for r in records) if v is not None]
+    if highs:
+        summary["high"] = max(highs)
+    if lows:
+        summary["low"] = min(lows)
+    return summary
+
+
+def to_table(capped: list | dict[str, object]) -> dict[str, Any]:
+    """Turn a (possibly capped) record list into the compact table payload.
+
+    Shape (``summary`` first so a structured truncation keeps it)::
+
+        {"summary": {...}, "columns": [...], "rows": [[...], ...]}
+
+    A capped series (see :func:`cap_rows`) additionally carries
+    ``total_rows`` / ``returned`` / ``truncated`` / ``policy`` / ``hint``.
+    Column names are emitted once instead of once per row — the single
+    biggest saving over ``to_dict(orient="records")``.
+    """
+    meta: dict[str, Any] = {}
+    if isinstance(capped, dict):
+        records = list(capped.get("data") or [])
+        meta = {
+            "total_rows": capped.get("rows"),
+            "returned": capped.get("returned"),
+            "truncated": True,
+            "policy": capped.get("policy"),
+            "hint": capped.get("hint"),
+        }
+    else:
+        records = list(capped)
+    columns: list[str] = []
+    for row in records:
+        for key in row:
+            if key not in columns:
+                columns.append(str(key))
+    table: dict[str, Any] = {"summary": _summarize(records, columns)}
+    if meta:
+        table["summary"]["total_rows"] = meta["total_rows"]
+        table.update(meta)
+    table[TABLE_COLUMNS_KEY] = columns
+    table[TABLE_ROWS_KEY] = [[row.get(col) for col in columns] for row in records]
+    return table
+
+
+def table_rows(value: Any) -> tuple[list[str], list[list[Any]]] | None:
+    """Return ``(columns, rows)`` for a per-symbol table payload, else None.
+
+    Shared by the grounding verifier and the structured truncation so the
+    table contract lives in one place.
+    """
+    if not isinstance(value, dict):
+        return None
+    columns = value.get(TABLE_COLUMNS_KEY)
+    rows = value.get(TABLE_ROWS_KEY)
+    if not isinstance(columns, list) or not isinstance(rows, list):
+        return None
+    return [str(c) for c in columns], rows
 
 
 def _fetch_via(
@@ -190,7 +306,7 @@ def fetch_market_data(
             for row in records:
                 for key, value in row.items():
                     row[key] = _json_safe(value)
-            results[symbol] = cap_rows(records, max_rows)
+            results[symbol] = to_table(cap_rows(records, max_rows))
 
     # ── Primary pass (requested/detected source per code) ────────────────────
     if source == "auto":
@@ -277,6 +393,17 @@ def fetch_market_data(
     return results
 
 
+def dumps_compact(payload: Any) -> str:
+    """Serialize a market-data payload as compact strict JSON (no indent)."""
+    return json.dumps(
+        payload, ensure_ascii=False, indent=None, separators=(",", ":"), allow_nan=False
+    )
+
+
 def fetch_market_data_json(**kwargs: Any) -> str:
-    """Fetch market data and return strict JSON."""
-    return json.dumps(fetch_market_data(**kwargs), ensure_ascii=False, indent=2, allow_nan=False)
+    """Fetch market data and return compact strict JSON.
+
+    Per symbol: ``{"summary": {...}, "columns": [...], "rows": [[...]]}``;
+    ``_unresolved`` / ``_gaps`` metadata keys as before.
+    """
+    return dumps_compact(fetch_market_data(**kwargs))

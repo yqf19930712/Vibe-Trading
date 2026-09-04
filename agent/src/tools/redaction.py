@@ -17,15 +17,26 @@ Two independent concerns live here:
    Promoted from the swarm worker's private copies (#142) so
    the swarm worker, the live-action audit, the main agent loop, and the
    paper-trading surfaces all consume one shared implementation.
+3. ``redact_secret_values`` — VALUE-based scrubbing (review 2026-09-04, P0).
+   Key-based redaction cannot see a credential that a shell command echoed
+   into free text (``env``, ``cat .env``, a traceback carrying the header).
+   The engine process env is the authoritative list of secrets it holds, so
+   every value of a credential-looking env var (``*_KEY`` / ``*_TOKEN`` /
+   ``*_SECRET`` / ``*_PASSWORD`` or an ``api_key``/``token``-style marker)
+   that is at least ``SECRET_VALUE_MIN_LEN`` chars long is replaced by
+   ``[redacted:<KEYNAME>]`` in tool output before it reaches the trajectory.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 import sysconfig
 from functools import cache
 from pathlib import Path
 from typing import Any
+
+from src.tools.subprocess_env import has_secret_segment
 
 _SENTINEL = "<redacted>"
 
@@ -212,3 +223,64 @@ def redact_payload(obj: Any) -> Any:
     if isinstance(obj, list):
         return [redact_payload(item) for item in obj]
     return obj
+
+
+# ── Value-based secret scrubbing ─────────────────────────────────────────────
+
+#: Shorter values are too likely to collide with ordinary text (a 6-char
+#: token would also match inside unrelated output).
+SECRET_VALUE_MIN_LEN = 12
+
+_secret_values_cache: list[tuple[str, str]] | None = None
+
+
+def _collect_secret_values(env: "dict[str, str] | os._Environ[str] | None" = None) -> list[tuple[str, str]]:
+    """Return ``(value, KEYNAME)`` pairs for credential-looking env vars.
+
+    Longest values first so an overlapping shorter secret cannot split a
+    longer one into a still-recognisable remainder.
+    """
+    source = os.environ if env is None else env
+    pairs: list[tuple[str, str]] = []
+    for name, value in source.items():
+        if not value or len(value) < SECRET_VALUE_MIN_LEN:
+            continue
+        if is_sensitive_arg(name) or has_secret_segment(name):
+            pairs.append((value, name))
+    pairs.sort(key=lambda kv: len(kv[0]), reverse=True)
+    return pairs
+
+
+def refresh_secret_values() -> None:
+    """Re-read the process env (tests; the engine env is fixed after boot)."""
+    global _secret_values_cache
+    _secret_values_cache = None
+
+
+def _secret_values() -> list[tuple[str, str]]:
+    global _secret_values_cache
+    if _secret_values_cache is None:
+        _secret_values_cache = _collect_secret_values()
+    return _secret_values_cache
+
+
+def redact_secret_values(text: object) -> str:
+    """Replace every known credential VALUE in ``text`` with ``[redacted:<KEY>]``.
+
+    Args:
+        text: Tool output (stdout/stderr/result string). Non-str is
+            stringified; ``None`` becomes ``""``.
+
+    Returns:
+        The text with each env-derived secret value replaced. Plain string
+        replacement, no regex.
+    """
+    if text is None:
+        return ""
+    s = text if isinstance(text, str) else str(text)
+    if not s:
+        return s
+    for value, name in _secret_values():
+        if value in s:
+            s = s.replace(value, f"[redacted:{name}]")
+    return s

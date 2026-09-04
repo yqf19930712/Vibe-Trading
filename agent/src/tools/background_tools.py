@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.agent.tools import BaseTool
+from src.tools.redaction import redact_secret_values
+from src.tools.subprocess_env import _subprocess_env
 
 WORKDIR = Path(__file__).resolve().parents[2]
 
@@ -38,10 +40,12 @@ class BackgroundManager:
 
     def _execute(self, task_id: str, command: str) -> None:
         try:
-            r = subprocess.run(command, shell=True, cwd=WORKDIR,
+            # Allowlisted env only (P0 2026-09-04): never hand the engine's
+            # shared credentials to a shell subprocess.
+            r = subprocess.run(command, shell=True, cwd=WORKDIR, env=_subprocess_env(),
                                capture_output=True, text=True, timeout=300,
                                encoding="utf-8", errors="replace")
-            output = (r.stdout + r.stderr).strip()[:50000]
+            output = redact_secret_values((r.stdout + r.stderr).strip()[:50000])
             status = "completed"
         except subprocess.TimeoutExpired:
             output, status = "Timeout (300s)", "timeout"

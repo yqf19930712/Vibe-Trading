@@ -20,11 +20,10 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.core.atomic_write import atomic_write_text
 from src.core.paths import data_root
 from src.core.token_estimate import estimate_text_tokens
 
@@ -82,14 +81,7 @@ def save(session_id: str, summary: str, *, attempt_iter: int = 0) -> bool:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         # Atomic replace: a concurrent reader never sees a half-written file.
-        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False)
-            os.replace(tmp_name, path)
-        except BaseException:
-            Path(tmp_name).unlink(missing_ok=True)
-            raise
+        atomic_write_text(path, json.dumps(payload, ensure_ascii=False))
     except OSError as exc:  # noqa: BLE001 - full disk must not kill the attempt
         logger.warning("handoff save failed for session %s: %s", session_id, exc)
         return False

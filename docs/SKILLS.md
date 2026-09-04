@@ -28,7 +28,8 @@
 系统提示只承载**一行摘要**，全文按需加载，这是 79 个 skill 不炸上下文的关键：
 
 - **摘要注入**：`get_descriptions()` 按 category 分组渲染（顺序 `data-source → strategy → analysis → asset-class → crypto → flow → tool → 其余按字母`），每个 skill 一行 `- name: description`。
-- **全文加载**：模型调 `load_skill(name)` 工具（`agent/src/tools/load_skill_tool.py`）→ `get_content()` 返回 `<skill name="…">正文</skill>`。未命中时回退到用户目录磁盘查找（覆盖会话中途新建的 skill），仍未命中则返回错误并列出全部可用名。
+- **全文加载**：模型调 `load_skill(name)` 工具（`agent/src/tools/load_skill_tool.py`）→ `SkillsLoader.get_body()` 取 SKILL.md 正文，工具返回 **Markdown 原文**，首行 `# skill: <name>`（不是 JSON，也没有 `<skill>` 包裹——单行 JSON 落盘后 `read_file` 按行翻页永远翻不到被裁掉的部分）。未命中时回退到用户目录磁盘查找（覆盖会话中途新建的 skill），仍未命中则返回 `{"status":"error","error":"Error: Unknown skill '…'. Available: …"}` JSON 信封（主循环与 swarm worker 的错误分类器都按该信封判失败）。`get_content()`（`<skill name="…">` XML 包裹）只剩 `mcp_server.py` 的 MCP 工具在用。
+- **长 skill 的截断规则**（`agent/src/agent/tool_result_store.py`）：`load_skill` 豁免通用的 10k 字符上限，预算 `SKILL_RESULT_LIMIT=60000`（79 个内置 skill 里 27 个超 10k，`tushare` 约 100k）。超预算时**按 `##` 小节裁**、绝不裁在句中：保留能装下的连续前缀小节，信封列出每个被省略小节的标题与起始行号、全文落盘路径（`run_dir/tool-results/<iter>-load_skill-<callid8>.md`）与 `read_file(offset, limit)` 续读提示；围栏代码块里的 `##` 不算分节点。落盘失败时改指向内置的 `<name>/SKILL.md`（行号偏移 frontmatter）。
 - **主 Agent 的行为约束**：Guidelines 要求「任务开始前先 load 相关 skill」；Shadow Account 流更是硬规则——不先 `load_skill("shadow-account")` 不许碰 `shadow_*` 工具。
 
 ## 3. 自进化：skill 的增删改

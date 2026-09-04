@@ -228,10 +228,14 @@ class TestOversizedToolResultWiring:
         payload = messages[0]["content"]
         assert payload.startswith(TRUNCATED_TAG)
         assert f'total_chars="{len(raw)}"' in payload
-        # The file it points at exists and holds the WHOLE result.
+        # The file it points at exists and holds the WHOLE result. A single-line
+        # JSON result is pretty-printed on disk so read_file(offset, limit)
+        # line paging can reach the omitted middle — content-identical.
         offloaded = list((Path(agent.memory.run_dir) / "tool-results").iterdir())
         assert len(offloaded) == 1
-        assert offloaded[0].read_text(encoding="utf-8") == raw
+        on_disk = offloaded[0].read_text(encoding="utf-8")
+        assert json.loads(on_disk) == json.loads(raw)
+        assert on_disk.count("\n") > 100
         assert str(offloaded[0]) in payload
 
     def test_the_grounding_verifier_still_sees_the_raw_result(

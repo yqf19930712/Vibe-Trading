@@ -12,6 +12,8 @@ from typing import Any
 
 from src.agent.progress import emit_progress
 from src.agent.tools import BaseTool
+from src.tools.redaction import redact_secret_values
+from src.tools.subprocess_env import _subprocess_env
 
 _OUTPUT_LIMIT = 50_000
 # F4: head+tail truncation instead of a silent hard cut — long outputs keep
@@ -111,10 +113,11 @@ class BashTool(BaseTool):
     name = "bash"
     description = (
         "Execute a shell command in the working directory and wait for it. Use for "
-        "installing packages, running scripts, or inspecting files. Outbound network "
-        "access goes through a domain-whitelisted egress proxy — direct "
-        "connections to arbitrary hosts may be blocked; prefer the dedicated "
-        "web_search/read_url/get_market_data tools for data access. "
+        "installing packages, running scripts, or inspecting files. The command "
+        "runs inside the tenant's isolated sandbox with a minimal environment: "
+        "no API keys or data-source credentials are exported to it, so use the "
+        "dedicated web_search/read_url/get_market_data tools for anything that "
+        "needs authenticated data access. "
         f"The command is killed after ~{_DEFAULT_TIMEOUT:.0f}s (less when the turn's "
         "remaining budget is shorter), so this tool is for work that finishes in "
         "well under that. For anything longer — model training, bulk data "
@@ -157,6 +160,9 @@ class BashTool(BaseTool):
                 command,
                 shell=True,
                 cwd=cwd,
+                # Allowlisted env only (P0 2026-09-04): the engine process
+                # env carries tenant-shared LLM/data-source credentials.
+                env=_subprocess_env(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -164,11 +170,15 @@ class BashTool(BaseTool):
                 encoding="utf-8",
                 errors="replace",
             )
+            # Value-based scrub BEFORE truncation/dumping so neither the
+            # trajectory copy nor the on-disk full dump carries a secret.
+            stdout = redact_secret_values(result.stdout)
+            stderr = redact_secret_values(result.stderr)
             payload: dict[str, Any] = {
                 "status": "ok" if result.returncode == 0 else "error",
                 "exit_code": result.returncode,
-                "stdout": _truncate_output(result.stdout, "stdout", cwd),
-                "stderr": _truncate_output(result.stderr, "stderr", cwd),
+                "stdout": _truncate_output(stdout, "stdout", cwd),
+                "stderr": _truncate_output(stderr, "stderr", cwd),
             }
             if audit_findings:
                 payload["security_audit"] = audit_findings

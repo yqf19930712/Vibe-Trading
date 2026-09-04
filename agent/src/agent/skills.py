@@ -156,6 +156,24 @@ class SkillsLoader:
                 lines.append(f"  - {skill.name}: {skill.description}")
         return "\n".join(lines)
 
+    def get_body(self, name: str) -> Optional[str]:
+        """Return the raw SKILL.md body for a skill, or None when unknown.
+
+        Same lookup as :meth:`get_content` (loaded list, then the user
+        skills directory for mid-session creations) but without the
+        ``<skill>`` wrapper — the ``load_skill`` tool hands the model the
+        Markdown as-is so a long skill stays line-pageable on disk.
+        """
+        for skill in self.skills:
+            if skill.name == name:
+                return skill.body
+        if self._user_skills_dir:
+            skill = _load_skill_dir(self._user_skills_dir / name)
+            if skill:
+                self.skills.append(skill)
+                return skill.body
+        return None
+
     def get_content(self, name: str) -> str:
         """Return the full documentation for a skill (used by the load_skill tool).
 
