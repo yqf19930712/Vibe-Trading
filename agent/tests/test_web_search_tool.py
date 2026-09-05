@@ -61,8 +61,9 @@ def test_returns_results_and_passes_backend_list(monkeypatch):
     assert out["results"][0]["url"] == "http://a"
     assert "snippet1" in out["results"][0]["snippet"]
     assert out["results"][0]["snippet"].startswith("<external-content ")
-    # The default multi-engine list is forwarded so a throttled engine falls through.
-    assert seen.get("backend") == "duckduckgo, google, bing, brave, mojeek, yahoo"
+    # ddgs 9.x rotates engines itself under "auto" — the tool forwards that
+    # rather than a hard-coded engine list (see web_search_tool._DEFAULT_BACKENDS).
+    assert seen.get("backend") == "auto"
 
 
 def test_env_overrides_backends(monkeypatch):

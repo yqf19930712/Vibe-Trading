@@ -69,7 +69,8 @@ flowchart LR
 - **文件 sink**：`data_root()/logs/engine.jsonl`，`RotatingFileHandler` 20MB×3，JSONL 一行一条：`ts`(UTC ISO)/`level`/`logger`/`msg`/`session_id`/`attempt_id` + 所有 `extra=` 结构化字段 + 截断到 2000 字符的异常栈（`exc`）。多租户下该目录在宿主 `/data/shared/vibe/<tk>/logs/`，**宿主直读、无需进沙箱**。
 - **stderr sink**：WARNING+ 纯文本，进 journald 兜底。
 - 级别：`VIBE_LOG_LEVEL`（默认 INFO）。
-- 数据链路的 `print("[WARN]")` 已第一批清剿（tushare/yfinance/okx loader → `logger.warning` + `source`/`symbol`/`error` 字段）；其余 print 存量分批处理。
+- 数据链路（tushare/yfinance/okx loader）走 `logger.warning` + `source`/`symbol`/`error` 结构化字段；上游其余模块仍有 `print` 存量，不进 engine.jsonl。
+- 工具结果在进入日志/trace/轨迹之前已经过按值脱敏（`redaction.redact_secret_values`）：引擎 env 里的凭据值出现在任何工具输出中都被替换为 `[redacted:<KEY>]`，所以 engine.jsonl / trace.jsonl 里不会有明文 key。
 
 ### 3.2 `attempt_stats` 事件
 
@@ -101,11 +102,15 @@ AgentLoop 在 **attempt 结束时**（成功/失败/取消/异常四条路径都
     {"preset": "investment_committee", "run_id": "…", "status": "completed",
      "ms": 231000, "agents": 4, "tasks": 4}
     // status ∈ completed/failed/cancelled/start_failed/error/
-    //          wait_budget_exhausted（等待预算耗尽、run 仍在后台跑）/timeout
+    //          wait_budget_exhausted（等待预算耗尽、run 仍在后台跑）/timeout/
+    //          cancelled_wait（attempt 被取消、等待放弃，run 仍在后台且可用 run_id 续等）
   ],
   "early_finalize": false,  // 见 §4
   "model": "claude-opus-5",
-  "reason": "…"             // 仅失败/取消时，截断 500 字符
+  "reason": "…",            // 仅失败/取消时，截断 500 字符
+  "verify_warnings": [...], // 可选：收口轻校验的警告（非空才出现）
+  "compact_failures": 1,    // 可选：L3 摘要 LLM 调用失败次数（非零才出现）
+  "offload_failures": 0     // 可选：工具结果落盘失败次数（非零才出现）
 }
 ```
 
@@ -119,14 +124,15 @@ AgentLoop 在 **attempt 结束时**（成功/失败/取消/异常四条路径都
 - `attempt_stats`：同 §3.2 全量字段，方便离线只读 trace 即可拿到汇总；
 - `tool_circuit_open`：`{iter, tool, consecutive_failures}` —— 同一 (工具, 参数) 连续失败达 `VIBE_TOOL_CIRCUIT_FAILURE_LIMIT`（默认 3）后该调用被拒。重复调用守卫只登记**成功**调用，所以这是「同一个坏调用烧掉多少迭代」的唯一信号；
 - `empty_model_response_retry`：`{iter, attempt, max_retries, provider, model}` —— 流成功返回但既无 content 也无 tool_calls 时的就地重试（附一条 nudge，消耗一个正常迭代）。仍为空才写终态 `empty_model_response`；
-- `compact_failed`：`{iter, error}` —— L3 摘要的 LLM 调用失败，本轮降级为只做 L1/L2 剪裁。**出现它不代表 attempt 失败**（V2 之前会）；`attempt_stats.compact_failures` 是它的计数；
-- `memory_auto_consolidated`：`{duplicates_merged, entries, index_lines, index_full}` —— 索引 ≥180 行时 run 收尾自动跑的长期记忆整理。
+- `compact_failed`：`{iter, error}` —— L3 摘要的 LLM 调用失败，本轮降级为只做 L1/L2 剪裁。**出现它不代表 attempt 失败**；`attempt_stats.compact_failures` 是它的计数；
+- `memory_auto_consolidated`：`{duplicates_merged, entries, index_lines, index_full}` —— 索引 ≥180 行时 run 收尾自动跑的长期记忆整理；
+- `tool_progress{stage:"cancelled"}` —— attempt 被取消时看门狗放弃等待在途工具的标记；对应的 `tool_result` 是 `{"status":"error","error_code":"cancelled"}` 结构化结果（`run_swarm` 的等待被取消时另带 `run_id` / `run_status`）。
 
 既有事件的字段增量：
 
-- `compact` 加 `input_messages_dropped` —— L3 摘要输入按 token 预算从**旧端**裁掉的消息条数（V2 之前是 `json.dumps(head)[:80000]` 从尾部砍，丢的恰是 head 里最新最密的轮次）；
-- swarm 的 `tool_result` 事件 `status` 改为按 `_is_error_result` 判定。V2 之前 worker 侧硬编码 `"ok"`，swarm 面板的 worker 工具错误率恒为 0，与主循环的 ok/error 双态口径不一致；
-- `attempt_stats` 可能出现 `offload_failures`（工具结果落盘失败次数，盘满/只读时降级为带标记的纯截断）。
+- `compact` 带 `input_messages_dropped` —— L3 摘要输入按 token 预算从**旧端**裁掉的消息条数；
+- swarm 的 `tool_result` 事件 `status` 按 `_is_error_result` 判定，与主循环的 ok/error 双态口径一致；
+- `attempt_stats` 的 `compact_failures` / `offload_failures` 只在非零时出现（落盘失败 = 盘满/只读时工具结果降级为带标记的纯截断）。
 
 ### 3.4 fetch_stats 收集器（`src/core/fetch_stats.py`）
 
@@ -135,6 +141,10 @@ attempt 级数据源记账。`loop.run()` 开头 `start_collect()` 绑一个**�
 ### 3.5 budget（`src/core/budget.py`）
 
 attempt 绝对 deadline（`time.monotonic()` 基准）的 contextvar + 三个工具函数：`bind_deadline` / `remaining_s` / `cap_timeout(requested, reserve_s, floor_s)`。同样经 copy_context 穿透线程，任何长耗时组件（工具超时、swarm 等待、market_data 降级链）都据此把自己的内部超时钳制到「真正剩余的时间」内。
+
+### 3.6 cancel（`src/core/cancel.py`）
+
+budget 的姊妹模块：`AgentLoop.run()` 开头把自己的 `threading.Event` 经 `bind_cancel_event` 绑进 contextvar，工具线程随 copy_context 继承。`sleep_unless_cancelled(seconds)` 是轮询循环里 `time.sleep` 的替代（事件一触发立即返回 True）；工具看门狗 `invoke_tool_guarded` 按 `CANCEL_POLL_S=1s` 切片等待 worker 队列，取消命中即返回 `error_code=cancelled` 的结构化结果而不是等工具自己回来。取消与 deadline 恰好同时到期时**取消优先**（最后一个切片里落地的 cancel 报 `cancelled`，不报成工具超时）。`run_swarm` 的等待循环用同一事件，取消时返回 `cancelled_wait`（run 保留在盘上，可用 `run_id` 续等）。会话层：`SessionService` 对同一会话的新 attempt 先 `cancel()` 仍在注册表里的旧 loop 再覆盖；`delete_session` 也先 cancel。
 
 ## 4. 预算体系与提前收敛
 
@@ -151,8 +161,10 @@ laicai timeoutS（默认 900s）
 
 循环内两级升级（`loop.py`）：
 
-1. **收尾提示**（剩余 < 25% 总预算，一次性）：注入 `[SYSTEM] Less than 25% of the time budget remains…` 引导模型收敛，不再开新调查线。独立于既有的「迭代数 80% 收尾提示」（后者在迭代慢时开火太晚——2026-08-24 事故里第 40 迭代才触发，而外层 15 分钟已到期）。
-2. **强制收敛 early_finalize**（剩余 < max(`VIBE_FINALIZE_RESERVE_S`=60s, 1.2×平均迭代耗时)）：本轮按「最后一轮」处理——丢弃工具定义强制出文本，并注入提示要求**基于已有材料立即作答、明确标注未完成/未验证部分**。宁可给部分答案，不让调用方超时拿到空文案。
+1. **收尾提示**（剩余 < 25% 总预算，**每轮**）：从跌破 25% 起，每次迭代都把 `[SYSTEM] Less than 25% of the time budget remains (~Ns)…` 并入该轮的 `<agent_status>` 状态栏（状态栏用后即弃，所以轨迹里始终只有一条），引导模型收敛、不再开新调查线。独立于「迭代数 80% 收尾提示」——后者按迭代计数，迭代慢时开火太晚。
+2. **强制收敛 early_finalize**（剩余 < max(`VIBE_FINALIZE_RESERVE_S`=60s, 1.2×平均迭代耗时)）：本轮按「最后一轮」处理——丢弃工具定义强制出文本，并注入提示要求**基于已有材料立即作答、明确标注未完成/未验证部分**。trace/事件只在首次触发时写一次，提示行随状态栏持续到 run 结束。宁可给部分答案，不让调用方超时拿到空文案。
+
+router 侧的 `max(60, …)` 下限意味着引擎拿到的 `deadline_s` 永远不少于 60s，哪怕调用方预算已在排队/冷启中耗尽——此时引擎立刻进入 early_finalize 分支，用这 60s 出一段部分答案。
 
 配套钳制：
 
@@ -164,8 +176,9 @@ laicai timeoutS（默认 900s）
 | swarm 等待 | `swarm_tool`：`cap_timeout(SWARM_TIMEOUT, reserve=90s, floor=60s)`。**嵌套不变式：swarm 自留 90s > loop 自留 60s，所以工具必然先于看门狗自收口**——这是 `wait_budget_exhausted` 打捞路径（带回 `run_id` 与部分报告的唯一出口）能被执行的前提，回归测试见 `agent/tests/test_swarm_timeout_nesting.py` |
 | bash 命令超时 | `VIBE_BASH_TIMEOUT_S`（默认 120s），同样被 attempt 剩余预算钳制（reserve 15s / floor 10s）；超时回 `bash_timeout` 并指向 `background_run` |
 | market_data 总预算 | `min(VIBE_TRADING_FETCH_BUDGET_S=120, 剩余预算)`，见 §5 |
-| 迭代上限 | `VIBE_MAX_ITERATIONS`（引擎默认 50 与上游一致；**router 给 laicai 租户同样下发 50**——曾下发 25，2026-08-26 因饿死 swarm 意图长任务调回） |
-| router 兜底取消 | `/ask` 未拿到答案（504/客户端断开/异常）一律 `POST /sessions/<sid>/cancel`，止住「超时后继续烧 + 拖死同租户重试」 |
+| 迭代上限 | `VIBE_MAX_ITERATIONS`（引擎默认 50 与上游一致；**router 给 laicai 租户同样下发 50**——swarm 意图的长任务仅数据收集阶段就要 ~20 迭代，墙钟 deadline 才是硬止损） |
+| router 兜底取消 | `/ask` 未拿到答案（504/客户端断开/异常/attempt 以 failed 结束）一律 `POST /sessions/<sid>/cancel`，止住「超时后继续烧 + 拖死同租户重试」。引擎侧取消事件穿透在途工具等待与 swarm 轮询（§3.6），≤1s 内生效，不必等 30 分钟的工具自己回来 |
+| 单次输入上限 | 引擎 `SendMessageRequest.content` 20000 字符（含 laicai 注入的持仓上下文）；超限的 422 由 router 转为 400「问题过长」 |
 
 ## 5. 数据可靠性
 
@@ -187,11 +200,22 @@ laicai timeoutS（默认 900s）
 | tushare 节流 | 进程内间隔锁（`TUSHARE_MAX_PER_MIN`，默认 300/分）——全租户共享一个 token，防并发互相打限频 |
 | tushare 重试 | daily 拉取 `retry_with_budget`（2 重试 / 30s 预算 / 退避 1s,3s） |
 | 无超时 SDK 兜底 | api_server 启动设 `socket.setdefaulttimeout(VIBE_SOCKET_TIMEOUT_S=30)`——tushare/akshare/baostock 等阻塞 HTTP 不再无限挂（asyncio 非阻塞 socket 不受影响） |
-| loader 缓存 | 上游既有 `VIBE_TRADING_DATA_CACHE`（parquet，只缓存已结算区间）；**router 对租户默认开启**，缓存落租户 bind-mount 盘跨会话持久。注意键是精确区间内容寻址——「预取暖缓存」因此收益趋零，暂缓（见 HISTORY） |
+| loader 缓存 | 上游既有 `VIBE_TRADING_DATA_CACHE`（parquet，只缓存已结算区间）；**router 对租户默认开启**，缓存落租户 bind-mount 盘跨会话持久。键是精确区间内容寻址，所以没有「预取暖缓存」——命中率趋零 |
+
+### 5.3 `get_market_data` 载荷形状与截断
+
+工具级契约（`src/market_data.py` + `src/tools/market_data_tool.py` + `src/agent/tool_result_store.py`）：
+
+- **每标的紧凑表**：`{"summary": {start, end, rows, first_close, last_close, high, low, change_pct[, total_rows]}, "columns": [...], "rows": [[...], ...]}`——列名只出现一次，日线日期是裸 `YYYY-MM-DD`，数值 4 位小数（`PRICE_DECIMALS`）、整数值的浮点去 `.0`，NaN/inf → null；序列化不带缩进（`dumps_compact`）。被 `max_rows` 裁过的标的另带 `total_rows`/`returned`/`truncated`/`policy`/`hint`。`_unresolved` / `_gaps` 元数据键不变。`summary` 排在最前，是结构化截断时必定保留的部分。
+- **默认 `max_rows=120`**（半个交易年的日线），一个标的的默认调用落在 10k 字符的轨迹预算之内（`TOOL_RESULT_LIMIT`），不再每次落盘。更长区间按等步长降采样（末根 bar 钉住），`truncated=true`；`max_rows=0` 取全量（必然落盘）。
+- **参数 schema**：`source` 是 enum，`auto` + `backtest.loaders.registry.VALID_SOURCES` 里注册的全部 loader 名（动态取，registry 导入失败才回退到静态清单）；`interval` 是 enum `1m/5m/15m/30m/1H/4H/1D/1W/1M`（`1D` 全源支持，分钟/小时线 okx/ccxt/tushare/mootdx/futu/yfinance，周/月线 mootdx/futu/akshare）。
+- **超 10k 的结构化预览**：不是盲切字符——每个标的保留 `summary` + 首尾各 20 根 bar（`MARKET_DATA_EDGE_ROWS`；多标的仍超限时收缩到首尾 5 根，再超才退回通用 head+tail 信封），`rows_omitted` 记中段丢弃数，预览本身是合法 JSON，并明说「中段 bar 不是数据源缺失」。全量落盘 `run_dir/tool-results/<iter>-get_market_data-<callid8>.json`，**每根 bar 一行**，`read_file(offset, limit)` 按行翻页即按 bar 翻页、`grep -n <日期>` 直接定位。
+- 其他工具的单行 JSON 结果落盘前按 `indent=1` 重排成多行（否则 `read_file` 的行翻页永远只有一行）；`load_skill` 的落盘是 `.md` 原文（见 SKILLS.md §2）。信封里的翻页提示只指向 `read_file` 与 bash `grep -n`（引擎没有 `grep_file` 工具）。
+- grounding 校验器（`verify.extract_reference_prices`）与结构化截断共用 `market_data.table_rows()` 读表，旧的 record 列表形状仍可解析。
 
 ## 6. 出境代理（白名单 egress）
 
-阿里云北京沙箱出境被墙：web_search 的境外引擎 `ConnectError`（修复前每次白烧 ~32s×3 次重试）、美股/雅虎数据退化。**明文 HTTP 代理直连境外不可行**——CONNECT 行明文过境会被按域名关键字重置（实测 duckduckgo 0.13s 秒断、未封锁的 yahoo 可通）。方案是把加密隧道端点放进沙箱：
+阿里云北京沙箱出境被墙：web_search 的境外引擎直连 `ConnectError`、美股/雅虎数据退化。**明文 HTTP 代理直连境外不可行**——CONNECT 行明文过境会被按域名关键字重置（实测 duckduckgo 0.13s 秒断、未封锁的 yahoo 可通）。方案是把加密隧道端点放进沙箱：
 
 ```mermaid
 flowchart LR
@@ -225,7 +249,8 @@ flowchart LR
 | `ts` | 结束时刻（epoch 秒） |
 | `tk8` | tenant_key 前 8 位（全量 key 不落日志） |
 | `channel` / `model` / `timeout_s` | 请求参数 |
-| `outcome` | `ok` / `timeout` / `busy` / `upstream_failed` / `exception` / `incomplete`（客户端断开）等 |
+| `outcome` | `ok` / `timeout` / `busy` / `upstream_failed` / `engine_failed`（attempt 以 `failed` 结束，答案帧不发、走 error 帧 502）/ `error`（含 400 问题过长）/ `exception` / `incomplete`（客户端断开） |
+| `intent` / `budget_source` | 结构化意图（`standard`/`deep_team`）与预算来源（`explicit` = 调用方给了 `timeoutS`，`intent` = 由意图推导） |
 | `queue_wait_ms` | 全局并发信号量等待 |
 | `cold_start` / `resumed` / `booted` | 沙箱路径标记 |
 | `sandbox_ready_ms` / `session_ms` / `first_progress_ms` / `total_ms` | 分段计时 |
@@ -243,11 +268,11 @@ flowchart LR
           "asks_error": 2, "uptime_s": 15591, "p50_ms": 21276, "p95_ms": 580769, "window": 3}
 ```
 
-p50/p95 只统计成功请求（近 100 次环形窗口）；重启清零——持久口径以 laicai `deep_engine_runs` 为准。
+p50/p95 只统计成功请求（近 100 次环形窗口）；重启清零——持久口径以 laicai `deep_engine_runs` 为准。`disk` 段（`data_root_bytes` / `quota_bytes` / `watermark` / `tenants_total` / `over_watermark`（tk8 列表）/ `disk_used_pct`）与 `GET /tenants/usage` 的字段见 PRODUCT_DESIGN §3.3。
 
 ### 7.3 只读 `/obs/*` 端点（laicai 详情页在线回读）
 
-五个端点，Bearer 鉴权同源，id 严格正则（`[A-Za-z0-9_-]{4,64}`）防路径穿越，只读尾部 4MB、单字段裁 600 字符、行数上限，文件读取走 `asyncio.to_thread`：
+五个端点，Bearer 鉴权同源，id 严格正则（`[A-Za-z0-9_-]{4,64}`）防路径穿越，路径经 `_tenant_file()` → `_safe_tenant_path()` 守卫（目标或其任一父级是 symlink、或解析后不在租户目录内 → 当作文件不存在返回空），只读尾部 4MB、单字段裁 600 字符、行数上限，文件读取走 `asyncio.to_thread`：
 
 | 端点 | 参数 | 数据源 |
 |---|---|---|
@@ -279,18 +304,21 @@ laicai 侧实现在主仓库（桥接 `app/src/server/vibe-trading.ts`、落库 
 | `VIBE_ALPHA_BENCH_BUDGET_S` | 1800 | alpha_bench 自身总预算；耗尽即停止起新 alpha 并返回部分 IC 表（`budget_exhausted`）。同时是它声明的 `timeout_seconds` 来源（+120s） |
 | `VIBE_BASH_TIMEOUT_S` | 120 | bash 单命令超时（另被剩余预算钳制）；长任务应走 `background_run` |
 | `VIBE_TOOL_CIRCUIT_FAILURE_LIMIT` | 3 | 同一 (工具, 参数) 连续失败几次后熔断该调用；命中写 `tool_circuit_open` |
-| `VIBE_EMPTY_RESPONSE_RETRIES` | 1 | 流成功但返回空 turn 时的就地重试次数（0 = 回到 V2 之前的「一次即判败」） |
-| `TIMEOUT_SECONDS` | 120（**300**） | LLM 流式读超时（httpx）；2026-08-24 swarm worker 因 opus 长上下文思考停顿 >120s 连续 ReadTimeout 整队报废后调升 |
+| `VIBE_EMPTY_RESPONSE_RETRIES` | 1 | 流成功但返回空 turn 时的就地重试次数（0 = 一次即判败） |
+| `TIMEOUT_SECONDS` | 120（**300**） | LLM 流式读超时（httpx）。opus 级长上下文的思考停顿可超 120s，300 能熬过停顿而真死的上游仍在一个 worker 迭代内失败 |
 | `VIBE_TRADING_FETCH_BUDGET_S` | 120 | market_data 单次调用含降级链的总预算 |
 | `VIBE_SOCKET_TIMEOUT_S` | 30 | 阻塞 socket 默认超时兜底 |
 | `TUSHARE_MAX_PER_MIN` | 300 | tushare 进程内节流 |
 | `VIBE_TRADING_DATA_CACHE` | off（**1**） | loader parquet 缓存 |
 | `VIBE_TRADING_SEARCH_BACKENDS` | auto | ddgs 后端列表 |
+| `VIBE_TRADING_ALLOWED_FILE_ROOTS` | 无（**/tmp**） | 文件工具在租户数据根之外额外放行的目录 |
 | `VIBE_TRADING_EGRESS_PROXY` | 无（**http://127.0.0.1:8118**，配了 egress key 才注入） | web_search/yfinance 专用出境代理 |
+
+以上变量中，凡名字带 `_KEY`/`_TOKEN`/`_SECRET`/`_PASSWORD` 段或 `OPENAI_`/`ANTHROPIC_`/`LANGCHAIN_` 前缀的都**不会**进入 `bash`/`background_run` 子进程；`VIBE_*` 全部透传（`src/tools/subprocess_env.py`）。
 
 **launcher env**（`/boot` 时消费，不进引擎）：`VIBE_EGRESS_SSH_KEY_B64` / `VIBE_EGRESS_SSH_DEST` / `VIBE_EGRESS_REMOTE`(默认 127.0.0.1:8888) / `VIBE_EGRESS_LOCAL_PORT`(默认 8118)。
 
-**router env 增量**（全量见 README_CUSTOM.md）：`VIBE_ASK_LOG`(默认 /var/lib/cube-router/ask_log.jsonl)、`VIBE_EGRESS_KEY_FILE`、`VIBE_EGRESS_SSH_DEST`，以及上表加粗值的同名覆盖项。
+**router env 增量**（全量见 README_CUSTOM.md）：`VIBE_ASK_LOG`(默认 /var/lib/cube-router/ask_log.jsonl)、`VIBE_EGRESS_KEY_FILE`、`VIBE_EGRESS_SSH_DEST`、`VIBE_SWEEP_STALE_TEMPLATES`(默认 1，回滚模板前置 0)、`VIBE_CUBEMASTERCLI`，以及上表加粗值的同名覆盖项。
 
 ## 10. 排障手册：按 attempt_id 五步追查
 
@@ -315,4 +343,4 @@ less /data/shared/vibe/$TK/sessions/<vibe_session_id>/trace.jsonl
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8990/healthz | jq .
 ```
 
-常见结论速查：`web_search` 大量 errors → 看 `/health` 的 `egress_tunnel` 与 B 端 tinyproxy；`data_gaps` 带 `rate_limited` → tushare 限频（节流器/积分档位）；`early_finalize=true` 高频 → 预算太紧或迭代太慢，对照瀑布图看时间去向；`outcome=incomplete` → 客户端（laicai）在终帧前断开，配合 `engine_cancelled` 确认止损生效。
+常见结论速查：`web_search` 大量 errors → 看 `/health` 的 `egress_tunnel` 与 B 端 tinyproxy；`data_gaps` 带 `rate_limited` → tushare 限频（节流器/积分档位）；`early_finalize=true` 高频 → 预算太紧或迭代太慢，对照瀑布图看时间去向；`outcome=incomplete` → 客户端（laicai）在终帧前断开，配合 `engine_cancelled` 确认止损生效；`outcome=engine_failed` → 引擎 attempt 自身失败（`error` 里是引擎的 `attempt.error`），去 trace 找 `end` 事件前的最后一个错误；`outcome=error` 且 detail 为「问题过长」→ laicai 注入的持仓上下文 + 问题超过 20000 字符；`/obs/*` 突然返回空而宿主上文件明明在 → 检查该路径或其父目录是否变成了 symlink（守卫按不存在处理）。

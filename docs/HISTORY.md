@@ -227,7 +227,7 @@ Minor / 补充：m1 冷启动 5–15s（重 import + CJK 字体下载 + matplotl
 
 **核心护栏**：新增 `agent/tests/test_swarm_timeout_nesting.py`，把生产常量按 1:300 等比例缩放（TOOL_TIMEOUT 300→1、SWARM_TIMEOUT 7200→24、reserve 60/90→0.2/0.3、margin 120→0.4）复刻本次故障，断言拿到的是带 run_id 的 `wait_budget_exhausted` 而非 `write_tool_timeout`；deadline 一项刻意不缩放（生产两侧只差 30s/7000s ≈ 0.4%，缩放后是 0.1s 的竞态、CI 上必然 flaky），预算钳制那一半改由同文件的纯函数用例 `test_tool_timeout_nesting_invariant` 按真实生产数值断言（`remaining=150` 时两个 floor 相遇，顺带把 floor 取值也钉住）。
 
-**文档同步。** OBSERVABILITY.md §4 的钳制表补齐 per-tool base、写工具 1×/2× 窗口、三个声明工具的取值与嵌套不变式，§9 env 表删掉「单**只读**工具硬超时」这个 F2 之后就已经错了的措辞并新增三个变量；SWARM-PRESETS.md 触发策略补 preset 真源、tie-break、变量抽取、两层等待的嵌套关系与 F3 冷却。**本次未部署**（无镜像重建、无模板切换、未碰生产）。
+**文档同步。** OBSERVABILITY.md §4 的钳制表补齐 per-tool base、写工具 1×/2× 窗口、三个声明工具的取值与嵌套不变式，§9 env 表删掉「单**只读**工具硬超时」这个 F2 之后就已经错了的措辞并新增三个变量；SWARM-PRESETS.md 触发策略补 preset 真源、tie-break、变量抽取、两层等待的嵌套关系与 F3 冷却。**部署**：批次 D/E/F 随模板 v35（`tpl-34c2c3971a654f7796bc4385`）、本批次 V1 与后续 V2/V3 随模板 v37（`tpl-b7fb286c6b0247cd9b0a9b6a`）于 2026-08-29 上生产；两次都走既有 runbook（重建镜像 → 发模板 → 改 `VIBE_CUBE_TEMPLATE_ID` → restart cube-router），存量租户下次调用自动换模板，数据在宿主 bind-mount 不动。
 
 ## 2026-08-29：批次 V2——上下文层交界、跨 attempt 交接、harness 韧性、记忆卫生
 
@@ -270,7 +270,7 @@ Minor / 补充：m1 冷启动 5–15s（重 import + CJK 字体下载 + matplotl
 
 既有测试的语义更新（都是行为确实变了，不是迁就实现）：`test_loop_helpers` 的两条折叠用例从 `messages[1]` 改看 `messages[2]`（下标 1 现在是走 FIRST_USER 分档的首条 user）；两条 `empty_model_response` 用例的断言从 "iteration 1" 改 "iteration 2"（多了一次重试）；`test_swarm_status_hydration` 的心跳源码检查从「worker 必须用 HeartbeatTimer 包住 registry.execute」改为「worker 必须走 `invoke_tool_guarded` 且转发它的心跳 + 守卫自身必须包住阻塞等待」；三处 FakeStore/\_Store 测试替身补 `run_dir()`；doc_reader / web_search 的三条相等断言改为包含断言（正文现在带 `<external-content>` 包裹）。
 
-**本次未部署**（无镜像重建、无模板切换、未碰生产）。
+**部署**：随模板 v37（`tpl-b7fb286c6b0247cd9b0a9b6a`）于 2026-08-29 上生产（与 V1、V3 同一次模板切换）。
 
 ## 2026-08-29：批次 V3——数据生命周期收口 + swarm 意图结构化（router 侧）
 
@@ -284,4 +284,36 @@ Minor / 补充：m1 冷启动 5–15s（重 import + CJK 字体下载 + matplotl
 
 **真正的清扫（删 sessions/runs/uploads）刻意不做**，代码里留 `TODO(retention)` 写明落地前置条件：先积累两周真实用量再定保留窗（凭证据而不是凭猜测定阈值）、上线必须先 `--dry-run` 人工核对无活跃会话、引擎侧 FTS 索引要同步清死行否则搜索返回死链。`memory/` 永不参与清扫——那是用户资产，只有用户手删或 `/forget` 能动。删用户数据是整个计划里失误代价最高的一步，把它放在最后是刻意的。
 
-**验收**：`python -m py_compile ops/cube-router/router.py` 通过；新增 `ops/cube-router/test_router_budget.py` 10 条纯逻辑用例全过（预算推导四种组合、`timeoutS` 优先级、引擎 env 与 `BUDGET_BY_INTENT` 一致性、磁盘统计的求和/缺目录/缓存/水位/缓存回收）。**本次未部署**（未重建镜像、未切模板、未碰生产）。
+**验收**：`python -m py_compile ops/cube-router/router.py` 通过；新增 `ops/cube-router/test_router_budget.py` 10 条纯逻辑用例全过（预算推导四种组合、`timeoutS` 优先级、引擎 env 与 `BUDGET_BY_INTENT` 一致性、磁盘统计的求和/缺目录/缓存/水位/缓存回收）。**部署**：router 改动随 2026-08-29 的 cube-router 重启上生产，引擎侧同批次改动在模板 v37（`tpl-b7fb286c6b0247cd9b0a9b6a`）里；laicai 侧 `intent`/`swarmPreset` 的发送与 `engine_forget_jobs` 链路同日 `deploy:vps` 上线。
+
+## 2026-09-04：第三轮评审整改——symlink 越界、shell 凭据泄露、数据工具截断（3 P0 + 一批 P1）
+
+**背景。** 第三轮双仓评审在本仓判定三个 P0，全部是「上一轮把机制做对了、边界没守住」：
+
+1. **symlink 读宿主机。** router 以 root 跑在宿主上，`/memory`、`/memory/delete`、`/obs/*`、`_dir_bytes` 都直接拼 `DATA_ROOT/<tk>/...` 读写；而 guest 里的引擎以 uid 1000 在同一个 bind-mount 目录里可以任意建链接。`memory/x.md -> /etc/shadow` 经 `/memory` 可读，`MEMORY.md -> /root/.ssh/authorized_keys` 经 `/memory/delete` 的索引改写可写，`big -> /` 让 `rglob` 以 root 遍历整个宿主文件系统。
+2. **bash 泄 key。** `bash` / `background_run` 继承引擎进程 env，而多租户下那份 env 装着全租户共享的内置 LLM 凭据、`TUSHARE_TOKEN`/`JINA_API_KEY`/`IFIND_MCP_TOKEN` 与引擎自己的 `API_AUTH_KEY`——模型跑一句 `env` 就把它们写进工具结果、trace 和 LLM 上下文。
+3. **数据工具 5.6× 截断。** `get_market_data` 默认 250 行、`indent=2` 的 record 列表，单标的一年日线实测 **63,158 字符**，是 10k 轨迹预算的 5.6 倍以上——V2 加的落盘+预览信封让模型每次只看到头尾 1k，中间被砍掉的 bar 被读成「数据源没有」；`load_skill` 同样被 10k 一刀切，27 个内置 skill 超限（tushare 约 100k），信封还把 JSON 单行落盘，`read_file` 按行翻页永远翻不到第二行。
+
+**router 侧改动（`ops/cube-router/router.py`）。**
+- `_safe_tenant_path(base, p)` / `_tenant_root` / `_tenant_file`：路径自身是 symlink、或 `resolve()` 后不在租户目录内（含父目录是外指 symlink）一律按不存在处理。`/memory` 列表跳过 symlink 条目与 symlink 形态的 `memory/`；`/memory/delete` 对 symlink 目标 404、索引改写走 tmp+replace；五个 `/obs/*` 全部改经 `_tenant_file`；`_dir_bytes` 改 `os.walk(followlinks=False)` + `lstat` 只计普通文件，symlink 租户根计 0，`DATA_ROOT` 遍历跳过 symlink 目录。
+- `POST /sessions/delete {uid, session_id}`：laicai「删除对话」此前只删自己库里的线程，引擎侧 `sessions/<sid>/`（含完整 prompt 的 trace、transcript 转储、handoff）永久残留，唯一清理口是注销时的整租户 `/forget`。沙箱在跑走引擎 `DELETE /sessions/<sid>`（`mode=engine`，引擎侧同时 cancel 在跑 loop + 清 `sessions.db` FTS 行），否则直接删宿主目录（`mode=offline`），symlink 拒删，幂等（`deleted=false`）。
+- `/forget` 失败可见：`sbx_delete` 返回 bool，沙箱删除失败或 `rmtree`（改到 `asyncio.to_thread`，`onerror` 收集明细）不完整 → 500 `{ok:false,error}`，laicai 的 `engine-forget.ts` 按 `res.ok` 让 job 留队等 23:30 重试；沙箱未删成功时 state 行保留。
+- `/healthz` 与 `/tenants/usage` 的 `over_watermark` 从计数改为 tk8 列表（看得见「谁」超线才能有人处理），新增 `disk_used_pct`（整盘水位——租户配额在盘满之后无意义）。
+- 引擎 422 → 400：`SendMessageRequest.content` 上限从 5000 提到 20000（laicai 注入持仓上下文后中等规模的账本就把旧上限撞成裸 422），router 把长度类 422 转成「问题过长，请精简后重试（引擎单次输入上限 20000 字符，含注入的持仓上下文）」，其余 422 截 200 字符转 400。
+- 失败 attempt 不再当答案：引擎在回复 `metadata` 写 `ok`/`error`，router 的 `_classify_answer_message` 遇 `ok=false`（或旧引擎的 `status="failed"`）抛 `_EngineFailed` → outcome `engine_failed`、走 error 帧 502、并触发未答即 cancel；此前「Execution failed: …」的 assistant 文本被原样当研究结论回给用户。
+
+**引擎侧改动（`agent/`）。**
+- **shell 最小 env**（新 `src/tools/subprocess_env.py`）：白名单（`PATH`/`HOME`/locale/`TZ`/`TMPDIR`/venv 变量 + `VIBE_*`）+ 段级拒绝（`_KEY`/`_TOKEN`/`_SECRET`/`_PASSWORD` 作后缀或中间段，`VIBE_EGRESS_SSH_KEY_B64` 会被抓、`VIBE_TRADING_KEYWORDS` 不会）+ 前缀拒绝（`OPENAI_`/`ANTHROPIC_`/`LANGCHAIN_`）。**按值脱敏**（`redaction.redact_secret_values`）：引擎 env 里凭据形名字、≥12 字符的值在任何工具结果进入轨迹前替换为 `[redacted:<KEY>]`，最长值优先替换防止短 secret 把长 secret 切成仍可辨认的残片；bash/background 的 stdout/stderr 在截断与落盘之前先脱敏，主循环 `_finalize_tool_result` 兜底覆盖其余工具（读到 `.env` 的 `read_file`、回显 header 的 MCP 报错）。
+- **取消穿透**（新 `src/core/cancel.py`）：cancel 事件绑进 contextvar，`invoke_tool_guarded` 按 1s 切片等 worker 队列、取消即返回 `error_code=cancelled` 的结构化结果；`run_swarm` 的轮询用 `sleep_unless_cancelled`，取消返回 `cancelled_wait`（带 run_id，run 不动）。一个实测修正：取消恰好落在最后一个切片、与 deadline 同时到期时，旧写法会把它报成工具超时——改为 `queue.Empty` 之后先查 cancel 再判 deadline，**取消优先**（`test_cancel_tool_wait.py` 钉住）。`SessionService` 同会话新 attempt 先 cancel 旧 loop 再覆盖注册、`finally` 只弹自己的条目（旧写法静默覆盖，旧 loop 变成 cancel 够不着、token 照烧的孤儿）。
+- `_auto_compact` 之后清理 `_called_ok`：重复调用守卫按工具结果消息**对象**键控，被压进摘要的结果已不在轨迹里，却仍让模型被告知「用上面的结果」——现在只保留消息仍在尾部的条目。
+- **原子写**（新 `src/core/atomic_write.py`，从 `handoff.py` 抽出）：`persistent.py` 的条目文件、`MEMORY.md`、`_rebuild_index`、`consolidate` 合并写全部改走 tmp+`os.replace`；`swarm/store.py` 的 `_atomic_write` 临时名带 pid、失败清理。**`MEMORY.md` 损坏隔离**：非法 UTF-8 的索引此前在 `PersistentMemory()` 构造时抛 `UnicodeDecodeError`，该租户每次 attempt 都起不来直到有人 SSH 进去；现在搬到 `MEMORY.md.corrupt-<ts>`、以空快照继续，条目文件不动可重建；单条目解码失败只跳过。
+- `attempt_stats` 补发 `compact_failures` / `offload_failures`（此前计了数但没发）；`delete_session` 清 `sessions.db` 的消息行与会话行（FTS 影子表随触发器同步）。
+- **`get_market_data` 载荷重做**（`src/market_data.py` / `tools/market_data_tool.py` / `agent/tool_result_store.py`）：默认 `max_rows` 250→120；每标的从 record 列表改为紧凑表 `{summary, columns, rows}`（列名只出现一次、日期裸 `YYYY-MM-DD`、4 位小数、整数值去 `.0`、无缩进）。同一标的一年日线：旧 250 行 `indent=2` = **63,158 字符**，新默认 120 行 = **8,944 字符**，落在 10k 之内不再落盘。超 10k 走结构化预览：每标的保 `summary` + 首尾 20 根 bar（多标的收缩到 5，再超退回通用信封），`rows_omitted` 计中段，预览是合法 JSON；落盘改为每根 bar 一行，`read_file` 按行翻页即按 bar 翻页。`source` 改 enum（`auto` + 注册表 `VALID_SOURCES` 动态取），`interval` 改 enum（`1m…1M`，按各 loader 支持面注明）。grounding 校验器 `extract_reference_prices` 改经共享的 `table_rows()` 读表，旧形状仍兼容；`mcp_server.py` 的 `get_market_data` docstring 同步（source 清单、默认 120）。
+- **`load_skill` 返回 Markdown**：去掉 `{"status","content"}` JSON 包裹，首行 `# skill: <name>`；未知 skill 仍回 `{"status":"error","error":…}` 信封（两个错误分类器都按它判失败，纯文本会被算成成功）。`tool_result_store` 给它单独的 `SKILL_RESULT_LIMIT=60000`，超限按 `##` 分节裁、列出省略小节标题与起始行号、落盘 `.md`；围栏代码块内的 `##` 不分节；落盘失败改指向内置 `<name>/SKILL.md`。系统提示 Guidelines 与工具 description 同步说明这一行为。
+- 信封文案去掉不存在的 `grep_file`（改 `read_file` + bash `grep -n`）；其它工具的单行 JSON 落盘前按 `indent=1` 重排成多行。`tools/bash_tool.py` description 改为「最小环境、无凭据，认证数据走专用工具」。
+
+**验收。** 新增 `ops/cube-router/test_router_security.py`（`_safe_tenant_path` 四态、memory 端点 symlink 拒绝、三个 obs 端点 symlink 为空、`_dir_bytes` 不跟链接、答案分类 + `engine_failed` 帧、422→400、`/forget` 三种失败态 + 幂等 + symlink 拒绝、`/sessions/delete` 两种 mode + 回退 + 400 + 鉴权、usage/healthz 的 tk8 列表与 `disk_used_pct`）与引擎侧 `test_subprocess_env_redaction.py`、`test_cancel_tool_wait.py`、`test_loop_compact_called_ok.py`、`test_memory_corrupt_index.py`、`test_session_delete_cleanup.py`、`test_load_skill_tool.py`；`test_tool_result_store.py` 补结构化预览/分节裁剪/每 bar 一行落盘，`test_get_market_data_size.py` 改为紧凑表断言，`test_run_verify.py` 补新形状的参考价抽取。
+
+**文档同步。** PRODUCT_DESIGN §2.2/§2.3/§3/§6/§7 按上述现状重写（租户数据在宿主 bind-mount 而非沙箱可写层；4G 只是 healthz 分母、无 fs quota；租户 env 表补 `TIMEOUT_SECONDS=300` 与 `VIBE_TRADING_ALLOWED_FILE_ROOTS=/tmp`；模板切换重建与启动清扫 `_sweep_stale_templates` 的回滚红线；`intent`/`swarmPreset` 只到 router 预算档、引擎不消费；`/sessions/delete` 契约）；README_CUSTOM 修正「launcher 请求必须带 Bearer」（launcher 无鉴权）、去掉更新操作里的 08-21 叙事、补 `VIBE_SWEEP_STALE_TEMPLATES` 与回滚步骤、记下 cube-router 仍以 root 运行的降权 TODO；OBSERVABILITY §3.6 cancel、§4 收尾提示为每轮而非一次性、§5.3 数据工具载荷、§7 `engine_failed` outcome、§9 env 表；SYSTEM-PROMPT Guidelines 与 `context.py` 文案对齐；SKILLS §2 `load_skill` 新行为；SWARM-PRESETS 触发策略改为结构化字段作用域的现状陈述；`router.py`/`launcher.py` 模块 docstring 与实现对齐（数据位置、/health 字段、launcher 无鉴权）。本文补齐 08-29 三批次的实际部署事实（v35 承载 D/E/F、v37 承载 V1–V3）。
+
+**部署**：2026-09-05 随模板 v38（`tpl-d349a7e354a74998a0e450c5`，镜像 `vibe-engine:v38`）上生产；router.py 同次覆盖——切换前生产 router.py 仍是 1dcf5ba，即 V3 的 router 侧改动（意图预算、磁盘水位）此前从未上机，本次一并落地。顺序：先以 `VIBE_SWEEP_STALE_TEMPLATES=0` 重启验证（临时租户冒烟：冷启 10.7s / 总 27.5s，沙箱内 `env` 仅 15 个变量名、无凭据；`/memory` 对指向 router.env 的符号链接不列出、删除 404；`/forget` 删净目录），再置 1 重启，启动清扫销毁两个 v37 沙箱并删除 v37 模板。引擎机根盘构建前 100% 满，清理旧本地镜像标签与构建缓存后才能构建。备份 `router.py.bak-v37` / `router.env.bak-v37`。

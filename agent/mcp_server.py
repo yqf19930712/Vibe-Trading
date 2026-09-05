@@ -1047,9 +1047,12 @@ def get_market_data(
         codes: List of symbols (e.g. ["AAPL.US", "BTC-USDT", "000001.SZ"]).
         start_date: Start date (YYYY-MM-DD).
         end_date: End date (YYYY-MM-DD).
-        source: Data source ("auto", "yfinance", "okx", "tushare", "baostock", "tencent", "akshare", "ccxt").
+        source: Data source ("auto" routes by market; explicit values are the
+            registered loaders — yfinance, tushare, akshare, tencent, baostock,
+            mootdx, tickflow, ifind, futu, okx, ccxt; see
+            backtest.loaders.registry.VALID_SOURCES for the live list).
         interval: Bar size (1m/5m/15m/30m/1H/4H/1D, default "1D").
-        max_rows: Per-symbol row cap (default 250) so the response stays
+        max_rows: Per-symbol row cap (default 120) so the response stays
             within the MCP token budget. A symbol exceeding it returns an
             even-stride downsample (every step-th bar, last bar pinned)
             plus truncation metadata. Set max_rows=0 for all rows

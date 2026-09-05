@@ -546,13 +546,24 @@ class SwarmStore:
         return reaped
 
     def _atomic_write(self, path: Path, content: str) -> None:
-        """Atomically write a file: write to .tmp then rename.
+        """Atomically write a file: write to a unique temp file then rename.
+
+        Same tmp + ``os.replace`` contract as ``src.core.atomic_write`` (review
+        2026-09-04), kept local so the Windows ``_replace_with_retry`` path
+        stays in front of the rename. The temp name carries the pid so two
+        engine processes sharing a run dir cannot clobber each other's
+        half-written temp, and a failed write never leaves a stray ``.tmp``
+        next to the live file.
 
         Args:
             path: Target file path.
             content: File content.
         """
-        tmp_path = path.with_suffix(".tmp")
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         with self._write_lock:
-            tmp_path.write_text(content, encoding="utf-8")
-            _replace_with_retry(tmp_path, path)
+            try:
+                tmp_path.write_text(content, encoding="utf-8")
+                _replace_with_retry(tmp_path, path)
+            except BaseException:
+                tmp_path.unlink(missing_ok=True)
+                raise

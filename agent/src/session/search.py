@@ -263,6 +263,23 @@ class SessionSearchIndex:
 
         return list(seen.values())
 
+    def delete_session(self, session_id: str) -> int:
+        """Drop one session's rows (messages + session record).
+
+        The ``messages_ad`` trigger keeps the FTS5 shadow table in sync.
+
+        Args:
+            session_id: Session ID.
+
+        Returns:
+            Number of message rows removed.
+        """
+        conn = self._get_conn()
+        cur = conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        conn.commit()
+        return int(cur.rowcount or 0)
+
     def reindex_from_store(self, store_base_dir: Path) -> int:
         """Rebuild the entire index from file-based session store.
 

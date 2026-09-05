@@ -1447,13 +1447,34 @@ class SwarmTool(BaseTool):
         # ``SwarmTool.timeout_seconds``), so this is the wait that actually
         # expires first and the salvage return below is reachable again.
         from src.core.budget import cap_timeout
+        from src.core.cancel import sleep_unless_cancelled
 
         max_wait = cap_timeout(
             float(_MAX_WAIT_SECONDS), reserve_s=_WAIT_RESERVE_S, floor_s=_WAIT_FLOOR_S
         )
         t0 = time.monotonic()
         while time.monotonic() - t0 < max_wait:
-            time.sleep(_POLL_INTERVAL_SECONDS)
+            # P1 2026-09-04: a user/router cancel used to be invisible here
+            # for the whole (up to two-hour) wait; the poll now wakes on the
+            # attempt's cancel event and hands the run back like a
+            # wait_budget_exhausted (run_id + partial state, run untouched).
+            if sleep_unless_cancelled(_POLL_INTERVAL_SECONDS):
+                loaded = store.load_run(run_id)
+                record("cancelled_wait", run_id, agents=run_agents, tasks=run_tasks)
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error_code": "cancelled",
+                        "run_id": run_id,
+                        "run_status": loaded.status.value if loaded is not None else "unknown",
+                        "error": (
+                            "Attempt cancelled while waiting on the swarm run; "
+                            "the run keeps its state on disk and can be resumed "
+                            "with this run_id."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
 
             loaded = store.load_run(run_id)
             if loaded is None:

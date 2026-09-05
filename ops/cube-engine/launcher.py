@@ -4,11 +4,19 @@ Listens on :8898 (template probe target) and manages the engine process on
 :8899. The router boots/reboots the engine with per-tenant env via POST /boot,
 so a single template serves every tenant and every LLM configuration.
 
-Endpoints:
-  GET  /health -> 200 {"launcher": "ok", "engine": "running"|"stopped"}
-  POST /boot   -> {"env": {...}} kill current engine (if any), spawn
-                  `vibe-trading serve --host 0.0.0.0 --port 8899` with
-                  os.environ + env, wait until /health on 8899 answers.
+Endpoints (no authentication — the launcher is reachable only through
+cube-proxy's host routing from the host itself; the engine on :8899 is the
+one that checks `Authorization: Bearer API_AUTH_KEY`):
+  GET  /health -> 200 {"launcher": "ok",
+                       "engine": "running"|"starting"|"stopped",
+                       "egress_tunnel": "up"|"down"|"off"}
+                  (also respawns a dead egress tunnel, >=10s apart)
+  POST /boot   -> {"env": {...}} kill current engine (if any), pop the
+                  VIBE_EGRESS_* keys out of env and (re)start the ssh egress
+                  tunnel with them (key material never reaches the engine),
+                  spawn `vibe-trading serve --host 0.0.0.0 --port 8899` with
+                  os.environ + remaining env, wait until /health on 8899
+                  answers (budget VIBE_LAUNCHER_BOOT_TIMEOUT, default 120s).
   POST /stop   -> kill the engine process.
 """
 

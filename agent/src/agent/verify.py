@@ -162,8 +162,11 @@ def extract_reference_prices(
 
     Understands the two grounding tool payload shapes:
       * ``get_realtime_quotes``: ``{"quotes": [{"symbol", "last_price", ...}]}``
-      * ``get_market_data``: ``{"<symbol>": [ {..., "close": x}, ... ], ...}``
-        (underscore-prefixed keys like ``_gaps`` / ``_unresolved`` are metadata).
+      * ``get_market_data``: per symbol the compact table
+        ``{"summary": {...}, "columns": [..., "close", ...], "rows": [[...], ...]}``
+        (``src.market_data.to_table``); the legacy record list
+        ``[{..., "close": x}, ...]`` is still understood. Underscore-prefixed
+        keys like ``_gaps`` / ``_unresolved`` are metadata.
 
     Later results win (they are newer within the run).
 
@@ -194,15 +197,26 @@ def extract_reference_prices(
             for symbol, rows in payload.items():
                 if not isinstance(symbol, str) or symbol.startswith("_"):
                     continue
-                if not isinstance(rows, list) or not rows:
-                    continue
-                last = rows[-1]
-                if not isinstance(last, dict):
-                    continue
-                price = last.get("close")
+                price = _last_close(rows)
                 if isinstance(price, (int, float)) and price > 0:
                     refs[symbol] = float(price)
     return refs
+
+
+def _last_close(rows: Any) -> Any:
+    """Return the last row's ``close`` from either market-data payload shape."""
+    if isinstance(rows, dict):
+        columns = rows.get("columns")
+        table = rows.get("rows")
+        if isinstance(columns, list) and isinstance(table, list) and table and "close" in columns:
+            last = table[-1]
+            idx = columns.index("close")
+            if isinstance(last, list) and idx < len(last):
+                return last[idx]
+        return None
+    if isinstance(rows, list) and rows and isinstance(rows[-1], dict):
+        return rows[-1].get("close")
+    return None
 
 
 def _symbol_variants(symbol: str) -> list[str]:

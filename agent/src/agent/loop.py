@@ -54,8 +54,9 @@ from src.goal.context import (
 from src.providers.chat import ChatLLM, ProviderStreamError
 from src.session import handoff
 from src.tools.background_tools import get_background_manager
-from src.tools.redaction import redact_payload
+from src.tools.redaction import redact_payload, redact_secret_values
 from src.core import budget as _budget
+from src.core import cancel as _cancel
 from src.core import fetch_stats as _fetch_stats
 from src.core.paths import data_root, runs_root
 from src.core.token_estimate import estimate_messages_tokens, estimate_text_tokens
@@ -809,6 +810,7 @@ def invoke_tool_guarded(
     timeout: float | None,
     emit: Callable[[str, Dict[str, Any]], None],
     on_degraded: Callable[[], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[str, int]:
     """Run one tool under the watchdog: thread + timeout + heartbeat + progress.
 
@@ -834,11 +836,18 @@ def invoke_tool_guarded(
             (None disables the watchdog).
         emit: ``(event_type, payload)`` sink for progress/heartbeat events.
         on_degraded: Called when a write tool is abandoned past its hard cap.
+        cancel_event: Attempt-level cancel signal (defaults to the one bound
+            in :mod:`src.core.cancel`). While set, the wait on the worker
+            thread is abandoned within ``CANCEL_POLL_S`` and a structured
+            ``cancelled`` result is returned — a cancel no longer has to wait
+            for a 30-minute tool to come back on its own (P1 2026-09-04).
 
     Returns:
         Tuple of (result_str, elapsed_ms).
     """
     timed_out = threading.Event()
+    if cancel_event is None:
+        cancel_event = _cancel.get_cancel_event()
 
     def _noop_degraded() -> None:
         return None
@@ -919,6 +928,57 @@ def invoke_tool_guarded(
         finally:
             _set_emitter(None)
 
+    def _wait_result(
+        budget_s: float | None,
+    ) -> tuple[str | None, BaseException | None] | None:
+        """Wait for the worker in ≤1s slices; ``None`` means cancelled.
+
+        Raises:
+            queue.Empty: When ``budget_s`` elapsed without a result.
+        """
+        if cancel_event is None:
+            return result_queue.get(timeout=budget_s)
+        deadline = None if budget_s is None else _time.monotonic() + budget_s
+        while True:
+            if cancel_event.is_set():
+                return None
+            if deadline is None:
+                slice_s = _cancel.CANCEL_POLL_S
+            else:
+                left = deadline - _time.monotonic()
+                if left <= 0:
+                    raise queue.Empty()
+                slice_s = min(_cancel.CANCEL_POLL_S, left)
+            try:
+                return result_queue.get(timeout=slice_s)
+            except queue.Empty:
+                # Cancel wins over an expiring deadline: a cancel that landed
+                # during the last slice must surface as "cancelled", not as
+                # the tool timeout it happened to coincide with.
+                if cancel_event.is_set():
+                    return None
+                if deadline is not None and _time.monotonic() >= deadline:
+                    raise
+                continue
+
+    def _cancelled_result() -> tuple[str, int]:
+        timed_out.set()  # suppress late progress/heartbeat from the worker
+        elapsed_ms = _emit_timeout_progress(
+            "cancelled", "Attempt cancelled; tool wait abandoned"
+        )
+        return (
+            json.dumps(
+                {
+                    "status": "error",
+                    "error_code": "cancelled",
+                    "tool": tool_name,
+                    "message": "Attempt cancelled by the caller; the tool's wait was abandoned.",
+                },
+                ensure_ascii=False,
+            ),
+            elapsed_ms,
+        )
+
     worker_ctx = contextvars.copy_context()
     worker = threading.Thread(
         target=lambda: worker_ctx.run(_worker),
@@ -928,7 +988,10 @@ def invoke_tool_guarded(
     worker.start()
     with _heartbeat_timer():
         try:
-            result, exc = result_queue.get(timeout=timeout)
+            got = _wait_result(timeout)
+            if got is None:
+                return _cancelled_result()
+            result, exc = got
         except queue.Empty:
             if readonly:
                 timed_out.set()
@@ -972,7 +1035,10 @@ def invoke_tool_guarded(
                 else None
             )
             try:
-                result, exc = result_queue.get(timeout=grace)
+                got = _wait_result(grace)
+                if got is None:
+                    return _cancelled_result()
+                result, exc = got
             except queue.Empty:
                 timed_out.set()
                 on_degraded()
@@ -1102,6 +1168,9 @@ class AgentLoop:
         """
         # Reset per-run state (safe for reuse across multiple run() calls)
         self._cancel_event.clear()
+        # Expose the cancel signal to every tool thread (copy_context) so
+        # long polls (swarm wait, tool watchdog) can stop between ticks.
+        _cancel.bind_cancel_event(self._cancel_event)
         self._called_ok = {}
         self._session_id = session_id or ""
         # V2: resume Layer 5 from the session's stored handoff summary instead
@@ -1756,6 +1825,12 @@ class AgentLoop:
         # F1: structural verification warnings (only present when non-empty).
         if self._stats.get("verify_warnings"):
             stats["verify_warnings"] = self._stats["verify_warnings"]
+        # Degradation counters (only present when non-zero): L3 summary call
+        # failures and oversized-result offload failures. Both were counted
+        # into _stats but never emitted (P1 2026-09-04).
+        for counter in ("compact_failures", "offload_failures"):
+            if self._stats.get(counter):
+                stats[counter] = int(self._stats[counter])
         collector = _fetch_stats.current()
         if collector is not None:
             fetches, gaps = collector.snapshot()
@@ -2071,6 +2146,7 @@ class AgentLoop:
             timeout=timeout,
             emit=self._emit,
             on_degraded=_mark_degraded,
+            cancel_event=self._cancel_event,
         )
 
     def _tool_timeout(self, tool_name: str) -> float | None:
@@ -2126,6 +2202,12 @@ class AgentLoop:
             iteration: Current iteration.
         """
         self._update_memory(tc.name)
+
+        # P0 2026-09-04: scrub env-derived credential VALUES before the result
+        # reaches the trajectory, the trace or the grounding verifier. The
+        # shell tools already scrub their own stdout; this covers every other
+        # tool (read_file on a dumped .env, an MCP error echoing a header …).
+        result = redact_secret_values(result)
 
         success = _is_tool_success(result)
 
@@ -2329,6 +2411,17 @@ class AgentLoop:
 
         # Fix orphaned tool pairs in the reconstructed message list
         _fix_tool_pairs(messages)
+
+        # P1 2026-09-04: the duplicate-call guard keys on the tool-result
+        # message OBJECT. Results compressed into the summary are gone from
+        # the trajectory, so an identical re-fetch must be allowed again —
+        # otherwise the model is told "use the result above" about data it
+        # can no longer see. Keep only entries whose message survived in the
+        # tail (identity comparison, same as the _microcompact pruning rule).
+        live = {id(m) for m in messages}
+        self._called_ok = {
+            key: msg for key, msg in self._called_ok.items() if id(msg) in live
+        }
 
     def _emit(self, event_type: str, data: Dict[str, Any]) -> None:
         """Fire an event via the callback."""

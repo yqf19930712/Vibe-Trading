@@ -77,6 +77,19 @@ class TestExtractReferencePrices:
         refs = extract_reference_prices([("get_market_data", raw)])
         assert refs == {"AAPL.US": 214.5}
 
+    def test_market_data_compact_table_uses_last_close(self) -> None:
+        """The 2026-09 compact ``{"columns", "rows"}`` table shape."""
+        raw = json.dumps({
+            "AAPL.US": {
+                "summary": {"rows": 2, "last_close": 214.5},
+                "columns": ["trade_date", "open", "close"],
+                "rows": [["2026-01-02", 208.0, 210.0], ["2026-01-05", 211.0, 214.5]],
+            },
+            "_unresolved": ["X"],
+        })
+        refs = extract_reference_prices([("get_market_data", raw)])
+        assert refs == {"AAPL.US": 214.5}
+
     def test_garbage_results_ignored(self) -> None:
         assert extract_reference_prices([("get_market_data", "not json")]) == {}
 

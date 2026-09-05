@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+import src.memory.persistent as persistent_mod
 from src.memory.persistent import (
     AUTO_CONSOLIDATE_INDEX_LINES,
     MAX_INDEX_LINES,
@@ -35,7 +36,9 @@ class TestWriteFailureIsStructured:
         def _boom(*_args, **_kwargs):
             raise OSError(28, "No space left on device")
 
-        monkeypatch.setattr(Path, "write_text", _boom)
+        # Entry/index writes go through the atomic writer (tmp + os.replace,
+        # review 2026-09-04), so that seam is the one to break.
+        monkeypatch.setattr(persistent_mod, "atomic_write_text", _boom)
 
         with pytest.raises(MemoryWriteError) as exc:
             memory.add("prefs", "risk averse", "user")
@@ -50,7 +53,7 @@ class TestWriteFailureIsStructured:
         def _boom(*_args, **_kwargs):
             raise OSError(28, "No space left on device")
 
-        monkeypatch.setattr(Path, "write_text", _boom)
+        monkeypatch.setattr(persistent_mod, "atomic_write_text", _boom)
 
         payload = json.loads(
             tool.execute(action="save", title="prefs", content="risk averse")
@@ -64,14 +67,14 @@ class TestWriteFailureIsStructured:
         self, memory: PersistentMemory, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The entry file is the asset; the index is derived from it."""
-        real_write = Path.write_text
+        real_write = persistent_mod.atomic_write_text
 
-        def _fail_index_only(self: Path, *args, **kwargs):
-            if self.name == "MEMORY.md":
+        def _fail_index_only(path: Path, *args, **kwargs):
+            if path.name == "MEMORY.md":
                 raise OSError(28, "No space left on device")
-            return real_write(self, *args, **kwargs)
+            return real_write(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "write_text", _fail_index_only)
+        monkeypatch.setattr(persistent_mod, "atomic_write_text", _fail_index_only)
 
         path = memory.add("prefs", "risk averse", "user")
 

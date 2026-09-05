@@ -608,7 +608,9 @@ def test_worker_source_wires_heartbeat_around_tool_execute():
     guard_source = inspect.getsource(loop_mod.invoke_tool_guarded)
     assert "HeartbeatTimer(" in guard_source
     timer_idx = guard_source.find("with _heartbeat_timer():")
-    exec_idx = guard_source.find("result_queue.get(", timer_idx)
+    # The wait is the cancel-aware ``_wait_result`` (≤1s slices over
+    # ``result_queue.get``, review 2026-09-04) — still inside the timer.
+    exec_idx = guard_source.find("_wait_result(", timer_idx)
     assert 0 < timer_idx < exec_idx
 
 

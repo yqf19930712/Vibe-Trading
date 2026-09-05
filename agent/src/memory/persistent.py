@@ -13,11 +13,13 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from src.agent.frontmatter import parse_frontmatter as _parse_frontmatter
+from src.core.atomic_write import atomic_write_text
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
@@ -217,14 +219,43 @@ class PersistentMemory:
         self._load_snapshot()
 
     def _load_snapshot(self) -> None:
-        """Load index as frozen snapshot. Called once at init."""
-        if self._index_path.exists():
+        """Load index as frozen snapshot. Called once at init.
+
+        A corrupt index (half-written multibyte sequence, non-UTF-8 bytes) used
+        to raise ``UnicodeDecodeError`` straight out of ``PersistentMemory()``
+        and fail every attempt of the tenant until someone SSH'd in (P1
+        2026-09-04). The file is now set aside as ``MEMORY.md.corrupt-<ts>``
+        and the run continues from an empty snapshot; the entry files are
+        untouched, so ``consolidate()`` / ``_rebuild_index`` can regenerate
+        the index from them.
+        """
+        if not self._index_path.exists():
+            return
+        try:
+            text = self._index_path.read_text(encoding="utf-8")
+        except OSError:
+            self._snapshot = ""
+            return
+        except (UnicodeDecodeError, ValueError) as exc:
+            self._snapshot = ""
+            quarantine = self._index_path.with_name(
+                f"{self._index_path.name}.corrupt-{int(time.time())}"
+            )
             try:
-                text = self._index_path.read_text(encoding="utf-8")
-                lines = text.split("\n")[:MAX_INDEX_LINES]
-                self._snapshot = "\n".join(lines)
-            except OSError:
-                self._snapshot = ""
+                self._index_path.replace(quarantine)
+                logger.warning(
+                    "memory index %s is not valid UTF-8 (%s); moved to %s and "
+                    "continuing with an empty snapshot",
+                    self._index_path, exc, quarantine.name,
+                )
+            except OSError as move_exc:
+                logger.warning(
+                    "memory index %s is corrupt (%s) and could not be quarantined: %s",
+                    self._index_path, exc, move_exc,
+                )
+            return
+        lines = text.split("\n")[:MAX_INDEX_LINES]
+        self._snapshot = "\n".join(lines)
 
     @property
     def snapshot(self) -> str:
@@ -243,7 +274,8 @@ class PersistentMemory:
                 continue
             try:
                 text = path.read_text(encoding="utf-8")
-            except OSError:
+            except (OSError, UnicodeDecodeError):
+                # One corrupt entry must not take the whole recall down.
                 continue
             meta, body = _parse_frontmatter(text)
             entries.append(MemoryEntry(
@@ -417,7 +449,7 @@ class PersistentMemory:
         # here and killed the whole attempt. Writing memory is a nice-to-have;
         # the caller turns this into a structured tool error instead.
         try:
-            path.write_text(frontmatter, encoding="utf-8")
+            atomic_write_text(path, frontmatter)
         except OSError as exc:
             logger.warning("memory write failed for %s: %s", path.name, exc)
             raise MemoryWriteError(
@@ -443,7 +475,7 @@ class PersistentMemory:
         """
         try:
             text = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             return ""
         _, body = _parse_frontmatter(text)
         return (body or "").strip()
@@ -492,7 +524,8 @@ class PersistentMemory:
         else:
             text = new_line
 
-        self._index_path.write_text(text, encoding="utf-8")
+        # tmp + os.replace: a crash mid-write must not leave a truncated index.
+        atomic_write_text(self._index_path, text)
         return included
 
     @property
@@ -567,10 +600,10 @@ class PersistentMemory:
                 header_end = text.find("\n---\n", 4)
                 if header_end != -1 and text.startswith("---"):
                     header = text[: header_end + len("\n---\n")]
-                    keeper.path.write_text(header + "\n" + merged_body, encoding="utf-8")
+                    atomic_write_text(keeper.path, header + "\n" + merged_body)
                 else:
                     # No frontmatter to preserve — write the merged body as-is.
-                    keeper.path.write_text(merged_body, encoding="utf-8")
+                    atomic_write_text(keeper.path, merged_body)
             except OSError as exc:
                 # Merge failed → keep the duplicates (deleting them now would
                 # lose their bodies).
@@ -602,4 +635,4 @@ class PersistentMemory:
         """Rebuild MEMORY.md from all existing entry files."""
         entries = self._scan_entries()
         lines = [f"- [{e.title}]({e.path.name}) — {e.description}" for e in entries]
-        self._index_path.write_text("\n".join(lines[:MAX_INDEX_LINES]), encoding="utf-8")
+        atomic_write_text(self._index_path, "\n".join(lines[:MAX_INDEX_LINES]))

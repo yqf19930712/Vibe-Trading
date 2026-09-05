@@ -39,7 +39,11 @@ def test_market_data_json_is_strict_when_loader_returns_nan():
 
     assert "NaN" not in text
     payload = json.loads(text)
-    assert payload["X.US"][0]["high"] is None
+    table = payload["X.US"]
+    assert table["columns"] == ["trade_date", "open", "high", "low", "close", "volume"]
+    assert table["rows"][0][table["columns"].index("high")] is None
+    # Daily bars carry a bare date, not a midnight timestamp.
+    assert table["rows"][0][0] == "2026-01-01"
 
 
 def test_swarm_registry_can_expose_local_get_market_data_tool():

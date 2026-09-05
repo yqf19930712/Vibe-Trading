@@ -68,7 +68,7 @@ Prefer `get_market_data` for OHLCV whenever the tool is available:
   "end_date": "2026-01-01",
   "source": "yfinance",
   "interval": "1D",
-  "max_rows": 250
+  "max_rows": 120
 }
 ```
 
