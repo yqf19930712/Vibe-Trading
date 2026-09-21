@@ -359,6 +359,10 @@ class Instance:
         self.last_activity = time.monotonic()
         self.lock = asyncio.Lock()
         self.paused = False
+        # Sandbox being created / resumed / booted for an ask: already counts
+        # as RUNNING for the capacity cap, never a pause victim, not yet
+        # usable by /sessions/delete.
+        self.booting = False
 
     @property
     def base_url(self) -> str:
@@ -373,6 +377,21 @@ pool: dict[str, Instance] = {}
 pool_mutex = asyncio.Lock()
 uid_locks: dict[str, asyncio.Lock] = {}
 active_sem = asyncio.Semaphore(MAX_CONCURRENT_ACTIVE)
+# Serialises "evict until there is room, then take the slot" so concurrent
+# cold starts / resumes see each other's reservations and the RUNNING count
+# never exceeds MAX_RUNNING.
+capacity_lock = asyncio.Lock()
+
+# Strong references for fire-and-forget tasks (engine cancel, reaper, sweep):
+# the event loop only keeps weak ones.
+_bg_tasks: set["asyncio.Task[Any]"] = set()
+
+
+def _spawn(coro: Any) -> "asyncio.Task[Any]":
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
 
 
 async def _launcher_health(inst: Instance) -> Optional[dict]:
@@ -470,35 +489,76 @@ async def get_or_create(
                     state.pop(tk, None)
                     _save_state()
                 else:
+                    # Re-attached from state.json after a router restart: the
+                    # sandbox may be running or paused, either way it is not
+                    # counted yet.
                     inst = Instance(tk, st["sandbox_id"], st.get("llm_fp"), st.get("api_key"))
-        if inst is None:
-            await _evict_for_capacity()
-            sandbox_id = await sbx_create(tk)
-            inst = Instance(tk, sandbox_id, None)
-            if meta is not None:
-                meta["cold_start"] = True
-            log.info("tenant %s -> new sandbox %s", tk[:8], sandbox_id[:12])
-        env, api_key = engine_env(model, llm)
-        await _ensure_ready(inst, fp, env, api_key, meta=meta)
+                    inst.paused = True
+        fresh = inst is None
+        if fresh:
+            inst = Instance(tk, "", None)
+        # Anything not currently counted as RUNNING (new, re-attached, paused)
+        # takes its slot BEFORE the sandbox is created/resumed, so the cap
+        # holds while READY_TIMEOUT_S of boot is still in flight.
+        if fresh or inst.paused:
+            await _reserve_running_slot(inst)
+        try:
+            if fresh:
+                inst.sandbox_id = await sbx_create(tk)
+                if meta is not None:
+                    meta["cold_start"] = True
+                log.info("tenant %s -> new sandbox %s", tk[:8], inst.sandbox_id[:12])
+            env, api_key = engine_env(model, llm)
+            await _ensure_ready(inst, fp, env, api_key, meta=meta)
+        except BaseException as exc:
+            if fresh:
+                # Never became a usable tenant instance: give the slot back
+                # and drop the half-made sandbox instead of leaking it.
+                if pool.get(tk) is inst:
+                    pool.pop(tk, None)
+                if inst.sandbox_id and isinstance(exc, Exception):
+                    await sbx_delete(inst.sandbox_id)
+            raise
+        finally:
+            inst.booting = False
         if meta is not None:
             meta["sandbox_ready_ms"] = int((time.monotonic() - t0) * 1000)
-        async with pool_mutex:
-            pool[tk] = inst
         return inst
 
 
+async def _reserve_running_slot(inst: Instance) -> None:
+    """Make room under MAX_RUNNING and count ``inst`` as RUNNING (booting)."""
+    async with capacity_lock:
+        await _evict_for_capacity()
+        inst.paused = False
+        inst.booting = True
+        inst.last_activity = time.monotonic()
+        async with pool_mutex:
+            pool[inst.tk] = inst
+
+
 async def _evict_for_capacity() -> None:
-    """Cap concurrently RUNNING sandboxes: pause the LRU idle one when full."""
-    running = [i for i in pool.values() if not i.paused]
-    if len(running) < MAX_RUNNING:
-        return
-    idle = sorted((i for i in running if i.refcount == 0), key=lambda i: i.last_activity)
-    if not idle:
-        raise HTTPException(503, "all instances busy; retry shortly")
-    victim = idle[0]
-    log.info("pausing LRU tenant %s (%s)", victim.tk[:8], victim.sandbox_id[:12])
-    await sbx_pause(victim.sandbox_id)
-    victim.paused = True
+    """Pause LRU idle sandboxes until RUNNING (booting included) < MAX_RUNNING.
+
+    Raises 503 when the cap is reached and nothing idle is left to pause; a
+    booting instance is never a victim (it is not idle, it is on its way up).
+    """
+    while True:
+        running = [i for i in pool.values() if not i.paused]
+        if len(running) < MAX_RUNNING:
+            return
+        idle = sorted(
+            (i for i in running if i.refcount == 0 and not i.booting),
+            key=lambda i: i.last_activity,
+        )
+        if not idle:
+            raise HTTPException(503, "all instances busy; retry shortly")
+        victim = idle[0]
+        log.info("pausing LRU tenant %s (%s)", victim.tk[:8], victim.sandbox_id[:12])
+        # Counted out before the pause call yields, so a concurrent count
+        # cannot hand the same slot to two callers.
+        victim.paused = True
+        await sbx_pause(victim.sandbox_id)
 
 
 # ── Vibe session helpers (unchanged semantics from v1) ───────────────────────
@@ -511,19 +571,42 @@ async def _vibe(inst: Instance, method: str, path: str, **kw):
     return await http.request(method, f"{inst.base_url}{path}", headers=headers, **kw)
 
 
-async def _cancel_attempt_bg(inst: Instance, sid: str, tk: str) -> None:
+async def _cancel_attempt_bg(
+    inst: Instance, sid: str, tk: str, stats: dict, finalize: Any = None
+) -> None:
     """Fire-and-forget engine cancel, detached from the (possibly dying) ask
     generator. Called from the unanswered path of _ask_stream: on client
     disconnect uvicorn *cancels* the generator task, so any `await` in its
     finally raises CancelledError before the HTTP request goes out — the
     engine kept grinding, got frozen by pause, and resumed as a zombie that
     422'd new asks (2026-08-28 incident). A separate task survives that
-    cancellation and reliably delivers the cancel."""
+    cancellation and reliably delivers the cancel.
+
+    Owns the ask-log line for this ask: ``engine_cancelled`` means the engine
+    confirmed a loop or attempt received the signal (``status=cancelled``),
+    ``engine_cancel_status`` carries the raw answer (``no_active_loop``,
+    ``http_<code>``, ``unreachable``) so "sent" and "took effect" stay
+    distinguishable in the log.
+    """
     try:
-        await _vibe(inst, "POST", f"/sessions/{sid}/cancel", timeout=10.0)
-        log.info("cancelled unfinished attempt (tenant %s, sid %s)", tk[:8], sid)
+        r = await _vibe(inst, "POST", f"/sessions/{sid}/cancel", timeout=10.0)
+        status = f"http_{r.status_code}"
+        if r.status_code == 200:
+            try:
+                status = str((r.json() or {}).get("status") or "unknown")
+            except Exception:  # noqa: BLE001 - non-JSON body
+                status = "unknown"
+        stats["engine_cancel_status"] = status
+        stats["engine_cancelled"] = status == "cancelled"
+        log.info("cancel unfinished attempt (tenant %s, sid %s) -> %s", tk[:8], sid, status)
     except Exception as e:  # noqa: BLE001
+        stats["engine_cancel_status"] = "unreachable"
+        stats["engine_cancelled"] = False
         log.warning("background cancel failed (tenant %s, sid %s): %s", tk[:8], sid, e)
+    finally:
+        if finalize is not None:
+            finalize()
+        _record_ask(stats)
 
 
 async def _ensure_session(inst: Instance, vibe_session_id: Optional[str]) -> str:
@@ -618,12 +701,39 @@ def _classify_answer_message(msg: dict, attempt_id: Optional[str]) -> tuple[str,
     return "answer", content
 
 
+class _FailSignal:
+    """``attempt.failed`` seen on the engine event stream for this attempt.
+
+    ``_wait_answer`` sleeps on it between message polls, so an attempt that
+    dies before writing anything (disk full in the engine's preparation
+    segment, registry build error) ends the ask at once instead of after
+    the whole budget.
+    """
+
+    def __init__(self) -> None:
+        self.event = asyncio.Event()
+        self.error = ""
+
+    def fire(self, error: str) -> None:
+        self.error = error
+        self.event.set()
+
+
 async def _wait_answer(
-    inst: Instance, sid: str, attempt_id: Optional[str], timeout_s: int
+    inst: Instance, sid: str, attempt_id: Optional[str], timeout_s: int,
+    failed: Optional[_FailSignal] = None,
 ) -> str:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        await asyncio.sleep(POLL_INTERVAL_S)
+        if failed is None:
+            await asyncio.sleep(POLL_INTERVAL_S)
+        else:
+            try:
+                await asyncio.wait_for(failed.event.wait(), timeout=POLL_INTERVAL_S)
+            except asyncio.TimeoutError:
+                pass
+            if failed.event.is_set():
+                raise _EngineFailed(failed.error or "attempt failed")
         m = await _vibe(inst, "GET", f"/sessions/{sid}/messages", params={"limit": 50})
         if m.status_code != 200:
             continue
@@ -792,11 +902,21 @@ async def _ask_stream(body: AskBody, timeout_s: int):
         "outcome": "incomplete",
     }
     engine_stats: Optional[dict] = None
+    # Set when the unanswered path handed the engine cancel to a detached
+    # task; that task then also writes the ask-log line (with the engine's
+    # answer to the cancel), so the line is written exactly once.
+    cancel_task: Optional["asyncio.Task[Any]"] = None
 
     def _grab_engine_stats(ev: dict) -> None:
         nonlocal engine_stats
         if ev.get("ev") == "attempt_stats" and isinstance(ev.get("data"), dict):
             engine_stats = ev["data"]
+
+    def _finalize_stats() -> None:
+        stats.setdefault("total_ms", int((time.monotonic() - t_req) * 1000))
+        if engine_stats:
+            stats["engine_status"] = engine_stats.get("status")
+            stats["iterations"] = engine_stats.get("iterations")
 
     try:
         sem_t0 = time.monotonic()
@@ -854,8 +974,21 @@ async def _ask_stream(body: AskBody, timeout_s: int):
 
                     answered = False
                     q: "asyncio.Queue[dict]" = asyncio.Queue()
+                    failed = _FailSignal()
+
+                    def _note_attempt_failed(ev: dict) -> None:
+                        if ev.get("ev") != "attempt.failed":
+                            return
+                        data = ev.get("data")
+                        if not isinstance(data, dict):
+                            return
+                        if data.get("attempt_id") in (attempt_id, None):
+                            failed.fire(str(data.get("error") or "attempt failed")[:500])
+
                     pump = asyncio.create_task(_pump_events(inst, sid, q))
-                    waiter = asyncio.create_task(_wait_answer(inst, sid, attempt_id, timeout_s))
+                    waiter = asyncio.create_task(
+                        _wait_answer(inst, sid, attempt_id, timeout_s, failed=failed)
+                    )
                     try:
                         while not waiter.done():
                             try:
@@ -867,6 +1000,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                                 "first_progress_ms", int((time.monotonic() - t_req) * 1000)
                             )
                             _grab_engine_stats(ev)
+                            _note_attempt_failed(ev)
                             yield _frame({"t": "progress", **ev})
                         while not q.empty():
                             ev = q.get_nowait()
@@ -895,9 +1029,12 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                             # MUST be a detached task, not an await — on client
                             # disconnect this generator is being cancelled and
                             # an await here dies before sending (2026-08-28
-                            # zombie-attempt incident).
-                            stats["engine_cancelled"] = True
-                            asyncio.create_task(_cancel_attempt_bg(inst, sid, tk))
+                            # zombie-attempt incident). It stamps
+                            # engine_cancelled from the engine's answer and
+                            # writes the ask-log line.
+                            cancel_task = _spawn(
+                                _cancel_attempt_bg(inst, sid, tk, stats, _finalize_stats)
+                            )
             finally:
                 inst.refcount -= 1
     except HTTPException as e:
@@ -919,11 +1056,9 @@ async def _ask_stream(body: AskBody, timeout_s: int):
             "stats": {"router": dict(stats), "engine": engine_stats},
         })
     finally:
-        stats.setdefault("total_ms", int((time.monotonic() - t_req) * 1000))
-        if engine_stats:
-            stats["engine_status"] = engine_stats.get("status")
-            stats["iterations"] = engine_stats.get("iterations")
-        _record_ask(stats)
+        _finalize_stats()
+        if cancel_task is None:
+            _record_ask(stats)
 
 
 @app.post("/ask")
@@ -1078,7 +1213,7 @@ async def sessions_delete(
     inst = pool.get(tk)
     mode = "offline"
     engine_deleted = False
-    if inst is not None and not inst.paused:
+    if inst is not None and not inst.paused and not inst.booting:
         # Live sandbox: the engine owns sessions.db, so let it do the delete
         # (loop cancel + dir + FTS rows). Any failure falls through to the
         # host-side removal so the data still goes away.
@@ -1590,6 +1725,7 @@ async def healthz(authorization: Optional[str] = Header(None)):
     return {
         "instances": len(pool),
         "running": sum(1 for i in pool.values() if not i.paused),
+        "booting": sum(1 for i in pool.values() if i.booting),
         "active": MAX_CONCURRENT_ACTIVE - active_sem._value,  # noqa: SLF001
         "max_running": MAX_RUNNING,
         "asks": {
@@ -1616,6 +1752,7 @@ async def healthz(authorization: Optional[str] = Header(None)):
                 "tk8": i.tk[:8],
                 "sandbox": i.sandbox_id[:12],
                 "paused": i.paused,
+                "booting": i.booting,
                 "refcount": i.refcount,
                 "idle_s": round(time.monotonic() - i.last_activity),
                 "disk_bytes": (by_tk8.get(i.tk[:8]) or {}).get("disk_bytes", 0),
@@ -1627,18 +1764,25 @@ async def healthz(authorization: Optional[str] = Header(None)):
 
 
 # ── Background reaper: pause idle sandboxes ──────────────────────────────────
+async def _reap_idle_once() -> list[Instance]:
+    """Pause every idle instance past IDLE_TTL_S (a booting one is not idle)."""
+    now = time.monotonic()
+    victims = [
+        i for i in pool.values()
+        if i.refcount == 0 and not i.paused and not i.booting
+        and (now - i.last_activity) > IDLE_TTL_S
+    ]
+    for v in victims:
+        log.info("pausing idle tenant %s (idle %ds)", v.tk[:8], round(now - v.last_activity))
+        v.paused = True
+        await sbx_pause(v.sandbox_id)
+    return victims
+
+
 async def _reaper():
     while True:
         await asyncio.sleep(60)
-        now = time.monotonic()
-        victims = [
-            i for i in pool.values()
-            if i.refcount == 0 and not i.paused and (now - i.last_activity) > IDLE_TTL_S
-        ]
-        for v in victims:
-            log.info("pausing idle tenant %s (idle %ds)", v.tk[:8], round(now - v.last_activity))
-            await sbx_pause(v.sandbox_id)
-            v.paused = True
+        await _reap_idle_once()
 
 
 # ── Startup sweep: destroy stale-template sandboxes, then delete old templates ─
@@ -1748,9 +1892,9 @@ async def _startup():
     global state
     state = _load_state()
     log.info("loaded %d tenant mappings from %s", len(state), STATE_FILE)
-    asyncio.create_task(_reaper())
+    _spawn(_reaper())
     if SWEEP_STALE:
-        asyncio.create_task(_sweep_stale_templates())
+        _spawn(_sweep_stale_templates())
 
 
 @app.on_event("shutdown")

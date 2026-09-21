@@ -259,11 +259,17 @@ class TestFailedAttemptClassification:
         async def _pump_events(inst_, sid, q):
             await asyncio.sleep(3600)
 
-        async def _wait_answer(inst_, sid, attempt_id, timeout_s):
+        async def _wait_answer(inst_, sid, attempt_id, timeout_s, failed=None):
             raise router._EngineFailed("Execution failed: provider 502")
 
-        async def _cancel_attempt_bg(inst_, sid, tk):
-            return None
+        async def _cancel_attempt_bg(inst_, sid, tk, stats, finalize=None):
+            # Same contract as the real one: the engine confirmed the cancel,
+            # and this task writes the ask-log line.
+            stats["engine_cancelled"] = True
+            stats["engine_cancel_status"] = "cancelled"
+            if finalize is not None:
+                finalize()
+            router._record_ask(stats)
 
         monkeypatch.setattr(router, "get_or_create", _get_or_create)
         monkeypatch.setattr(router, "_ensure_session", _ensure_session)
