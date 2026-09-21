@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import importlib
 import logging
-import os
 import pkgutil
 from collections.abc import Mapping
 from collections import deque
@@ -55,7 +54,9 @@ _TENANT_SAFE_BLOCKED_PREFIXES = ("trading_",)
 
 def _tenant_safe_enabled() -> bool:
     """Whether the multi-tenant safety profile is active for this process."""
-    return os.getenv("VIBE_TRADING_TENANT_SAFE", "").strip().lower() in {"1", "true", "yes"}
+    from src.config.tenant import tenant_safe_enabled
+
+    return tenant_safe_enabled()
 
 
 def _discover_subclasses() -> list[type[BaseTool]]:

@@ -93,14 +93,14 @@ stateDiagram-v2
 
 1. **MicroVM 硬边界**：guest 独立内核 + 独立 rootfs（模板镜像 + 4G writable layer）。shell 工具（`bash` / `background_run`）的任意命令执行落在 guest 内，宿主机不暴露；跨租户无共享文件系统、无共享进程空间。宿主侧唯一与 guest 共享的路径是该租户自己的 bind-mount 目录，其他租户的目录不可见。
 2. **HOME 收口**：镜像内以用户 `vibe` 运行，`HOME=/home/vibe`，`~/.vibe-trading` 是宿主 `/data/shared/vibe/<tk>` 的 bind-mount → 长期记忆、搜索索引、oauth、shadow 账户、GoalStore 等一切 `Path.home()` 派生状态都在宿主的租户目录里，跨 pause/resume、跨沙箱重建持久。guest 内以 uid 1000 可在该目录任意建文件（含 symlink），因此 router 侧凡是宿主直读直写这些路径的端点都拒绝 symlink 与目录外解析（见 §3.4）。
-3. **shell 子进程最小 env**（`agent/src/tools/subprocess_env.py`）：`bash` / `background_run` 不继承引擎进程 env，只带白名单（`PATH`/`HOME`/locale/`TZ`/`TMPDIR`/python venv 变量 + 全部 `VIBE_*`），且名字含 `_KEY`/`_TOKEN`/`_SECRET`/`_PASSWORD` 段或以 `OPENAI_`/`ANTHROPIC_`/`LANGCHAIN_` 开头者一律剔除——`env`、`cat .env` 之类命令拿不到全租户共享的 LLM/数据源凭据。配套**按值脱敏**（`redaction.redact_secret_values`）：引擎进程 env 里凭据形名字、长度 ≥12 的值，在任何工具结果进入轨迹/trace/校验器之前替换为 `[redacted:<KEYNAME>]`。引擎自身的 LLM 调用是进程内 httpx，不受影响。
+3. **子进程最小 env**（`agent/src/tools/subprocess_env.py`）：引擎替模型拉起的每个子进程都不继承引擎进程 env。`bash` / `background_run` 与 MCP stdio 服务端子进程（`tools/mcp.py`）只带白名单（`PATH`/`HOME`/locale/`TZ`/`TMPDIR`/python venv 变量 + 全部 `VIBE_*`；MCP 再叠加操作员写在该 server `env` 块里的变量），`backtest` 的 Runner 子进程（`core/runner.py`，会 import 模型写的 `signal_engine.py`，AST 扫描只拦 import 期语句、拦不住方法体里的 `os.environ`）带 `backtest_subprocess_env()` = 同一白名单 + loader 在子进程内认证用的三个数据 token（`TUSHARE_TOKEN`/`TICKFLOW_API_KEY`/`IFIND_MCP_TOKEN`）+ 代理/CA 变量（`HTTP(S)_PROXY`/`NO_PROXY` 等）与 `TUSHARE_`/`TICKFLOW_`/`IFIND_`/`CCXT_`/`OKX_`/`FUTU_`/`RSSHUB_` 前缀的调参项。名字含 `_KEY`/`_TOKEN`/`_SECRET`/`_PASSWORD` 段或以 `OPENAI_`/`ANTHROPIC_`/`LANGCHAIN_` 开头者一律剔除，`API_AUTH_KEY`/`JINA_API_KEY`/`ROUTER_*` 不进任何子进程——`env`、`cat .env`、回测策略里 `open("artifacts/x").write(os.environ)` 之类都拿不到全租户共享的 LLM 凭据。配套**按值脱敏**（`redaction.redact_secret_values`）：引擎进程 env 里凭据形名字、长度 ≥12 的值，在任何工具结果进入轨迹/trace/校验器之前替换为 `[redacted:<KEYNAME>]`。引擎自身的 LLM 调用是进程内 httpx，不受影响。同一边界的配置面：租户档位（`VIBE_TRADING_TENANT_SAFE=1`）下 `src/config/loader.py` 不读 `~/.vibe-trading/agent.json` / `swarm-agent.json`（那是租户可写的 bind-mount，bash 写一个文件就能让下一次 attempt 以引擎身份拉起任意 stdio 命令），MCP 服务端只认 `VIBE_TRADING_AGENT_CONFIG` / `VIBE_TRADING_SWARM_AGENT_CONFIG` 指向的镜像内只读路径（生产模板不放这两个文件，即租户引擎无 MCP 服务端）。
 4. **引擎 env 档位**（router 经 `/boot` 注入每个租户引擎）：
 
 | env | 作用 |
 |---|---|
 | `VIBE_DATA_DIR=/home/vibe/.vibe-trading` | `runs/` `sessions/` `uploads/` `logs/` `memory/` 统一落在租户数据根（= 宿主 bind-mount） |
 | `VIBE_MULTITENANT=1` | fail-loud 标记：缺 `VIBE_DATA_DIR` 时引擎拒绝启动，杜绝静默写共享安装目录 |
-| `VIBE_TRADING_TENANT_SAFE=1` | `build_registry` 排除**动钱红线**：`trading_*` 前缀全部工具 + `propose_mandate_profiles`。只读分析产品在任何配置下都不得触发真实下单/资金授权 |
+| `VIBE_TRADING_TENANT_SAFE=1` | `build_registry` 排除**动钱红线**：`trading_*` 前缀全部工具 + `propose_mandate_profiles`。只读分析产品在任何配置下都不得触发真实下单/资金授权。同时 `config/loader.py` 忽略 `~/.vibe-trading` 下的 `agent.json` / `swarm-agent.json`（见 §2.3 第 3 条） |
 | `VIBE_TRADING_ENABLE_SHELL_TOOLS=1` | 放开 shell 类工具（上游默认关）——任意命令执行已被 MicroVM 圈住，视为安全 |
 | `API_AUTH_KEY=<随机>` | 引擎对非 loopback 调用方的 Bearer 鉴权 key，见 §5 |
 | `VIBE_MAX_ITERATIONS=50` | 租户档位：ReAct 迭代上限（与引擎默认一致；router env 可覆盖） |

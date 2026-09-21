@@ -26,6 +26,7 @@ from mcp import types as mcp_types
 from src.agent.tools import BaseTool
 from src.config.schema import MCPServerConfig
 from src.security.scanner import with_security_warnings
+from src.tools.subprocess_env import _subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -405,7 +406,11 @@ class MCPServerAdapter:
         transport_type = self.server_config.resolved_transport()
 
         if transport_type == "stdio":
-            env = os.environ.copy()
+            # Same allowlist as the shell tools: the child never sees the
+            # engine's LLM / data-source credentials or API_AUTH_KEY. Anything
+            # a server needs beyond that is what the operator wrote into its
+            # ``env`` block.
+            env = _subprocess_env()
             env.update(self.server_config.env)
             transport = StdioTransport(
                 command=self.server_config.command,

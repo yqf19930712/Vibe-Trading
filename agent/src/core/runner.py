@@ -12,6 +12,8 @@ from typing import Any, Dict, Optional
 
 from rich.console import Console
 
+from src.tools.subprocess_env import backtest_subprocess_env
+
 
 console = Console(stderr=True)
 
@@ -168,7 +170,7 @@ class Runner:
         return sys.executable
 
     def _build_runtime_env(self, run_dir: Path, *, pythonpath_extra: Path | None = None) -> dict[str, str]:
-        """Build subprocess env and enforce no-proxy execution.
+        """Build the allowlisted subprocess env for the backtest run.
 
         Args:
             run_dir: Current run directory.
@@ -178,7 +180,11 @@ class Runner:
             Environment mapping for subprocess.
         """
 
-        env = os.environ.copy()
+        # Allowlisted env only: the model-written signal_engine.py is imported
+        # in this subprocess, so it must not see the engine's LLM credentials
+        # or API_AUTH_KEY. Data-source tokens and proxy settings the loaders
+        # read in-process are added back by backtest_subprocess_env().
+        env = backtest_subprocess_env()
         env.update(
             {
                 "PYTHONUNBUFFERED": "1",
@@ -191,9 +197,10 @@ class Runner:
             existing = env.get("PYTHONPATH", "")
             env["PYTHONPATH"] = str(pythonpath_extra) + (os.pathsep + existing if existing else "")
 
-        # Preserve system proxy settings; data sources (OKX/yfinance) need network access
-        # NOTE: do NOT override HOME/USERPROFILE — data libraries (yfinance, akshare)
-        # cache downloads under ~/; overriding HOME causes full re-download every run.
+        # Proxy settings pass through (data sources such as OKX/yfinance need
+        # network access). HOME/USERPROFILE are kept as-is: data libraries
+        # (yfinance, akshare) cache downloads under ~/, and overriding HOME
+        # forces a full re-download every run.
 
         return env
 

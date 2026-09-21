@@ -5,6 +5,8 @@ category: data-source
 ---
 # OKX Market
 
+> **Hosted sandbox note:** in the managed multi-tenant sandbox, `bash` subprocesses carry neither data-source credentials (`TUSHARE_TOKEN` / `TICKFLOW_API_KEY` / `IFIND_MCP_TOKEN`) nor direct access to sites outside mainland China. Use `get_market_data` for OHLCV and `read_url` for web pages; the script examples in this skill only work in a self-hosted deployment where the token and network are available to the shell.
+
 ## Overview
 
 The OKX V5 REST API provides comprehensive cryptocurrency market data covering spot, perpetual swaps, delivery futures, options, and more. All market-data endpoints are public and can be called directly without authentication. The data comes from OKX, the world's second-largest cryptocurrency exchange.
