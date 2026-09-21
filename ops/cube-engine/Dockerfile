@@ -8,18 +8,18 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
+RUN sed -i 's|deb.debian.org|mirrors.huaweicloud.com|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update && apt-get install -y --no-install-recommends \
     build-essential curl ca-certificates openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 COPY agent/requirements.txt agent/requirements.txt
-RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple -r agent/requirements.txt
+RUN pip install --no-cache-dir -i https://mirrors.huaweicloud.com/repository/pypi/simple -r agent/requirements.txt
 
 COPY pyproject.toml LICENSE README.md MANIFEST.in ./
 COPY agent/ agent/
 RUN mkdir -p frontend/dist && touch frontend/dist/index.html \
-    && pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple -e .
+    && pip install --no-cache-dir -i https://mirrors.huaweicloud.com/repository/pypi/simple -e .
 
 COPY launcher.py /usr/local/lib/vibe-launcher.py
 

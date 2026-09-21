@@ -402,3 +402,8 @@ Minor / 补充：m1 冷启动 5–15s（重 import + CJK 字体下载 + matplotl
 - **P2-3** 记忆文件锁口径写进 `_DirLock` docstring、PRODUCT_DESIGN §7、README_CUSTOM 已知坑：`flock` 只在同一内核内有保证，租户目录是宿主 bind-mount 进 MicroVM 的，引擎内有效、router `/memory/delete` 只防宿主侧并发，两侧之间不保证互斥（靠索引由条目文件重建自愈）。router 取锁改为 `_flock_bounded`（`LOCK_NB` + 50ms 重试，上限 `VIBE_MEMORY_LOCK_TIMEOUT_S` 默认 5s），超时记 warning 后不加锁照删。用例：另一 open file description 持锁时等到上限即绕过且索引照改；空闲锁取后释放。
 - **P2-4** bash / background_run 的「1M 内存护栏」原是 `subprocess.run(PIPE)` 全量读完之后的截断，不是内存护栏。改为 `bash_tool.run_capped`：`Popen` + 两个读线程按 64k 块流式读，任一路流超过 `_OUTPUT_HARD_CAP` 字节即 `killpg` 整个进程组、只保留前缀并附标记（结果多 `output_capped` 字段）；超时同样杀进程组（`start_new_session`），治 `subprocess.run` 杀了 shell 却被仍持有管道的孙进程拖住的老问题。`_cap_output` 与 head+tail 常量删除。用例：`yes A` 在 200k 上限下秒级结束、stderr 独立封顶、恰到上限整段透传、孙进程持管道不延长超时、background_run 同一实现。文案：README_CUSTOM「工具结果形状」、OBSERVABILITY §5.3、background 描述与注释改为「流式硬上限、超过即杀」。
 - 验证：`tests/test_context_engineering_v3.py -k "MaxOutputTokens or ToolChoice"` 11 例、`test_anthropic_channel.py` 23 例、`test_bash_output_and_audit.py` + `test_credential_boundary.py` 41 例、router 72 例；全量见提交说明。
+
+## 2026-09-21 引擎镜像构建源改华为云：阿里云镜像站对 HTTP/1.1 限速
+
+v39 构建时 apt 与 pip 在阿里云镜像站只有约 100 kB/s（python 基础层 5 分钟、apt 13 分钟、pip 半小时未完），而主机 curl 同一文件 17 MB/s。逐项排除后定位：`curl` 默认 HTTP/2，apt / pip / python urllib 只会 HTTP/1.1，阿里云 CDN 节点对 HTTP/1.1 长下载限速；与 docker 桥接网络、代理、IPv6 均无关（`--network host` 与容器内外一致慢）。清华 / 华为云走 HTTP/1.1 分别 9 / 11 MB/s（apt 包 7 / 50 MB/s），`ops/cube-engine/Dockerfile` 的 apt 与 pip 源改为 mirrors.huaweicloud.com。顺带：构建前 `docker image prune -a` 会连 python:3.12-slim 基础镜像一起删掉，下次重拉；引擎机 CubeSandbox 的 MySQL binlog 从未清理占了 19 GB（根盘 100%），已 `PURGE BINARY LOGS` 并 `SET PERSIST binlog_expire_logs_seconds=604800`。
+
