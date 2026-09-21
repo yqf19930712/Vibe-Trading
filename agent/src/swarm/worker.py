@@ -145,6 +145,8 @@ def _filter_skill_descriptions(loader: SkillsLoader, skill_names: list[str]) -> 
 def _estimate_tokens(
     messages: list[dict],
     response: object,
+    *,
+    count_reasoning: bool = False,
 ) -> tuple[int, int]:
     """Return token usage for a single LLM call, real if available.
 
@@ -183,7 +185,7 @@ def _estimate_tokens(
     # src.core.token_estimate), so CJK-heavy prompts are no longer
     # under-counted 2-3x.
     try:
-        input_tokens = estimate_messages_tokens(messages)
+        input_tokens = estimate_messages_tokens(messages, count_reasoning=count_reasoning)
     except Exception:
         input_tokens = 0
 
@@ -435,36 +437,51 @@ def run_worker(
     # iteration boundaries, and the layer deadline in runtime.py then needs
     # ``layer_budget + 60s`` to notice.
     from src.agent.loop import (
+        LENGTH_CONTINUATIONS,
+        OUTPUT_TRUNCATED_MARK,
+        _LENGTH_CONTINUE_NUDGE,
         _microcompact,
         invoke_tool_guarded,
         tool_is_readonly,
         tool_timeout_for,
     )
     from src.agent.tool_result_store import prepare_for_context
+    from src.core.cancel import sleep_unless_cancelled
+    from src.providers.chat import TOOL_CHOICE_NONE
 
     # Layer 1 hysteresis state, owned by this worker (see loop._microcompact).
     microcompact_state: dict[str, Any] = {}
+    # ``reasoning_content`` counts toward the context only on channels that
+    # send it back upstream.
+    count_reasoning = bool(getattr(llm, "sends_reasoning_content", False))
+    should_cancel = cancel_event.is_set if cancel_event is not None else None
+    length_continuations = 0
+    # Partial replies cut by the output ceiling, awaiting their continuation.
+    truncated_parts: list[str] = []
+
+    def _cancelled_result(at_iteration: int) -> WorkerResult:
+        summary = _best_summary(messages, last_assistant_content) or (
+            f"Worker cancelled after {at_iteration} iterations"
+        )
+        summary = _resolve_summary(artifact_dir, summary)
+        _emit(event_callback, "worker_cancelled", agent_id, task_id, {"iteration": at_iteration})
+        _write_summary(artifact_dir, summary)
+        _persist_messages(artifact_dir, messages)
+        return WorkerResult(
+            status="cancelled",
+            summary=summary,
+            artifact_paths=_collect_artifacts(artifact_dir),
+            iterations=at_iteration,
+            error="run cancelled",
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            llm_ms=total_llm_ms,
+            tool_ms=total_tool_ms,
+        )
 
     for iteration in range(max_iterations):
         if cancel_event is not None and cancel_event.is_set():
-            summary = _best_summary(messages, last_assistant_content) or (
-                f"Worker cancelled after {iteration} iterations"
-            )
-            summary = _resolve_summary(artifact_dir, summary)
-            _emit(event_callback, "worker_cancelled", agent_id, task_id, {"iteration": iteration})
-            _write_summary(artifact_dir, summary)
-            _persist_messages(artifact_dir, messages)
-            return WorkerResult(
-                status="cancelled",
-                summary=summary,
-                artifact_paths=_collect_artifacts(artifact_dir),
-                iterations=iteration,
-                error="run cancelled",
-                input_tokens=total_input_tokens,
-                output_tokens=total_output_tokens,
-                llm_ms=total_llm_ms,
-                tool_ms=total_tool_ms,
-            )
+            return _cancelled_result(iteration)
 
         # Microcompact: prune old tool results only when the context estimate
         # crosses the worker's own token budget threshold.
@@ -472,6 +489,7 @@ def run_worker(
             messages,
             token_threshold=_MAX_TOKEN_ESTIMATE,
             state=microcompact_state,
+            count_reasoning=count_reasoning,
         )
 
         # Check timeout
@@ -494,7 +512,7 @@ def run_worker(
             )
 
         # Check token estimate (CJK-weighted, see src.core.token_estimate)
-        token_estimate = estimate_messages_tokens(messages)
+        token_estimate = estimate_messages_tokens(messages, count_reasoning=count_reasoning)
         if token_estimate > _MAX_TOKEN_ESTIMATE:
             summary = last_assistant_content or f"Worker context too large (~{token_estimate} tokens, {iteration} iterations)"
             summary = _resolve_summary(artifact_dir, summary)
@@ -523,9 +541,22 @@ def run_worker(
                 ),
             })
 
-        # On last iteration, call LLM without tool definitions to force text output
+        # The last iteration is a forced text turn: the tool definitions stay
+        # in the request and ``tool_choice=none`` disables calling them (the
+        # Anthropic Messages API rejects a history with tool_use/tool_result
+        # blocks but no ``tools``).
         is_last_iteration = iteration == max_iterations - 1
-        tool_defs = None if is_last_iteration else registry.get_definitions()
+        tool_defs = registry.get_definitions()
+        tool_choice = TOOL_CHOICE_NONE if is_last_iteration else None
+        if is_last_iteration:
+            messages.append({
+                "role": "user",
+                "content": (
+                    "[SYSTEM] This is the final turn and tool calls are disabled. "
+                    "Output your final analysis summary now as plain text; state "
+                    "explicitly which parts are incomplete or unverified."
+                ),
+            })
 
         # Stream the LLM — moonshot/kimi non-streaming invoke is unreliable
         # (issue #42), and streaming also feeds dashboard live progress.
@@ -576,6 +607,8 @@ def run_worker(
                         tools=tool_defs,
                         timeout=remaining_timeout,
                         on_text_chunk=_on_text_chunk,
+                        should_cancel=should_cancel,
+                        tool_choice=tool_choice,
                     )
 
             # In-place recovery for transient stream failures (ReadTimeout,
@@ -624,7 +657,10 @@ def run_worker(
                     from src.core.fetch_stats import record_stream_retry
 
                     record_stream_retry("swarm")
-                    time.sleep(delay)
+                    # A cancel during the backoff ends the worker now instead
+                    # of after the full sleep plus one more LLM call.
+                    if sleep_unless_cancelled(delay, cancel_event):
+                        return _cancelled_result(iteration)
             llm_elapsed_ms = int((time.monotonic() - llm_t0) * 1000)
             total_llm_ms += llm_elapsed_ms
             # Event ts = LLM call end; elapsed lets the gantt draw the exact
@@ -651,7 +687,7 @@ def run_worker(
             )
 
         # Accumulate token counts
-        iter_in, iter_out = _estimate_tokens(messages, response)
+        iter_in, iter_out = _estimate_tokens(messages, response, count_reasoning=count_reasoning)
         total_input_tokens += iter_in
         total_output_tokens += iter_out
 
@@ -659,9 +695,32 @@ def run_worker(
         if response.content and len(response.content.strip()) > 20:
             last_assistant_content = response.content
 
-        # If no tool calls, this is the final response
+        # If no tool calls, this is the final response — unless the output
+        # ceiling cut it (finish_reason=length): then keep the partial text
+        # and ask for the rest, or deliver it with an explicit marker.
         if not response.has_tool_calls:
-            summary = response.content or last_assistant_content or "(no summary)"
+            content = response.content or ""
+            finish_reason = getattr(response, "finish_reason", "stop")
+            if finish_reason == "length" and content:
+                _emit(
+                    event_callback, "worker_output_truncated", agent_id, task_id,
+                    {"iteration": iteration, "chars": len(content),
+                     "continuation": length_continuations + 1
+                     if not is_last_iteration and length_continuations < LENGTH_CONTINUATIONS
+                     else None},
+                )
+                if not is_last_iteration and length_continuations < LENGTH_CONTINUATIONS:
+                    length_continuations += 1
+                    truncated_parts.append(content)
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({"role": "user", "content": _LENGTH_CONTINUE_NUDGE})
+                    continue
+            if truncated_parts:
+                content = "".join(truncated_parts) + content
+                truncated_parts = []
+            if finish_reason == "length" and content:
+                content += OUTPUT_TRUNCATED_MARK
+            summary = content or last_assistant_content or "(no summary)"
             summary = _resolve_summary(artifact_dir, summary)
             _write_summary(artifact_dir, summary)
             reason = _classify_deliverable(
@@ -696,6 +755,9 @@ def run_worker(
                 tool_ms=total_tool_ms,
             )
 
+        # A tool-calling turn after a length continuation restarts the
+        # model's own reasoning; the partial stays in the trajectory only.
+        truncated_parts = []
         # Append assistant message with tool calls
         messages.append(
             ContextBuilder.format_assistant_tool_calls(

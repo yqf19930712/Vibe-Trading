@@ -23,6 +23,17 @@ envelope was quietly disabling the two tools the model needs most):
 * Any other single-line JSON result is pretty-printed before it hits disk, so
   ``read_file(offset, limit)`` can actually page through it.
 
+Two more tool-aware rules keep this the **only** truncation layer between a
+tool and the trajectory (a tool that clips its own output on top of it makes
+the model chase a second copy of the same text):
+
+* ``bash`` returns its streams whole; the offloaded copy is written as plain
+  text (stdout, then stderr after a separator line) so ``read_file`` /
+  ``grep -n`` page through the actual output rather than a JSON string.
+* ``read_file`` results are never offloaded — the source file is already on
+  disk, so the preview points back at it with a narrower ``offset``/``limit``
+  instead of creating a copy of a copy.
+
 Byte stability (book §2.3.4): file names are a deterministic function of
 (iteration, tool, call id), so a replay or retry reuses the same path and the
 preview text — which embeds that path — stays byte-identical. No timestamps,
@@ -61,6 +72,14 @@ _SKILL_FOOTER_RESERVE = 1_500
 MARKET_DATA_TOOL_NAME = "get_market_data"
 MARKET_DATA_EDGE_ROWS = 20
 
+# ``bash`` results are ``{"stdout", "stderr", ...}`` JSON; the disk copy is the
+# streams as plain text so line paging is paging through the real output.
+SHELL_TOOL_NAME = "bash"
+_STDERR_SEPARATOR = "\n--- stderr ---\n"
+
+# ``read_file`` pages are previewed but never offloaded (see module docstring).
+READ_FILE_TOOL_NAME = "read_file"
+
 # Keep name fragments filesystem-safe. Tool names are internal identifiers,
 # but a remote MCP tool name is not under our control. Dots are excluded along
 # with separators so no fragment can ever be ``..`` — the extension is appended
@@ -90,6 +109,35 @@ def _is_json_like(result: str) -> bool:
     return result.lstrip()[:1] in ("{", "[")
 
 
+def _parse_json_object(result: str) -> dict[str, Any] | None:
+    """Parse ``result`` as a JSON object, or None when it is not one."""
+    if not _is_json_like(result):
+        return None
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _shell_streams(result: str) -> tuple[str, str] | None:
+    """Return ``(stdout, stderr)`` of a ``bash`` result, or None if not one."""
+    payload = _parse_json_object(result)
+    if payload is None:
+        return None
+    out, err = payload.get("stdout"), payload.get("stderr")
+    if not isinstance(out, str) and not isinstance(err, str):
+        return None
+    return (out if isinstance(out, str) else "", err if isinstance(err, str) else "")
+
+
+def _shell_disk_text(streams: tuple[str, str]) -> str:
+    """Plain-text disk layout of a shell result: stdout, then stderr."""
+    out, err = streams
+    text = out + (_STDERR_SEPARATOR + err if err else "")
+    return text if text.endswith("\n") else text + "\n"
+
+
 def result_path(base_dir: Path, iteration: int, tool_name: str, call_id: str, result: str) -> Path:
     """Return the deterministic on-disk path for one oversized result.
 
@@ -106,6 +154,8 @@ def result_path(base_dir: Path, iteration: int, tool_name: str, call_id: str, re
     """
     if tool_name == SKILL_TOOL_NAME:
         ext = "md"
+    elif tool_name == SHELL_TOOL_NAME and _shell_streams(result) is not None:
+        ext = "txt"
     else:
         ext = "json" if _is_json_like(result) else "txt"
     name = f"{max(0, int(iteration)):03d}-{_safe(tool_name)}-{_safe(call_id)[:8]}.{ext}"
@@ -137,14 +187,19 @@ def disk_text(tool_name: str, result: str) -> str:
     """Return the text actually written to disk for ``result``.
 
     ``get_market_data`` payloads are written one bar per line (see
-    :func:`_market_data_disk_text`); other single-line JSON is pretty-printed;
-    everything else (Markdown skills, multi-line JSON, plain text) is stored
-    verbatim so line numbers quoted in the preview stay exact.
+    :func:`_market_data_disk_text`); ``bash`` results as their plain-text
+    streams; other single-line JSON is pretty-printed; everything else
+    (Markdown skills, multi-line JSON, plain text) is stored verbatim so line
+    numbers quoted in the preview stay exact.
     """
     if tool_name == MARKET_DATA_TOOL_NAME:
         payload = _parse_market_data(result)
         if payload is not None:
             return _market_data_disk_text(payload)
+    if tool_name == SHELL_TOOL_NAME:
+        streams = _shell_streams(result)
+        if streams is not None:
+            return _shell_disk_text(streams)
     return _reflow_single_line_json(result)
 
 
@@ -195,10 +250,30 @@ def build_preview(result: str, path: Path | None, tool_name: str) -> str:
     Returns:
         Preview text to place in the trajectory in place of ``result``.
     """
+    envelope = _generic_envelope(result, tool_name)
+    if path is None:
+        return envelope + _NO_DISK_NOTE
+    layout = (
+        " — stdout as plain text, stderr (if any) after a \"--- stderr ---\" line"
+        if tool_name == SHELL_TOOL_NAME and _shell_streams(result) is not None
+        else ""
+    )
+    return (
+        f"{envelope}\n"
+        f"[FULL RESULT ON DISK: {path}{layout}]\n"
+        "[This is a PREVIEW, not the complete result. It may be syntactically "
+        "incomplete (e.g. unbalanced JSON) — do NOT parse it as a whole and do "
+        "NOT conclude data is missing from the source. To read the rest: "
+        f"{_READ_HINT.format(path=path)}]"
+    )
+
+
+def _generic_envelope(result: str, tool_name: str) -> str:
+    """Head + tail of ``result`` inside the machine-readable truncation tag."""
     head = result[: TOOL_RESULT_LIMIT - PREVIEW_TAIL]
     tail = result[-PREVIEW_TAIL:]
     omitted = len(result) - TOOL_RESULT_LIMIT
-    envelope = (
+    return (
         f'{TRUNCATED_TAG} tool="{_safe(tool_name)}" '
         f'total_chars="{len(result)}" shown="{TOOL_RESULT_LIMIT}">\n'
         f"{head}\n"
@@ -206,15 +281,34 @@ def build_preview(result: str, path: Path | None, tool_name: str) -> str:
         f"{tail}\n"
         "</tool-result-truncated>"
     )
-    if path is None:
-        return envelope + _NO_DISK_NOTE
+
+
+def build_read_file_preview(result: str) -> str:
+    """Preview an oversized ``read_file`` page without copying it to disk.
+
+    The source file is already on disk (its path is in the payload), so the
+    envelope sends the model back to it with a narrower ``offset``/``limit``
+    instead of offloading a second copy that it would then ``read_file``
+    again.
+    """
+    payload = _parse_json_object(result)
+    source = payload.get("path") if payload else None
+    envelope = _generic_envelope(result, READ_FILE_TOOL_NAME)
+    if not isinstance(source, str) or not source:
+        return (
+            f"{envelope}\n"
+            "[This is a PREVIEW with the middle omitted — do not parse it as a "
+            "whole. The file itself is on disk: re-read it with a smaller limit "
+            "(read_file(path=..., offset=<start line>, limit=<line count>)).]"
+        )
     return (
         f"{envelope}\n"
-        f"[FULL RESULT ON DISK: {path}]\n"
-        "[This is a PREVIEW, not the complete result. It may be syntactically "
-        "incomplete (e.g. unbalanced JSON) — do NOT parse it as a whole and do "
-        "NOT conclude data is missing from the source. To read the rest: "
-        f"{_READ_HINT.format(path=path)}]"
+        f"[NOT copied to disk — the source file is already there: {source}]\n"
+        "[This is a PREVIEW with the middle omitted — do not parse it as a whole "
+        "and do NOT conclude the omitted lines are missing from the file. Read "
+        f'them with read_file(path="{source}", offset=<start line>, '
+        f"limit=<fewer lines>); in bash, `grep -n <pattern> {source}` finds the "
+        "line to start from.]"
     )
 
 
@@ -457,10 +551,11 @@ def prepare_for_context(
     verifier and the trace all keep consuming the full text.
 
     Tool-aware: ``load_skill`` uses :data:`SKILL_RESULT_LIMIT` and section
-    trimming; ``get_market_data`` uses the structured row preview; every
-    other tool gets the generic head+tail envelope at
-    :data:`TOOL_RESULT_LIMIT`. The dispatch lives here (not in ``loop.py``)
-    so the main loop and the swarm worker cannot drift.
+    trimming; ``get_market_data`` uses the structured row preview;
+    ``read_file`` is previewed but never offloaded; every other tool gets
+    the generic head+tail envelope at :data:`TOOL_RESULT_LIMIT` (``bash``
+    with its streams stored as plain text). The dispatch lives here (not in
+    ``loop.py``) so the main loop and the swarm worker cannot drift.
 
     Args:
         result: Full raw result text.
@@ -480,6 +575,9 @@ def prepare_for_context(
 
     if len(result) <= TOOL_RESULT_LIMIT:
         return result, False
+
+    if tool_name == READ_FILE_TOOL_NAME:
+        return build_read_file_preview(result), False
 
     path = _try_offload(base_dir, iteration, tool_name, call_id, result)
     if tool_name == MARKET_DATA_TOOL_NAME:

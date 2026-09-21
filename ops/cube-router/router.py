@@ -541,14 +541,19 @@ async def _evict_for_capacity() -> None:
     """Pause LRU idle sandboxes until RUNNING (booting included) < MAX_RUNNING.
 
     Raises 503 when the cap is reached and nothing idle is left to pause; a
-    booting instance is never a victim (it is not idle, it is on its way up).
+    booting instance is never a victim (it is not idle, it is on its way up),
+    nor is one whose per-instance lock is held (a request is inside the
+    engine — e.g. a session delete — even though its refcount is 0).
     """
     while True:
         running = [i for i in pool.values() if not i.paused]
         if len(running) < MAX_RUNNING:
             return
         idle = sorted(
-            (i for i in running if i.refcount == 0 and not i.booting),
+            (
+                i for i in running
+                if i.refcount == 0 and not i.booting and not i.lock.locked()
+            ),
             key=lambda i: i.last_activity,
         )
         if not idle:
@@ -1765,11 +1770,15 @@ async def healthz(authorization: Optional[str] = Header(None)):
 
 # ── Background reaper: pause idle sandboxes ──────────────────────────────────
 async def _reap_idle_once() -> list[Instance]:
-    """Pause every idle instance past IDLE_TTL_S (a booting one is not idle)."""
+    """Pause every idle instance past IDLE_TTL_S.
+
+    A booting instance is not idle, and neither is one whose lock is held.
+    """
     now = time.monotonic()
     victims = [
         i for i in pool.values()
         if i.refcount == 0 and not i.paused and not i.booting
+        and not i.lock.locked()
         and (now - i.last_activity) > IDLE_TTL_S
     ]
     for v in victims:

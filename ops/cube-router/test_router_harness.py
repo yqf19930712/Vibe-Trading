@@ -10,8 +10,9 @@ fakes that yield to the event loop the way the real ones do.
   · RUNNING cap — N concurrent cold starts never exceed MAX_RUNNING (a
     booting instance already holds its slot); a re-attached (state.json)
     instance and a paused one being resumed also evict; a failed cold start
-    gives its slot back and drops the sandbox; booting instances are never
-    pause victims (LRU or reaper).
+    gives its slot back and drops the sandbox; booting instances and
+    instances whose per-instance lock is held are never pause victims (LRU
+    or reaper).
   · _wait_answer ends with _EngineFailed as soon as attempt.failed is seen
     on the event stream, without waiting for the next message poll.
   · engine_cancelled is stamped from the engine's answer to the cancel and
@@ -204,6 +205,24 @@ class TestRunningCap:
         victims = _run(router._reap_idle_once())
         assert victims == []
         assert not booting.paused
+
+    def test_lock_held_instance_is_never_a_pause_victim(self, fake_cube):
+        """refcount 0 but a request inside the engine (e.g. a session delete)."""
+        held = _idle_running("held", idle_s=10_000)
+        _idle_running("busy", idle_s=10_000).refcount = 1
+
+        async def _scenario():
+            async with held.lock:
+                with pytest.raises(HTTPException) as ei:
+                    await router._evict_for_capacity()
+                assert ei.value.status_code == 503
+                assert await router._reap_idle_once() == []
+            # Released: eligible again.
+            await router._evict_for_capacity()
+
+        _run(_scenario())
+        assert fake_cube["pause"] == [held.sandbox_id]
+        assert held.paused
 
     def test_evict_loops_until_under_the_cap(self, fake_cube, monkeypatch):
         monkeypatch.setattr(router, "MAX_RUNNING", 1)

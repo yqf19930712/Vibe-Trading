@@ -34,9 +34,13 @@ def _make_tool(payload: dict) -> MCPRemoteTool:
 
 class TestResultTruncation:
     def test_small_payload_passes_through(self) -> None:
+        """No size truncation; the text only gains the external-content declaration."""
         payload = {"status": "ok", "text": "hello"}
         result = json.loads(_make_tool(payload).execute())
-        assert result["text"] == "hello"
+        assert result["text"].startswith('<external-content source="mcp:')
+        assert 'kind="mcp_result"' in result["text"]
+        assert "\nhello\n" in result["text"]
+        assert "result_truncated" not in result
         assert "result_truncated" not in result
 
     def test_oversized_text_is_truncated_with_marker(self) -> None:

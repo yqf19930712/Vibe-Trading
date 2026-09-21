@@ -51,7 +51,7 @@ from src.goal.context import (
     goal_needs_continuation,
     goal_progress_tuple,
 )
-from src.providers.chat import ChatLLM, ProviderStreamError
+from src.providers.chat import TOOL_CHOICE_NONE, ChatLLM, ProviderStreamError
 from src.session import handoff
 from src.tools.background_tools import get_background_manager
 from src.tools.redaction import redact_payload, redact_secret_values
@@ -59,7 +59,11 @@ from src.core import budget as _budget
 from src.core import cancel as _cancel
 from src.core import fetch_stats as _fetch_stats
 from src.core.paths import data_root, runs_root
-from src.core.token_estimate import estimate_messages_tokens, estimate_text_tokens
+from src.core.token_estimate import (
+    estimate_messages_tokens,
+    estimate_text_tokens,
+    messages_for_estimate,
+)
 
 # Honor VIBE_DATA_DIR (multi-tenant per-user HOME) so the agent loop writes run
 # artifacts under the tenant root, not the shared install dir. See core/paths.py.
@@ -168,6 +172,21 @@ _EMPTY_RESPONSE_NUDGE = (
     "Respond now: either call a tool, or write your answer as text."
 )
 LLM_USAGE_ARTIFACT = "llm_usage.json"
+
+# A reply cut by the output-token ceiling (``finish_reason == "length"``,
+# Anthropic ``stop_reason == "max_tokens"``) is not a final answer: the loop
+# appends the partial text and asks the model to continue from where it
+# stopped, up to this many times per attempt; a still-truncated reply, or one
+# truncated on the last turn, is delivered with an explicit marker instead
+# of passing as complete.
+LENGTH_CONTINUATIONS = max(0, int(os.getenv("VIBE_LENGTH_CONTINUATIONS", "2")))
+_LENGTH_CONTINUE_NUDGE = (
+    "[SYSTEM] Your previous reply was cut off by the output length limit "
+    "(finish_reason=length). Continue EXACTLY from where it stopped: do not "
+    "repeat what you already wrote and do not restart the document. Be concise "
+    "in the remaining part."
+)
+OUTPUT_TRUNCATED_MARK = "\n\n（输出被截断）"
 
 # Layer 2: Context collapse thresholds
 COLLAPSE_THRESHOLD = int(TOKEN_THRESHOLD * 0.7)
@@ -314,7 +333,7 @@ def _format_timeout(seconds: float) -> str:
     return f"{seconds:.0f}s"
 
 
-def estimate_tokens(messages: list) -> int:
+def estimate_tokens(messages: list, *, count_reasoning: bool = False) -> int:
     """Rough token count estimate, weighted by character class.
 
     ASCII ~4 chars/token, CJK ~0.6 token/char, other ~3 chars/token — see
@@ -324,11 +343,13 @@ def estimate_tokens(messages: list) -> int:
 
     Args:
         messages: Message list.
+        count_reasoning: Include assistant ``reasoning_content`` — only when
+            the provider sends it back upstream (``ChatLLM.sends_reasoning_content``).
 
     Returns:
         Estimated token count.
     """
-    return estimate_messages_tokens(messages)
+    return estimate_messages_tokens(messages, count_reasoning=count_reasoning)
 
 
 # Placeholder for pruned tool results. MUST tell the model the data was
@@ -360,6 +381,8 @@ def _microcompact(
     messages: list,
     token_threshold: int = TOKEN_THRESHOLD,
     state: dict | None = None,
+    *,
+    count_reasoning: bool = False,
 ) -> None:
     """Layer 1: prune old tool results — threshold-triggered, token-budget keep.
 
@@ -388,8 +411,9 @@ def _microcompact(
         state: Caller-owned dict carrying the armed flag across iterations.
             Omitted (None) reproduces the pre-V2 single-line behavior, so the
             function stays usable stateless.
+        count_reasoning: See :func:`estimate_tokens`.
     """
-    estimate = estimate_tokens(messages)
+    estimate = estimate_tokens(messages, count_reasoning=count_reasoning)
     keep_ratio = MICROCOMPACT_KEEP_BUDGET_RATIO
     if state is None:
         if estimate <= token_threshold * MICROCOMPACT_TRIGGER_RATIO:
@@ -690,7 +714,9 @@ def _select_summary_input(head: list[dict]) -> tuple[str, int]:
     """
     kept: list[dict] = []
     budget = SUMMARY_INPUT_TOKEN_BUDGET
-    for msg in reversed(head):
+    # The thinking transcript is not part of the conversation being
+    # summarised (and would eat the budget several times over).
+    for msg in reversed(messages_for_estimate(head)):
         try:
             blob = json.dumps(msg, default=str, ensure_ascii=False)
         except (TypeError, ValueError):
@@ -1273,6 +1299,10 @@ class AgentLoop:
         final_content = ""
         empty_model_response_iter: int | None = None
         empty_response_retries = 0
+        length_continuations = 0
+        # Partial replies cut by the output ceiling, in order, awaiting the
+        # continuation that completes them.
+        truncated_parts: list[str] = []
         llm_usage_summary = _new_llm_usage_summary(self.llm)
         goal_continuations = 0
         goal_last_progress: tuple[int, int] | None = None
@@ -1301,14 +1331,19 @@ class AgentLoop:
                 # any compaction, so it never survives into summaries.
                 _remove_status_messages(messages)
 
+                # ``reasoning_content`` counts only when the channel sends it.
+                count_reasoning = bool(getattr(self.llm, "sends_reasoning_content", False))
+
                 # Layer 1: microcompact (threshold-triggered + armed hysteresis)
-                _microcompact(messages, state=self._microcompact_state)
+                _microcompact(
+                    messages, state=self._microcompact_state, count_reasoning=count_reasoning
+                )
 
                 # Layer 2: context collapse (fold long text, zero API cost)
-                tokens = estimate_tokens(messages)
+                tokens = estimate_tokens(messages, count_reasoning=count_reasoning)
                 if tokens > COLLAPSE_THRESHOLD:
                     _context_collapse(messages)
-                    tokens = estimate_tokens(messages)
+                    tokens = estimate_tokens(messages, count_reasoning=count_reasoning)
 
                 # Layer 3: auto_compact (token threshold exceeded)
                 if tokens > TOKEN_THRESHOLD:
@@ -1379,6 +1414,21 @@ class AgentLoop:
                             "have, and prepare your final answer."
                         )
 
+                # The last iteration (or a deadline-driven early finalize) is
+                # a forced text turn: the tool definitions stay in the request
+                # and ``tool_choice=none`` tells the model not to call any (the
+                # Anthropic Messages API rejects a history with tool_use /
+                # tool_result blocks but no ``tools``); the [SYSTEM] line says
+                # what is expected of the turn.
+                is_last_iteration = (iteration == self.max_iterations) or force_final
+                if is_last_iteration and not force_final:
+                    nudge_lines.append(
+                        "[SYSTEM] This is the final turn and tool calls are disabled. "
+                        "Write your final answer now as plain text, based on the "
+                        "material you already gathered; state explicitly which "
+                        "parts are incomplete or unverified."
+                    )
+
                 messages.append(
                     _build_status_message(self.memory.to_summary(), nudge_lines)
                 )
@@ -1412,12 +1462,20 @@ class AgentLoop:
                         {"iter": current_iter, "chars": reasoning_chars},
                     )
 
-                # On the last iteration (or a deadline-driven early finalize),
-                # drop tool definitions to force text output.
-                is_last_iteration = (iteration == self.max_iterations) or force_final
-                tool_defs = None if is_last_iteration else self.registry.get_definitions()
+                tool_defs = self.registry.get_definitions()
+                tool_choice = TOOL_CHOICE_NONE if is_last_iteration else None
                 if is_last_iteration:
-                    trace.write({"type": "forced_text_only", "iter": current_iter})
+                    trace.write(
+                        {
+                            "type": "forced_text_only",
+                            "iter": current_iter,
+                            "mode": (
+                                "tool_choice_none"
+                                if getattr(self.llm, "supports_tool_choice_none", True)
+                                else "tools_omitted"
+                            ),
+                        }
+                    )
 
                 llm_t0 = _time.perf_counter()
                 # In-place recovery for transient mid-stream failures
@@ -1429,6 +1487,7 @@ class AgentLoop:
                 # remaining budget can't absorb the next backoff sleep. Deltas
                 # from a failed attempt are dropped so the trace does not
                 # contain duplicated thinking text.
+                response = None
                 for stream_attempt in range(1 + STREAM_RETRIES):
                     try:
                         self._stats["llm_calls"] += 1
@@ -1438,6 +1497,7 @@ class AgentLoop:
                             on_text_chunk=_on_text_chunk,
                             on_reasoning_chunk=_on_reasoning_chunk,
                             should_cancel=self._cancel_event.is_set,
+                            tool_choice=tool_choice,
                         )
                         break
                     except ProviderStreamError as exc:
@@ -1476,7 +1536,10 @@ class AgentLoop:
                         thinking_chunks.clear()
                         reasoning_chars = 0
                         last_reasoning_emit = None
-                        _time.sleep(delay)
+                        # A cancel during the backoff ends the run at the
+                        # check below instead of after the full sleep.
+                        if _cancel.sleep_unless_cancelled(delay, self._cancel_event):
+                            break
                 llm_elapsed_ms = int((_time.perf_counter() - llm_t0) * 1000)
                 self._stats["llm_ms"] += llm_elapsed_ms
                 # Persist the LLM call as a trace block (ts = end time) so the
@@ -1489,9 +1552,10 @@ class AgentLoop:
                 except Exception:  # noqa: BLE001 - trace must never break the run
                     logger.debug("llm_call trace write failed", exc_info=True)
 
-                # Cancelled mid-stream: discard this turn's partial response and
-                # end the run now, without executing any of its tool calls.
-                if self._cancel_event.is_set():
+                # Cancelled mid-stream (or during a retry backoff): discard
+                # this turn's partial response and end the run now, without
+                # executing any of its tool calls.
+                if self._cancel_event.is_set() or response is None:
                     break
 
                 usage = getattr(response, "usage_metadata", None)
@@ -1545,8 +1609,60 @@ class AgentLoop:
                     )
                     self._emit("thinking_done", {"iter": current_iter, "content": thinking_text[:500]})
 
+                # Duck-typed: LLM stand-ins may omit finish_reason.
+                finish_reason = getattr(response, "finish_reason", "stop")
+                if finish_reason == "length":
+                    truncated_payload = {
+                        "iter": current_iter,
+                        "chars": len(response.content or ""),
+                        "has_tool_calls": response.has_tool_calls,
+                    }
+                    trace.write({"type": "output_truncated", **truncated_payload})
+                    self._emit("output_truncated", truncated_payload)
+                    self._stats["output_truncations"] = (
+                        self._stats.get("output_truncations", 0) + 1
+                    )
+
                 if not response.has_tool_calls:
                     final_content = response.content or ""
+                    if (
+                        finish_reason == "length"
+                        and final_content
+                        and not is_last_iteration
+                        and length_continuations < LENGTH_CONTINUATIONS
+                    ):
+                        # Keep the partial reply in the trajectory and ask for
+                        # the rest; the continuation consumes a normal
+                        # iteration (never rewind the counters — the trace is
+                        # indexed by ``iter``).
+                        length_continuations += 1
+                        truncated_parts.append(final_content)
+                        trace.write_text_entry(
+                            {"type": "message", "iter": current_iter, "role": "assistant"},
+                            field="content",
+                            value=final_content,
+                            offload_kind=f"assistant-message-{current_iter}",
+                        )
+                        trace.write(
+                            {
+                                "type": "output_truncated_continue",
+                                "iter": current_iter,
+                                "attempt": length_continuations,
+                                "max_continuations": LENGTH_CONTINUATIONS,
+                            }
+                        )
+                        messages.append({"role": "assistant", "content": final_content})
+                        messages.append({"role": "user", "content": _LENGTH_CONTINUE_NUDGE})
+                        # Fallback answer should the run end without another
+                        # text turn: the partial, marked as such.
+                        final_content += OUTPUT_TRUNCATED_MARK
+                        continue
+                    if truncated_parts:
+                        # The continuation(s) complete the earlier partial text.
+                        final_content = "".join(truncated_parts) + final_content
+                        truncated_parts = []
+                    if finish_reason == "length" and final_content:
+                        final_content += OUTPUT_TRUNCATED_MARK
                     if not final_content:
                         empty_payload = {
                             "iter": current_iter,
@@ -1666,10 +1782,16 @@ class AgentLoop:
                     react_trace.append({"type": "answer", "content": final_content[:500]})
                     break
 
+                # A tool-calling turn after a length continuation restarts the
+                # model's own reasoning; the partial text stays in the
+                # trajectory for it to reuse, not as a prefix of the answer.
+                truncated_parts = []
                 assistant_message = context.format_assistant_tool_calls(
                     response.tool_calls,
                     content=response.content,
-                    reasoning_content=response.reasoning_content or thinking_text or None,
+                    # Only the channel's own reasoning field; the visible text
+                    # is already ``content`` and must not be mirrored here.
+                    reasoning_content=response.reasoning_content or None,
                 )
                 _attach_tool_call_thought_signatures(assistant_message, response.tool_calls)
                 messages.append(assistant_message)

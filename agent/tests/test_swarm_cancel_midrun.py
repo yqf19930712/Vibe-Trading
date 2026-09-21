@@ -62,7 +62,7 @@ class _ToolCallingLLM:
     def __call__(self, *args: Any, **kwargs: Any) -> "_ToolCallingLLM":
         return self
 
-    def stream_chat(self, messages, tools=None, on_text_chunk=None, timeout=None) -> LLMResponse:
+    def stream_chat(self, messages, tools=None, on_text_chunk=None, timeout=None, should_cancel=None, tool_choice=None) -> LLMResponse:
         self.calls += 1
         return LLMResponse(
             content="calling noop",

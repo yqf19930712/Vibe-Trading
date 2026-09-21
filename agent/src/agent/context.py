@@ -6,6 +6,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from src.agent.context_policy import mark_request_message
 from src.agent.memory import WorkspaceMemory
 from src.agent.skills import SkillsLoader
 from src.agent.tools import ToolRegistry
@@ -226,7 +227,9 @@ class ContextBuilder:
             except Exception as exc:
                 logger.debug("Auto-recall failed: %s", exc)
 
-        messages.append({"role": "user", "content": enriched})
+        # Marked as this attempt's request so the context layers can tell it
+        # from replayed history / handoff summaries by class, not position.
+        messages.append(mark_request_message({"role": "user", "content": enriched}))
         return messages
 
     def _format_tool_descriptions(self) -> str:

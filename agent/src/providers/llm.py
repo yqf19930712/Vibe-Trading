@@ -361,6 +361,37 @@ _ENV_LABELS = ("~/.vibe-trading/.env", "<AGENT_DIR>/.env", "<CWD>/.env")
 
 logger = logging.getLogger(__name__)
 
+# One output-token ceiling per model reply, read by both channels.
+# ``VIBE_MAX_OUTPUT_TOKENS`` applies to both when set (``VIBE_ANTHROPIC_MAX_TOKENS``
+# still wins on the native channel); unset, each channel keeps its own
+# default. The OpenAI-compatible default is the widest ceiling every known
+# compatible endpoint accepts (deepseek-chat / qwen reject a larger value with
+# a 400) — an over-large ceiling is a hard request error, a small one only
+# truncates, and a truncated reply is continued by the loop
+# (``finish_reason == "length"``).
+ANTHROPIC_MAX_OUTPUT_TOKENS_DEFAULT = 32000
+OPENAI_COMPAT_MAX_OUTPUT_TOKENS_DEFAULT = 8192
+
+
+def max_output_tokens(channel: str) -> int:
+    """Return the max output tokens for one reply on ``channel``.
+
+    Args:
+        channel: ``"anthropic"`` for the native Messages channel, anything
+            else for the OpenAI-compatible path.
+
+    Returns:
+        Positive token ceiling.
+    """
+    shared = os.getenv("VIBE_MAX_OUTPUT_TOKENS", "").strip()
+    if channel == "anthropic":
+        native = os.getenv("VIBE_ANTHROPIC_MAX_TOKENS", "").strip()
+        if native:
+            return int(native)
+        return int(shared) if shared else ANTHROPIC_MAX_OUTPUT_TOKENS_DEFAULT
+    return int(shared) if shared else OPENAI_COMPAT_MAX_OUTPUT_TOKENS_DEFAULT
+
+
 _dotenv_loaded: bool = False
 
 
@@ -470,6 +501,7 @@ def _build_native_deepseek(
         temperature=temperature,
         timeout=int(os.getenv("TIMEOUT_SECONDS", "120")),
         max_retries=int(os.getenv("MAX_RETRIES", "2")),
+        max_tokens=max_output_tokens("openai"),
         callbacks=callbacks,
         api_key=api_key or None,
         base_url=base_url or None,
@@ -632,7 +664,8 @@ def _build_native_anthropic(model: str, callbacks: Any = None) -> Any:
     Config:
         ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY — credential (first wins).
         ANTHROPIC_BASE_URL — gateway origin, e.g. https://api-direct.laicai8.co
-        VIBE_ANTHROPIC_MAX_TOKENS — max output tokens (default 32000).
+        VIBE_ANTHROPIC_MAX_TOKENS / VIBE_MAX_OUTPUT_TOKENS — max output
+            tokens (see :func:`max_output_tokens`; default 32000).
         VIBE_ANTHROPIC_THINKING — "adaptive" (default for *-5 family models),
             or "off" to disable. Budget-based thinking is deliberately not
             wired: opus-5-family rejects it and BYOK models fall back to
@@ -707,7 +740,7 @@ def _build_native_anthropic(model: str, callbacks: Any = None) -> Any:
         )
     kwargs: dict[str, Any] = {
         "model": model,
-        "max_tokens": int(os.getenv("VIBE_ANTHROPIC_MAX_TOKENS", "32000")),
+        "max_tokens": max_output_tokens("anthropic"),
         "timeout": int(os.getenv("TIMEOUT_SECONDS", "120")),
         "max_retries": int(os.getenv("MAX_RETRIES", "2")),
         "api_key": api_key,
@@ -913,6 +946,7 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         "temperature": temperature_param,
         "timeout": int(os.getenv("TIMEOUT_SECONDS", "120")),
         "max_retries": int(os.getenv("MAX_RETRIES", "2")),
+        "max_tokens": max_output_tokens("openai"),
         "stream_usage": stream_usage,
         "callbacks": callbacks,
         "extra_body": {"reasoning": {"effort": effort}} if effort and caps.openrouter_reasoning_body else None,

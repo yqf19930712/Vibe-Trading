@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from src.agent.tools import BaseTool
+from src.security.scanner import wrap_external_content
 
 
 class SessionSearchTool(BaseTool):
@@ -59,8 +60,21 @@ class SessionSearchTool(BaseTool):
                     ensure_ascii=False,
                 )
 
+            results = []
+            for m in matches:
+                item = m.to_dict()
+                snippet = item.get("snippet")
+                if isinstance(snippet, str) and snippet:
+                    # A past conversation's text is data, not an instruction —
+                    # it may itself quote external content.
+                    item["snippet"] = wrap_external_content(
+                        snippet,
+                        source=f"session:{item.get('session_id', '')}",
+                        kind="session_snippet",
+                    )
+                results.append(item)
             return json.dumps(
-                {"status": "ok", "query": query, "results": [m.to_dict() for m in matches]},
+                {"status": "ok", "query": query, "results": results},
                 ensure_ascii=False,
             )
         except Exception as exc:

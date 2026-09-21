@@ -6,8 +6,6 @@ import json
 import os
 import re
 import subprocess
-import time
-from pathlib import Path
 from typing import Any
 
 from src.agent.progress import emit_progress
@@ -15,12 +13,15 @@ from src.agent.tools import BaseTool
 from src.tools.redaction import redact_secret_values
 from src.tools.subprocess_env import _subprocess_env
 
-_OUTPUT_LIMIT = 50_000
-# F4: head+tail truncation instead of a silent hard cut — long outputs keep
-# their beginning (setup, first errors) AND their end (final result, traceback
-# tail), and the full text is persisted to run_dir for read_file paging.
-_TRUNC_HEAD = 40_000
-_TRUNC_TAIL = 8_000
+# The trajectory copy of a bash result is bounded by the one truncation
+# layer every tool shares (``agent.tool_result_store``: 10k head+tail preview,
+# full streams offloaded to ``<run_dir>/tool-results/`` as plain text for
+# ``read_file`` paging), so this tool returns its streams whole. The hard cap
+# below is a resource guard only — it keeps a runaway process from parking an
+# unbounded string in memory — and is marked explicitly when it fires.
+_OUTPUT_HARD_CAP = 1_000_000
+_HARD_CAP_HEAD = 800_000
+_HARD_CAP_TAIL = 200_000
 # V1: was a bare hard-coded 120 with no way to tune it and no relationship to
 # the tenant's own budget. Now configurable, and clamped per call by the
 # attempt's remaining budget (``_effective_timeout``) so bash always returns
@@ -73,37 +74,26 @@ def _audit_command(command: str) -> list[str]:
     return [name for name, pattern in _DANGEROUS_PATTERNS if pattern.search(command)]
 
 
-def _truncate_output(text: str, stream: str, run_dir: str | None) -> str:
-    """Head+tail truncate ``text``, persisting the full output when possible.
+def _cap_output(text: str, stream: str) -> str:
+    """Apply the resource hard cap to one stream (see ``_OUTPUT_HARD_CAP``).
 
     Args:
         text: Raw stream output.
-        stream: Stream label ("stdout"/"stderr") used in the dump filename.
-        run_dir: Run directory to persist the full output into (may be None).
+        stream: Stream label ("stdout"/"stderr") named in the marker.
 
     Returns:
-        The original text when within the limit, otherwise head + marker +
-        tail. The marker names the on-disk dump (readable via ``read_file``)
-        when persisting succeeded.
+        ``text`` unchanged when within the cap, otherwise head + explicit
+        marker + tail.
     """
-    if len(text) <= _OUTPUT_LIMIT:
+    if len(text) <= _OUTPUT_HARD_CAP:
         return text
-
-    dump_hint = ""
-    if run_dir:
-        try:
-            dump_name = f"bash_output_{stream}_{int(time.time() * 1000)}.log"
-            dump_path = Path(run_dir) / dump_name
-            dump_path.write_text(text, encoding="utf-8")
-            dump_hint = f" Full output saved to '{dump_name}' — use read_file (offset/limit) to inspect it."
-        except OSError:
-            dump_hint = ""
-
-    trimmed = len(text) - _TRUNC_HEAD - _TRUNC_TAIL
+    dropped = len(text) - _HARD_CAP_HEAD - _HARD_CAP_TAIL
     return (
-        text[:_TRUNC_HEAD]
-        + f"\n\n...[output truncated: {trimmed} chars omitted.{dump_hint}]...\n\n"
-        + text[-_TRUNC_TAIL:]
+        text[:_HARD_CAP_HEAD]
+        + f"\n\n...[{stream}: {dropped} chars dropped from the middle — the process "
+        f"produced more than {_OUTPUT_HARD_CAP} chars; rerun with a filter "
+        "(head/tail/grep) or redirect to a file under run_dir]...\n\n"
+        + text[-_HARD_CAP_TAIL:]
     )
 
 
@@ -171,15 +161,15 @@ class BashTool(BaseTool):
                 encoding="utf-8",
                 errors="replace",
             )
-            # Value-based scrub BEFORE truncation/dumping so neither the
-            # trajectory copy nor the on-disk full dump carries a secret.
+            # Value-based scrub here so neither the trajectory copy nor the
+            # offloaded full copy (tool_result_store) carries a secret.
             stdout = redact_secret_values(result.stdout)
             stderr = redact_secret_values(result.stderr)
             payload: dict[str, Any] = {
                 "status": "ok" if result.returncode == 0 else "error",
                 "exit_code": result.returncode,
-                "stdout": _truncate_output(stdout, "stdout", cwd),
-                "stderr": _truncate_output(stderr, "stderr", cwd),
+                "stdout": _cap_output(stdout, "stdout"),
+                "stderr": _cap_output(stderr, "stderr"),
             }
             if audit_findings:
                 payload["security_audit"] = audit_findings

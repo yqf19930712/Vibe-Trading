@@ -41,6 +41,7 @@ class _FlakyLoopLLM:
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        tool_choice: str | None = None,
     ) -> LLMResponse:
         """Raise the next queued error or return the final response.
 

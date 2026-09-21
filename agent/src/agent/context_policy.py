@@ -8,12 +8,20 @@ folded the middle out of the grounding results L1 explicitly refuses to prune,
 and folded the handoff summary L3 had just paid an LLM call to produce. Every
 "can this message be compressed, and how hard" decision now lives here.
 
-Design note — graded rules, not boolean exemptions. A blanket exemption for the
-first user message (original request + goal context + ``<recalled-memories>``)
-would make the single largest message in a long session permanently
-incompressible. Instead each message class gets its own fold parameters, and
-only genuinely structural messages (already-folded placeholders, the status
-bar, handoff summaries, protected tool results) get ``skip``.
+Design note — graded rules, not boolean exemptions. Each message class gets
+its own fold parameters; only structural messages (already-folded
+placeholders, the status bar, handoff summaries, protected tool results) and
+the **current request** get ``skip``. The current request — the user message
+``ContextBuilder.build_messages`` appends for this attempt, carrying the
+original question, the goal context, the recalled memories and whatever
+context the caller attached (a 15k-character War Room plan prompt, a
+holdings dump) — is the one message the model needs on every turn and the
+one Layer 2 cannot rebuild; folding its middle silently removes the task
+constraints. Layer 3 remains its backstop: when the whole trajectory exceeds
+the token threshold, the structured summary covers it like any other head
+message. Messages are classified by role and the ``vibe_class`` mark, not by
+position: in a continued thread slot 1 is the handoff summary or a replayed
+history turn, so position cannot identify the request.
 
 Byte stability (book §2.3.4): the marker prefixes below are matched against
 text already written into the trajectory. Changing one silently re-enables
@@ -36,6 +44,15 @@ HANDOFF_PREFIX = "[Conversation compressed"
 STATUS_PREFIX = "<agent_status>"
 # The explicit tool-result truncation envelope (src.agent.tool_result_store).
 TRUNCATED_TAG = "<tool-result-truncated"
+
+# —— Message class mark ————————————————————————————————————————————————
+# Extra key on an OpenAI-format message dict naming its class. LangChain
+# folds unknown keys into ``additional_kwargs``, which neither the OpenAI nor
+# the Anthropic serializer emits for user messages, so the mark never reaches
+# a provider and never changes request bytes.
+MESSAGE_CLASS_KEY = "vibe_class"
+# The user message that carries this attempt's request (see module docstring).
+REQUEST_CLASS = "request"
 
 # Tool results that Layer 1 never prunes: they carry the run's grounding data
 # (every cited number must trace back to one) or a deliverable whose re-fetch
@@ -67,11 +84,12 @@ class CollapseRule(NamedTuple):
     tail: int
 
 
-# Today's COLLAPSE_* constants, unchanged — the default for ordinary messages.
+# The default for ordinary messages.
 DEFAULT = CollapseRule(False, 2400, 900, 500)
-# The first user message carries the original request, the goal context and the
-# recalled-memories block: information density is high and re-deriving it is
-# impossible, so it folds later and keeps more on both ends.
+# The earliest replayed user turn of a continued thread (the original request
+# the whole thread grew from, replayed by the session service): high
+# information density, so it folds later and keeps more on both ends. The
+# current attempt's request is not this class — it is ``skip`` by mark.
 FIRST_USER = CollapseRule(False, 9600, 3000, 1200)
 # Escape valve for a protected tool result that is pathologically large (only
 # reachable on paths the tool_result_store offload does not cover). Without it
@@ -104,9 +122,26 @@ def collapse_rule(msg: Any, *, index: int, first_user_index: int) -> CollapseRul
         # source (tool_result_store preview) or semantically (Layer 3), except
         # for the hard-cap escape valve above.
         return PROTECTED_HARD_CAP
+    if is_request_message(msg):
+        return SKIP
     if index == first_user_index:
         return FIRST_USER
     return DEFAULT
+
+
+def mark_request_message(msg: dict) -> dict:
+    """Tag ``msg`` as the current attempt's request (mutates and returns it)."""
+    msg[MESSAGE_CLASS_KEY] = REQUEST_CLASS
+    return msg
+
+
+def is_request_message(msg: Any) -> bool:
+    """Return whether ``msg`` is the current attempt's request message."""
+    return (
+        isinstance(msg, dict)
+        and msg.get("role") == "user"
+        and msg.get(MESSAGE_CLASS_KEY) == REQUEST_CLASS
+    )
 
 
 def is_prunable_by_microcompact(msg: Any) -> bool:
@@ -126,10 +161,14 @@ def is_prunable_by_microcompact(msg: Any) -> bool:
 def first_user_index(messages: list) -> int:
     """Index of the first ``role == "user"`` message.
 
-    Normally 1 (index 0 is the system prompt), but after a Layer 3 compaction
-    slot 1 holds the handoff summary, which is itself a user message — and is
-    ``skip``-ed by prefix, so the graded FIRST_USER rule lands on whichever
-    user message actually leads the trajectory.
+    Position only — it does not identify the current request (that is the
+    ``vibe_class`` mark, see :func:`is_request_message`). In a fresh session
+    it is 1 and points at the request itself, which ``collapse_rule`` skips by
+    mark before the position rule is consulted. In a continued thread slot 1
+    holds the handoff summary (skipped by prefix) or the earliest replayed
+    user turn, which is what the graded FIRST_USER rule is for. After a
+    Layer 3 compaction slot 1 is the in-run summary (skipped by prefix) and
+    FIRST_USER applies to nothing.
 
     Args:
         messages: Message list.

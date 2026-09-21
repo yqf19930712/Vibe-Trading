@@ -25,7 +25,7 @@ from mcp import types as mcp_types
 
 from src.agent.tools import BaseTool
 from src.config.schema import MCPServerConfig
-from src.security.scanner import with_security_warnings
+from src.security.scanner import with_security_warnings, wrap_external_content
 from src.tools.subprocess_env import _subprocess_env
 
 logger = logging.getLogger(__name__)
@@ -606,6 +606,11 @@ class MCPRemoteTool(BaseTool):
         payload = with_security_warnings(
             payload, fields=("text", "error", "data", "content.*.text")
         )
+        payload = _wrap_remote_text(
+            payload,
+            source=f"mcp:{payload.get('server') or 'remote'}/"
+            f"{payload.get('remote_tool') or self._spec.remote_name}",
+        )
         return json.dumps(payload, ensure_ascii=False, default=_json_default)
 
     def _filter_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -649,6 +654,33 @@ def _clamp_remote_description(description: str | None, tool_name: str, server_na
     if len(text) > _DESCRIPTION_CHAR_LIMIT:
         text = text[: _DESCRIPTION_CHAR_LIMIT - 1].rstrip() + "…"
     return text
+
+
+def _wrap_remote_text(payload: dict[str, Any], *, source: str) -> dict[str, Any]:
+    """Declare a remote MCP result's prose as untrusted data.
+
+    A third-party server's natural-language output (quotes commentary,
+    company events, search hits) is external content like a web page: the
+    flattened ``text`` and every ``content[*].text`` block are wrapped in the
+    same ``<external-content>`` envelope the reader tools use, with the
+    scanner's findings promoted to its banner.
+    """
+    findings = payload.get("security_warnings")
+    findings = findings if isinstance(findings, list) else None
+    text = payload.get("text")
+    if isinstance(text, str) and text:
+        payload["text"] = wrap_external_content(
+            text, source=source, kind="mcp_result", findings=findings
+        )
+    content = payload.get("content")
+    if isinstance(content, list):
+        for block in content:
+            block_text = block.get("text") if isinstance(block, dict) else None
+            if isinstance(block_text, str) and block_text:
+                block["text"] = wrap_external_content(
+                    block_text, source=source, kind="mcp_result", findings=findings
+                )
+    return payload
 
 
 def _truncate_long_strings(value: Any) -> Any:

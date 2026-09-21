@@ -4,32 +4,68 @@ from __future__ import annotations
 
 import json
 
-from src.tools.bash_tool import BashTool, _audit_command, _truncate_output
+from src.agent.tool_result_store import TOOL_RESULT_LIMIT, prepare_for_context
+from src.tools.bash_tool import (
+    _HARD_CAP_HEAD,
+    _HARD_CAP_TAIL,
+    _OUTPUT_HARD_CAP,
+    BashTool,
+    _audit_command,
+    _cap_output,
+)
 
 
-class TestTruncateOutput:
-    def test_short_output_untouched(self, tmp_path) -> None:
-        assert _truncate_output("hello", "stdout", str(tmp_path)) == "hello"
+class TestSingleTruncationLayer:
+    """bash returns its streams whole; the shared envelope is the only cut."""
 
-    def test_long_output_keeps_head_and_tail_and_persists(self, tmp_path) -> None:
-        text = "A" * 60_000 + "TAIL_MARKER"
-        out = _truncate_output(text, "stdout", str(tmp_path))
+    def test_short_output_untouched(self) -> None:
+        assert _cap_output("hello", "stdout") == "hello"
 
-        assert out.startswith("A" * 100)
-        assert out.endswith("TAIL_MARKER")
-        assert "output truncated" in out
-        assert "read_file" in out
-        dumps = list(tmp_path.glob("bash_output_stdout_*.log"))
-        assert len(dumps) == 1
-        assert dumps[0].read_text(encoding="utf-8") == text
-        # The marker names the dump file so the model can read_file it.
-        assert dumps[0].name in out
+    def test_60k_output_is_returned_whole_by_the_tool(self, tmp_path) -> None:
+        body = json.loads(
+            BashTool().execute(command="yes A | head -c 60000", run_dir=str(tmp_path))
+        )
+        assert body["status"] == "ok"
+        assert len(body["stdout"]) == 60_000
+        assert "truncated" not in body["stdout"]
+        # No tool-private dump: the offloaded copy is the envelope's job.
+        assert list(tmp_path.glob("bash_output_*")) == []
 
-    def test_no_run_dir_still_truncates(self) -> None:
-        text = "B" * 60_000
-        out = _truncate_output(text, "stderr", None)
-        assert "output truncated" in out
-        assert len(out) < len(text)
+    def test_envelope_offloads_the_streams_as_plain_text(self, tmp_path) -> None:
+        raw = json.dumps(
+            {"status": "ok", "exit_code": 0, "stdout": "L\n" * 20_000, "stderr": "warn\n"}
+        )
+        payload, failed = prepare_for_context(
+            raw, base_dir=tmp_path, iteration=3, tool_name="bash", call_id="call_1"
+        )
+        assert failed is False
+        assert len(payload) < len(raw)
+        files = list((tmp_path / "tool-results").iterdir())
+        assert [f.name for f in files] == ["003-bash-call_1.txt"]
+        on_disk = files[0].read_text(encoding="utf-8")
+        assert on_disk.startswith("L\nL\n")
+        assert on_disk.endswith("--- stderr ---\nwarn\n")
+        assert "--- stderr ---" in payload  # the preview says how the file is laid out
+        assert str(files[0]) in payload
+
+    def test_hard_cap_only_guards_memory_and_is_marked(self) -> None:
+        text = "H" * _HARD_CAP_HEAD + "M" * 50_000 + "T" * _HARD_CAP_TAIL
+        assert len(text) > _OUTPUT_HARD_CAP
+        out = _cap_output(text, "stdout")
+        assert out.startswith("H" * 100)
+        assert out.endswith("T" * 100)
+        assert "50000 chars dropped" in out
+        assert "M" * 10 not in out
+        # Anything up to the cap passes through untouched.
+        assert _cap_output("x" * _OUTPUT_HARD_CAP, "stdout") == "x" * _OUTPUT_HARD_CAP
+
+    def test_trajectory_copy_is_bounded_by_the_shared_envelope(self) -> None:
+        raw = json.dumps({"status": "ok", "exit_code": 0, "stdout": "y" * 30_000, "stderr": ""})
+        payload, _ = prepare_for_context(
+            raw, base_dir=None, iteration=1, tool_name="bash", call_id="c"
+        )
+        assert payload.startswith("<tool-result-truncated")
+        assert f'shown="{TOOL_RESULT_LIMIT}"' in payload
 
 
 class TestDangerousPatternAudit:
