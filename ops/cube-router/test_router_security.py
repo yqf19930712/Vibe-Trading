@@ -528,3 +528,121 @@ class TestWatermarkIsConsumable:
 
     def test_disk_used_pct_survives_missing_path(self, tmp_path):
         assert router._disk_used_pct(tmp_path / "missing") is not None
+
+
+# ── Forwarded env: explicit names + LANGCHAIN_* / VIBE_ANTHROPIC_* prefixes ──
+
+
+class TestForwardedEnv:
+    def test_prefix_families_and_single_name_knobs_reach_the_engine(self, monkeypatch):
+        monkeypatch.setenv("LANGCHAIN_STREAM_USAGE", "0")
+        monkeypatch.setenv("LANGCHAIN_REASONING_EFFORT", "high")
+        monkeypatch.setenv("VIBE_ANTHROPIC_THINKING", "adaptive")
+        monkeypatch.setenv("VIBE_ANTHROPIC_MAX_TOKENS", "32000")
+        monkeypatch.setenv("VIBE_MAX_OUTPUT_TOKENS", "8192")
+        monkeypatch.setenv("VIBE_LENGTH_CONTINUATIONS", "3")
+        monkeypatch.setenv("VIBE_MEMORY_TTL_DAYS", "180")
+        monkeypatch.setenv("TICKFLOW_BASE_URL", "https://tickflow.example")
+        monkeypatch.setenv("NOT_FORWARDED_SETTING", "x")
+        monkeypatch.setenv("VIBE_ROUTER_SECRET", "must-stay-on-host")
+
+        env, _key = router.engine_env(None, None)
+
+        assert env["LANGCHAIN_STREAM_USAGE"] == "0"
+        assert env["LANGCHAIN_REASONING_EFFORT"] == "high"
+        assert env["VIBE_ANTHROPIC_THINKING"] == "adaptive"
+        assert env["VIBE_ANTHROPIC_MAX_TOKENS"] == "32000"
+        assert env["VIBE_MAX_OUTPUT_TOKENS"] == "8192"
+        assert env["VIBE_LENGTH_CONTINUATIONS"] == "3"
+        assert env["VIBE_MEMORY_TTL_DAYS"] == "180"
+        assert env["TICKFLOW_BASE_URL"] == "https://tickflow.example"
+        assert "NOT_FORWARDED_SETTING" not in env
+        assert "VIBE_ROUTER_SECRET" not in env
+
+    def test_byok_still_strips_the_builtin_anthropic_credentials(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "builtin")
+        monkeypatch.setenv("LANGCHAIN_STREAM_USAGE", "0")
+        llm = router.LlmOverride(provider="deepseek", model="deepseek-chat",
+                                 apiKey="k" * 10, baseUrl="https://api.deepseek.com")
+        env, _key = router.engine_env(None, llm)
+        assert "ANTHROPIC_API_KEY" not in env
+        assert env["LANGCHAIN_PROVIDER"] == "deepseek"
+        assert env["LANGCHAIN_STREAM_USAGE"] == "0"
+
+
+# ── Offline session delete also removes the session's runs ──────────────────
+
+
+class TestSessionsDeleteRemovesRuns:
+    @staticmethod
+    def _run(tenant: Path, run_id: str, session_id: str) -> Path:
+        d = tenant / "runs" / run_id
+        d.mkdir(parents=True)
+        (d / "req.json").write_text(json.dumps({"prompt": "p", "context": {"session_id": session_id}}))
+        (d / "trace.jsonl").write_text("{}\n")
+        return d
+
+    def test_offline_delete_removes_only_the_sessions_runs(self, tenant):
+        sess = tenant / "sessions" / "sess0010"
+        sess.mkdir(parents=True)
+        mine = self._run(tenant, "20260921_000001_aaaaaa", "sess0010")
+        theirs = self._run(tenant, "20260921_000002_bbbbbb", "sess0099")
+        noreq = tenant / "runs" / "20260921_000003_cccccc"
+        noreq.mkdir()
+        router.pool.pop(router.tenant_key(UID), None)
+
+        out = _run(router.sessions_delete(
+            router.SessionDeleteBody(uid=UID, session_id="sess0010"), authorization=AUTH))
+
+        assert out == {"ok": True, "mode": "offline", "deleted": True}
+        assert not sess.exists()
+        assert not mine.exists()
+        assert theirs.exists()
+        assert noreq.exists()
+
+    def test_runs_are_removed_even_when_the_session_dir_is_already_gone(self, tenant):
+        mine = self._run(tenant, "20260921_000004_dddddd", "sess0011")
+        router.pool.pop(router.tenant_key(UID), None)
+        out = _run(router.sessions_delete(
+            router.SessionDeleteBody(uid=UID, session_id="sess0011"), authorization=AUTH))
+        assert out == {"ok": True, "mode": "offline", "deleted": False}
+        assert not mine.exists()
+
+    def test_symlinked_run_dir_is_skipped_not_followed(self, tenant, tmp_path):
+        host_dir = tmp_path.parent / "host-run-del"
+        host_dir.mkdir(exist_ok=True)
+        (host_dir / "req.json").write_text(json.dumps({"context": {"session_id": "sess0012"}}))
+        (host_dir / "keep").write_text("k")
+        (tenant / "runs").mkdir()
+        (tenant / "runs" / "evilrun").symlink_to(host_dir)
+        (tenant / "sessions" / "sess0012").mkdir(parents=True)
+        router.pool.pop(router.tenant_key(UID), None)
+
+        out = _run(router.sessions_delete(
+            router.SessionDeleteBody(uid=UID, session_id="sess0012"), authorization=AUTH))
+
+        assert out["ok"] is True
+        assert (host_dir / "keep").exists()
+        assert (host_dir / "req.json").exists()
+
+
+# ── /memory/delete leaves an audit line ──────────────────────────────────────
+
+
+class TestMemoryDeleteIsAudited:
+    def test_delete_logs_tenant_name_and_existence(self, tenant, caplog):
+        mem = tenant / "memory"
+        mem.mkdir()
+        (mem / "project_x.md").write_text("---\nname: x\n---\nbody")
+        (mem / "MEMORY.md").write_text("- [x](project_x.md) — x\n- [y](project_y.md) — y\n")
+        import logging as _logging
+
+        with caplog.at_level(_logging.INFO, logger="cube-router"):
+            out = _run(router.memory_delete({"uid": UID, "name": "project_x.md"}, authorization=AUTH))
+
+        assert out == {"ok": True, "deleted": True}
+        assert (mem / "MEMORY.md").read_text() == "- [y](project_y.md) — y\n"
+        line = next(r.getMessage() for r in caplog.records if "memory/delete" in r.getMessage())
+        assert router.tenant_key(UID)[:8] in line
+        assert "project_x.md" in line and "existed=True" in line
+        assert not (mem / ".MEMORY.lock").is_symlink()

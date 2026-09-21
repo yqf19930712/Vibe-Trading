@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fcntl
 import hashlib
 import hmac
 import json
@@ -110,15 +111,29 @@ def budget_for(intent: Optional[str], explicit: Optional[int]) -> int:
 # attempt_id) so slow/failed asks can be traced without any extra infra.
 ASK_LOG = Path(os.environ.get("VIBE_ASK_LOG", "/var/lib/cube-router/ask_log.jsonl"))
 ASK_LOG_MAX_BYTES = 20 * 1024 * 1024
-# LLM / data-source env forwarded into each tenant engine (via launcher /boot).
+# LLM / data-source env forwarded into each tenant engine (via launcher /boot):
+# the explicit names below plus every router env var carrying one of the
+# FORWARD_ENV_PREFIXES. The engine reads its LLM knobs (thinking mode, output
+# cap, usage block, reasoning effort, …) from the LANGCHAIN_* / VIBE_ANTHROPIC_*
+# families, so the prefix rule is what lets router.env tune them without a
+# router code change; the explicit list carries the credentials and the
+# single-name knobs (VIBE_MAX_OUTPUT_TOKENS, VIBE_LENGTH_CONTINUATIONS, …).
 FORWARD_ENV = [
     "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_MODEL",
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-    "LANGCHAIN_PROVIDER", "LANGCHAIN_MODEL_NAME", "LANGCHAIN_TEMPERATURE",
-    "LANGCHAIN_NO_TEMPERATURE_MODELS",
+    "VIBE_MAX_OUTPUT_TOKENS", "VIBE_LENGTH_CONTINUATIONS", "VIBE_MEMORY_TTL_DAYS",
     "TUSHARE_TOKEN", "VIBE_TRADING_SEARCH_BACKENDS", "JINA_API_KEY",
-    "IFIND_MCP_TOKEN", "TICKFLOW_API_KEY",
+    "IFIND_MCP_TOKEN", "TICKFLOW_API_KEY", "TICKFLOW_BASE_URL",
 ]
+FORWARD_ENV_PREFIXES = ("LANGCHAIN_", "VIBE_ANTHROPIC_")
+
+
+def forwarded_env_names(environ: "dict[str, str] | os._Environ[str]" = os.environ) -> list[str]:
+    """Names in ``environ`` that engine_env() forwards (explicit list + prefixes)."""
+    return sorted(
+        k for k in environ
+        if k in FORWARD_ENV or k.startswith(FORWARD_ENV_PREFIXES)
+    )
 
 # In-guest egress tunnel credentials (optional): private key file on the host
 # + ssh destination (server B). Injected into each sandbox via launcher /boot.
@@ -168,7 +183,7 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
     Returns (env, api_key): the engine validates `Authorization: Bearer
     <API_AUTH_KEY>` on every non-loopback call, so the router must keep the
     key it minted for the instance."""
-    env = {k: os.environ[k] for k in FORWARD_ENV if k in os.environ}
+    env = {k: os.environ[k] for k in forwarded_env_names()}
     if llm is not None:
         for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
             env.pop(k, None)
@@ -221,9 +236,10 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
     ):
         env[key] = os.environ.get(key, default)
     # Whitelisted foreign egress: the launcher builds an in-guest SSH tunnel
-    # to server B's loopback tinyproxy (domain filter there); web_search and
-    # the yfinance loader then use VIBE_TRADING_EGRESS_PROXY. Key material is
-    # consumed by the launcher and never enters the engine process env.
+    # to server B's loopback tinyproxy (domain filter there); web_search,
+    # read_url (r.jina.ai) and the yfinance loader then use
+    # VIBE_TRADING_EGRESS_PROXY. Key material is consumed by the launcher and
+    # never enters the engine process env.
     if _EGRESS_KEY_B64 and EGRESS_SSH_DEST:
         env["VIBE_EGRESS_SSH_KEY_B64"] = _EGRESS_KEY_B64
         env["VIBE_EGRESS_SSH_DEST"] = EGRESS_SSH_DEST
@@ -1152,19 +1168,23 @@ def _rmtree_tenant_dir(path: Path) -> Optional[str]:
 # ── Per-session deletion (laicai "删除对话" → engine session) ────────────────
 # laicai deletes a chat thread; the bound engine session (messages.jsonl,
 # trace.jsonl with every prompt, transcript_*.jsonl compaction dumps,
-# handoff.json) used to stay on the host forever — the only purge path was
-# the whole-tenant /forget at account deletion (P1 2026-09-04).
+# handoff.json) and the ``runs/<id>`` directories it produced (linked through
+# ``req.json`` ``context.session_id``) go with it — otherwise the only purge
+# path would be the whole-tenant /forget at account deletion.
 #
 # Two modes, chosen by the router, reported back in ``mode``:
 #   engine  — the tenant's sandbox is up: DELETE /sessions/{id} on the engine,
-#             which cancels a live loop, drops the dir AND its sessions.db FTS
-#             rows (search would otherwise keep returning a dead session).
+#             which cancels a live loop, drops the dir, its runs AND its
+#             sessions.db FTS rows (search would otherwise keep returning the
+#             deleted conversation).
 #   offline — no running sandbox (never created / paused / evicted): the
-#             session dir is removed straight off the host bind-mount. FTS
-#             rows in sessions.db are NOT touched from the host (the engine
-#             may hold WAL state in the frozen VM); the engine's session_search
-#             tolerates a missing dir and the row is dropped on the next
-#             reindex.
+#             session dir and its runs are removed straight off the host
+#             bind-mount. FTS / goal-ledger rows in sessions.db are NOT touched
+#             from the host (the engine may hold WAL state in the frozen VM):
+#             the engine drops them itself — at its next start
+#             (``SessionService.reconcile_orphans``) and on sight during
+#             ``session_search`` (a hit whose directory is gone is deleted,
+#             not returned).
 # Idempotent: a session that is already gone answers ok=true, deleted=false.
 
 
@@ -1173,27 +1193,64 @@ class SessionDeleteBody(BaseModel):
     session_id: str
 
 
+def _session_run_dirs(root: Path, session_id: str) -> list[Path]:
+    """``runs/<id>`` dirs under the tenant whose ``req.json`` names ``session_id``.
+
+    Every candidate passes :func:`_safe_tenant_path` (a symlinked run dir or
+    ``req.json`` is skipped, never followed). Cost is one small JSON read per
+    run directory, paid only on a session delete.
+    """
+    runs = _safe_tenant_path(root, root / "runs")
+    if runs is None or not runs.is_dir():
+        return []
+    out: list[Path] = []
+    for d in runs.iterdir():
+        if d.is_symlink() or not d.is_dir() or _safe_tenant_path(runs, d) is None:
+            continue
+        req = _safe_tenant_path(d, d / "req.json")
+        if req is None or not req.is_file():
+            continue
+        try:
+            data = json.loads(req.read_text("utf-8", "replace"))
+        except (OSError, ValueError):
+            continue
+        ctx = data.get("context") if isinstance(data, dict) else None
+        if isinstance(ctx, dict) and ctx.get("session_id") == session_id:
+            out.append(d)
+    return out
+
+
+def _rmtree_collect(path: Path, failures: list[str]) -> None:
+    def _onerror(_fn: Any, p: Any, exc_info: Any) -> None:
+        failures.append(f"{Path(str(p)).name}: {exc_info[1]}")
+
+    shutil.rmtree(path, onerror=_onerror)
+
+
 def _remove_session_dir(uid: str, session_id: str) -> tuple[bool, Optional[str]]:
-    """Remove ``DATA_ROOT/<tk>/sessions/<sid>`` from the host.
+    """Remove ``DATA_ROOT/<tk>/sessions/<sid>`` and the session's run dirs.
 
     Returns:
-        ``(removed, error)`` — ``removed`` is False when nothing was there;
-        ``error`` is set when the dir exists but could not be removed
-        (or is a symlink, which is refused rather than followed).
+        ``(removed, error)`` — ``removed`` is False when no session dir was
+        there (its runs, if any, are still removed); ``error`` is set when a
+        dir exists but could not be removed (or the session dir is a symlink,
+        which is refused rather than followed).
     """
     root = _tenant_root(uid)
     candidate = root / "sessions" / session_id
     if candidate.is_symlink():
         return False, f"session dir {session_id} is a symlink; refusing to remove"
+    failures: list[str] = []
+    for run_dir in _session_run_dirs(root, session_id):
+        _rmtree_collect(run_dir, failures)
+        if run_dir.exists():
+            failures.append(f"{run_dir.name}: still present")
     path = _safe_tenant_path(root, candidate)
     if path is None or not path.is_dir():
+        if failures:
+            return False, f"run dir removal incomplete ({'; '.join(failures[:3])})"
         return False, None
-    failures: list[str] = []
-
-    def _onerror(_fn: Any, p: Any, exc_info: Any) -> None:
-        failures.append(f"{Path(str(p)).name}: {exc_info[1]}")
-
-    shutil.rmtree(path, onerror=_onerror)
+    _rmtree_collect(path, failures)
     if failures or path.exists():
         return False, f"session dir removal incomplete ({'; '.join(failures[:3])})"
     return True, None
@@ -1561,25 +1618,49 @@ async def memory_delete(body: dict, authorization: Optional[str] = Header(None))
         raise HTTPException(404, "not found")
 
     def _delete() -> bool:
-        existed = path.is_file()
-        if existed:
-            path.unlink()
-        # The index is rewritten in place: refuse when it is (or sits under)
-        # a symlink, otherwise root would write through it (P0 2026-09-04).
-        idx = _safe_tenant_path(d, d / "MEMORY.md")
-        if idx is not None and idx.is_file():
+        # Same flock the engine takes around every index rewrite
+        # (``memory/persistent.py``), so this edit cannot race an attempt's
+        # add/consolidate on the frozen-VM side. The lock file is opened
+        # O_NOFOLLOW and guarded like every other tenant path.
+        lock_path = _safe_tenant_path(d, d / ".MEMORY.lock")
+        lock_fd: Optional[int] = None
+        if lock_path is not None:
             try:
-                lines = idx.read_text("utf-8", "replace").splitlines(keepends=True)
-                kept = [l for l in lines if f"({name})" not in l]
-                if len(kept) != len(lines):
-                    tmp = idx.with_name(f".{idx.name}.{os.getpid()}.tmp")
-                    tmp.write_text("".join(kept), encoding="utf-8")
-                    tmp.replace(idx)
+                lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
             except OSError:
-                pass  # index cleanup is best-effort; the engine tolerates drift
+                if lock_fd is not None:
+                    os.close(lock_fd)
+                lock_fd = None
+        try:
+            existed = path.is_file()
+            if existed:
+                path.unlink()
+            # The index is rewritten in place: refuse when it is (or sits under)
+            # a symlink, otherwise root would write through it.
+            idx = _safe_tenant_path(d, d / "MEMORY.md")
+            if idx is not None and idx.is_file():
+                try:
+                    lines = idx.read_text("utf-8", "replace").splitlines(keepends=True)
+                    kept = [l for l in lines if f"({name})" not in l]
+                    if len(kept) != len(lines):
+                        tmp = idx.with_name(f".{idx.name}.{os.getpid()}.tmp")
+                        tmp.write_text("".join(kept), encoding="utf-8")
+                        tmp.replace(idx)
+                except OSError:
+                    pass  # index cleanup is best-effort; the engine tolerates drift
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
         return existed
 
     existed = await asyncio.to_thread(_delete)
+    # Audit line: the only record of "which memory was removed, for which
+    # tenant, when" once the file is gone.
+    log.info("memory/delete tenant %s name %s existed=%s", tenant_key(uid)[:8], name, existed)
     return {"ok": True, "deleted": existed}
 
 

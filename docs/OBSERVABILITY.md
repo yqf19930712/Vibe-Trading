@@ -230,20 +230,21 @@ flowchart LR
     subgraph guest["租户 MicroVM"]
         L["launcher<br/>ssh -N -L 127.0.0.1:8118"]
         WS["web_search (ddgs)"]
+        RU["read_url (r.jina.ai)"]
         YF["yfinance loader"]
     end
     B["服务器B tinyproxy<br/>127.0.0.1:8888<br/>域名白名单 FilterDefaultDeny"]
-    NET["yahoo / 搜索引擎<br/>wikipedia 等白名单域"]
+    NET["yahoo / 搜索引擎 / r.jina.ai<br/>wikipedia 等白名单域"]
 
-    WS & YF -- "VIBE_TRADING_EGRESS_PROXY<br/>http://127.0.0.1:8118" --> L
+    WS & RU & YF -- "VIBE_TRADING_EGRESS_PROXY<br/>http://127.0.0.1:8118" --> L
     L == "SSH 加密（GFW 无感）" ==> B
     B --> NET
 ```
 
 - **launcher**（`ops/cube-engine/launcher.py`）：`/boot` env 携带 `VIBE_EGRESS_SSH_KEY_B64`/`VIBE_EGRESS_SSH_DEST` 时写 key（0600）并拉起隧道；key 材料被 launcher **pop 消费，不进引擎进程 env**。`/health` 顺带自愈重拉（≥10s 间隔）并上报 `egress_tunnel: up|down|off`。镜像含 `openssh-client`。
 - **密钥约束**：B 端 `authorized_keys` 对该 key `restrict,port-forwarding,permitopen="127.0.0.1:8888"`——即使租户在沙箱内读到私钥，能获得的也只是白名单代理本身，无 shell、无其他转发。
-- **B 端 tinyproxy**：仅监听 loopback；`Filter` + `FilterDefaultDeny` 域名白名单（yahoo/yimg、各搜索引擎、wikipedia/wikimedia、startpage、grokipedia）。**laicai market-data 的 md 隧道流量同受此白名单约束**——market-data 新增境外域时要同步加白名单。
-- **使用方（这就是"白名单"的第二层）**：只有 `web_search`（DDGS 的 `proxy` 参数，兼容旧版 `proxies` 命名）和 `yfinance` loader（`yf.download(proxy=…)`，对删掉该参数的新版 TypeError 回退直连）读 `VIBE_TRADING_EGRESS_PROXY`。国内数据源（tushare/东财/腾讯/akshare/mootdx）与 LLM 上游**一律直连**——绝不能设全局 `HTTP(S)_PROXY`。
+- **B 端 tinyproxy**：仅监听 loopback；`Filter` + `FilterDefaultDeny` 域名白名单，须放行的域按消费方分三组：yahoo/yimg（yfinance）、各搜索引擎 + wikipedia/wikimedia + startpage + grokipedia（web_search）、**`r.jina.ai`（read_url）**。**laicai market-data 的 md 隧道流量同受此白名单约束**——market-data 新增境外域时要同步加白名单。
+- **使用方（这就是"白名单"的第二层）**：三个消费方读 `VIBE_TRADING_EGRESS_PROXY`——`web_search`（DDGS 的 `proxy` 参数，兼容旧版 `proxies` 命名）、`read_url`（`tools/web_reader_tool.py`，`requests.get(..., proxies=…)` 访问 `r.jina.ai`，连接 5s / 读 30s；不设代理时直连）和 `yfinance` loader（`yf.download(proxy=…)`，对删掉该参数的新版 TypeError 回退直连）。国内数据源（tushare/东财/腾讯/akshare/mootdx）与 LLM 上游**一律直连**——绝不能设全局 `HTTP(S)_PROXY`。
 - **搜索后端**：ddgs 9.x 已移除 google/bing；默认 `VIBE_TRADING_SEARCH_BACKENDS=auto` 轮询其全部引擎（含 wikipedia/grokipedia 兜底）。数据中心出口 IP 被各引擎随机反爬属常态，空结果时模型会如实报告并转国内源。
 
 ## 7. router 侧观测
@@ -315,8 +316,13 @@ laicai 侧实现在主仓库（桥接 `app/src/server/vibe-trading.ts`、落库 
 | `VIBE_TOOL_CIRCUIT_FAILURE_LIMIT` | 3 | 同一 (工具, 参数) 连续失败几次后熔断该调用；命中写 `tool_circuit_open` |
 | `VIBE_EMPTY_RESPONSE_RETRIES` | 1 | 流成功但返回空 turn 时的就地重试次数（0 = 一次即判败） |
 | `VIBE_LENGTH_CONTINUATIONS` | 2 | `finish_reason=length` 的续写次数（占正常迭代）；用尽或已是最后一轮则答案末尾附「（输出被截断）」 |
-| `VIBE_MAX_OUTPUT_TOKENS` | 无 | 单次回复输出 token 上限，两通道共用；不设则原生 Anthropic 通道 32000、OpenAI 兼容通道 8192（兼容端点都接受的最宽值：过大是 400 硬错，过小只是可续写的截断）。router 不下发 |
-| `VIBE_ANTHROPIC_MAX_TOKENS` | 无 | 只覆盖原生 Anthropic 通道的上限，优先于 `VIBE_MAX_OUTPUT_TOKENS`。router 不下发 |
+| `VIBE_MAX_OUTPUT_TOKENS` | 无 | 单次回复输出 token 上限，两通道共用；不设则原生 Anthropic 通道 32000、OpenAI 兼容通道 8192（兼容端点都接受的最宽值：过大是 400 硬错，过小只是可续写的截断）。router.env 里设了即原样转发 |
+| `VIBE_ANTHROPIC_MAX_TOKENS` | 无 | 只覆盖原生 Anthropic 通道的上限，优先于 `VIBE_MAX_OUTPUT_TOKENS`。按 `VIBE_ANTHROPIC_*` 前缀转发 |
+| `VIBE_ANTHROPIC_THINKING` | 空（模型名含 `-5` 时 adaptive，否则 off） | 原生 Anthropic 通道的 thinking 模式：`adaptive` 或 `off`（预算式 thinking 未接线，opus-5 系列拒绝它）。按 `VIBE_ANTHROPIC_*` 前缀转发 |
+| `LANGCHAIN_REASONING_EFFORT` | 空 | OpenAI 兼容通道的 reasoning effort（`low`/`medium`/`high`），空 = 不发该字段。按 `LANGCHAIN_*` 前缀转发 |
+| `LANGCHAIN_STREAM_USAGE` | 1 | 流式请求带 `stream_options.include_usage`；`0`/`false` 关闭，此时 `llm_usage` 事件恒空。按前缀转发 |
+| `TICKFLOW_BASE_URL` | loader 内置默认 | TickFlow 美股备源的接口根地址。显式转发 |
+| `VIBE_MEMORY_TTL_DAYS` | 无（永不过期） | 长期记忆非 `user` 条目的软过期天数：超期条目退出索引快照与自动召回，文件保留。显式转发 |
 | `TIMEOUT_SECONDS` | 120（**300**） | LLM 流式读超时（httpx）。opus 级长上下文的思考停顿可超 120s，300 能熬过停顿而真死的上游仍在一个 worker 迭代内失败 |
 | `VIBE_TRADING_FETCH_BUDGET_S` | 120 | market_data 单次调用含降级链的总预算 |
 | `VIBE_SOCKET_TIMEOUT_S` | 30 | 阻塞 socket 默认超时兜底 |
@@ -324,7 +330,7 @@ laicai 侧实现在主仓库（桥接 `app/src/server/vibe-trading.ts`、落库 
 | `VIBE_TRADING_DATA_CACHE` | off（**1**） | loader parquet 缓存 |
 | `VIBE_TRADING_SEARCH_BACKENDS` | auto | ddgs 后端列表 |
 | `VIBE_TRADING_ALLOWED_FILE_ROOTS` | 无（**/tmp**） | 文件工具在租户数据根之外额外放行的目录 |
-| `VIBE_TRADING_EGRESS_PROXY` | 无（**http://127.0.0.1:8118**，配了 egress key 才注入） | web_search/yfinance 专用出境代理 |
+| `VIBE_TRADING_EGRESS_PROXY` | 无（**http://127.0.0.1:8118**，配了 egress key 才注入） | web_search / read_url / yfinance 专用出境代理（§6） |
 
 以上变量中，凡名字带 `_KEY`/`_TOKEN`/`_SECRET`/`_PASSWORD` 段或 `OPENAI_`/`ANTHROPIC_`/`LANGCHAIN_` 前缀的都**不会**进入 `bash`/`background_run` 子进程；`VIBE_*` 全部透传（`src/tools/subprocess_env.py`）。
 
