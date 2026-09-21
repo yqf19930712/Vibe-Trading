@@ -218,7 +218,7 @@ router 侧的 `max(60, …)` 下限意味着引擎拿到的 `deadline_s` 永远�
 - **默认 `max_rows=120`**（半个交易年的日线），一个标的的默认调用落在 10k 字符的轨迹预算之内（`TOOL_RESULT_LIMIT`），不再每次落盘。更长区间按等步长降采样（末根 bar 钉住），`truncated=true`；`max_rows=0` 取全量（必然落盘）。
 - **参数 schema**：`source` 是 enum，`auto` + `backtest.loaders.registry.VALID_SOURCES` 里注册的全部 loader 名（动态取，registry 导入失败才回退到静态清单）；`interval` 是 enum `1m/5m/15m/30m/1H/4H/1D/1W/1M`（`1D` 全源支持，分钟/小时线 okx/ccxt/tushare/mootdx/futu/yfinance，周/月线 mootdx/futu/akshare）。
 - **超 10k 的结构化预览**：不是盲切字符——每个标的保留 `summary` + 首尾各 20 根 bar（`MARKET_DATA_EDGE_ROWS`；多标的仍超限时收缩到首尾 5 根，再超才退回通用 head+tail 信封），`rows_omitted` 记中段丢弃数，预览本身是合法 JSON，并明说「中段 bar 不是数据源缺失」。全量落盘 `run_dir/tool-results/<iter>-get_market_data-<callid8>.json`，**每根 bar 一行**，`read_file(offset, limit)` 按行翻页即按 bar 翻页、`grep -n <日期>` 直接定位。
-- 其他工具的单行 JSON 结果落盘前按 `indent=1` 重排成多行（否则 `read_file` 的行翻页永远只有一行）；`load_skill` 的落盘是 `.md` 原文（见 SKILLS.md §2）；`bash` 的落盘是纯文本流（stdout，stderr 接在 `--- stderr ---` 行之后，文件名 `<iter>-bash-<callid>.txt`），工具本身整段返回、不再另裁另存（只剩 100 万字符的内存护栏）；`read_file` 默认一页 200 行，超限结果只做 head+tail 预览、**不落盘副本**，预览指回源文件的 offset/limit。信封里的翻页提示只指向 `read_file` 与 bash `grep -n`（引擎没有 `grep_file` 工具）。
+- 其他工具的单行 JSON 结果落盘前按 `indent=1` 重排成多行（否则 `read_file` 的行翻页永远只有一行）；`load_skill` 的落盘是 `.md` 原文（见 SKILLS.md §2）；`bash` 的落盘是纯文本流（stdout，stderr 接在 `--- stderr ---` 行之后，文件名 `<iter>-bash-<callid>.txt`），工具本身整段返回、不再另裁另存（只剩每路流 100 万字符的流式硬上限：超过即杀进程组、保留前缀并标记，`output_capped` 字段列出命中的流）；`read_file` 默认一页 200 行，超限结果只做 head+tail 预览、**不落盘副本**，预览指回源文件的 offset/limit。信封里的翻页提示只指向 `read_file` 与 bash `grep -n`（引擎没有 `grep_file` 工具）。
 - grounding 校验器（`verify.extract_reference_prices`）与结构化截断共用 `market_data.table_rows()` 读表，旧的 record 列表形状仍可解析。
 
 ## 6. 出境代理（白名单 egress）
@@ -316,7 +316,7 @@ laicai 侧实现在主仓库（桥接 `app/src/server/vibe-trading.ts`、落库 
 | `VIBE_TOOL_CIRCUIT_FAILURE_LIMIT` | 3 | 同一 (工具, 参数) 连续失败几次后熔断该调用；命中写 `tool_circuit_open` |
 | `VIBE_EMPTY_RESPONSE_RETRIES` | 1 | 流成功但返回空 turn 时的就地重试次数（0 = 一次即判败） |
 | `VIBE_LENGTH_CONTINUATIONS` | 2 | `finish_reason=length` 的续写次数（占正常迭代）；用尽或已是最后一轮则答案末尾附「（输出被截断）」 |
-| `VIBE_MAX_OUTPUT_TOKENS` | 无 | 单次回复输出 token 上限，两通道共用；不设则原生 Anthropic 通道 32000、OpenAI 兼容通道 8192（兼容端点都接受的最宽值：过大是 400 硬错，过小只是可续写的截断）。router.env 里设了即原样转发 |
+| `VIBE_MAX_OUTPUT_TOKENS` | 无 | 单次回复输出 token 上限，两通道共用；不设则原生 Anthropic 通道 32000、OpenAI 兼容通道**不发上限字段**（由端点自己封顶，截断可续写）。设了以后兼容通道经 `ChatOpenAI` 发出的字段名是 `max_completion_tokens`（langchain-deepseek 原生适配器才是 `max_tokens`），设前要确认目标端点认这个字段。router.env 里设了即原样转发 |
 | `VIBE_ANTHROPIC_MAX_TOKENS` | 无 | 只覆盖原生 Anthropic 通道的上限，优先于 `VIBE_MAX_OUTPUT_TOKENS`。按 `VIBE_ANTHROPIC_*` 前缀转发 |
 | `VIBE_ANTHROPIC_THINKING` | 空（模型名含 `-5` 时 adaptive，否则 off） | 原生 Anthropic 通道的 thinking 模式：`adaptive` 或 `off`（预算式 thinking 未接线，opus-5 系列拒绝它）。按 `VIBE_ANTHROPIC_*` 前缀转发 |
 | `LANGCHAIN_REASONING_EFFORT` | 空 | OpenAI 兼容通道的 reasoning effort（`low`/`medium`/`high`），空 = 不发该字段。按 `LANGCHAIN_*` 前缀转发 |
