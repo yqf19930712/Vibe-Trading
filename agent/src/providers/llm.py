@@ -361,19 +361,22 @@ _ENV_LABELS = ("~/.vibe-trading/.env", "<AGENT_DIR>/.env", "<CWD>/.env")
 
 logger = logging.getLogger(__name__)
 
-# One output-token ceiling per model reply, read by both channels.
-# ``VIBE_MAX_OUTPUT_TOKENS`` applies to both when set (``VIBE_ANTHROPIC_MAX_TOKENS``
-# still wins on the native channel); unset, each channel keeps its own
-# default. The OpenAI-compatible default is the widest ceiling every known
-# compatible endpoint accepts (deepseek-chat / qwen reject a larger value with
-# a 400) — an over-large ceiling is a hard request error, a small one only
-# truncates, and a truncated reply is continued by the loop
-# (``finish_reason == "length"``).
+# One output-token ceiling per model reply. The native Anthropic channel
+# always sends one (``VIBE_ANTHROPIC_MAX_TOKENS`` wins, then the shared
+# ``VIBE_MAX_OUTPUT_TOKENS``, then the default below). The OpenAI-compatible
+# channel sends a ceiling only when ``VIBE_MAX_OUTPUT_TOKENS`` is set:
+# ``ChatOpenAI`` renames ``max_tokens`` to ``max_completion_tokens`` in every
+# request (``_default_params`` and ``_get_request_payload``, so
+# ``model_kwargs={"max_tokens": …}`` is renamed too — langchain-openai 1.3
+# has no switch to keep the legacy name; only ``BaseChatOpenAI`` subclasses
+# such as ``ChatDeepSeek`` still send ``max_tokens``), and whether a given
+# compatible endpoint accepts that field is unknown until tried, so the
+# default is to send nothing and let the endpoint apply its own cap.
+# A truncated reply is continued by the loop (``finish_reason == "length"``).
 ANTHROPIC_MAX_OUTPUT_TOKENS_DEFAULT = 32000
-OPENAI_COMPAT_MAX_OUTPUT_TOKENS_DEFAULT = 8192
 
 
-def max_output_tokens(channel: str) -> int:
+def max_output_tokens(channel: str) -> Optional[int]:
     """Return the max output tokens for one reply on ``channel``.
 
     Args:
@@ -381,7 +384,8 @@ def max_output_tokens(channel: str) -> int:
             else for the OpenAI-compatible path.
 
     Returns:
-        Positive token ceiling.
+        Positive token ceiling, or ``None`` when the OpenAI-compatible
+        channel should not send one (``VIBE_MAX_OUTPUT_TOKENS`` unset).
     """
     shared = os.getenv("VIBE_MAX_OUTPUT_TOKENS", "").strip()
     if channel == "anthropic":
@@ -389,7 +393,7 @@ def max_output_tokens(channel: str) -> int:
         if native:
             return int(native)
         return int(shared) if shared else ANTHROPIC_MAX_OUTPUT_TOKENS_DEFAULT
-    return int(shared) if shared else OPENAI_COMPAT_MAX_OUTPUT_TOKENS_DEFAULT
+    return int(shared) if shared else None
 
 
 _dotenv_loaded: bool = False
@@ -501,6 +505,8 @@ def _build_native_deepseek(
         temperature=temperature,
         timeout=int(os.getenv("TIMEOUT_SECONDS", "120")),
         max_retries=int(os.getenv("MAX_RETRIES", "2")),
+        # None = no ceiling field in the request (ChatDeepSeek sends the
+        # legacy ``max_tokens`` name when one is set).
         max_tokens=max_output_tokens("openai"),
         callbacks=callbacks,
         api_key=api_key or None,
@@ -946,6 +952,8 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         "temperature": temperature_param,
         "timeout": int(os.getenv("TIMEOUT_SECONDS", "120")),
         "max_retries": int(os.getenv("MAX_RETRIES", "2")),
+        # None = no ceiling field in the request; a value goes out as
+        # ``max_completion_tokens`` (ChatOpenAI renames it, see max_output_tokens).
         "max_tokens": max_output_tokens("openai"),
         "stream_usage": stream_usage,
         "callbacks": callbacks,

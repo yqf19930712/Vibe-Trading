@@ -559,6 +559,23 @@ class TestForwardedEnv:
         assert "NOT_FORWARDED_SETTING" not in env
         assert "VIBE_ROUTER_SECRET" not in env
 
+    def test_langsmith_names_never_ride_the_prefix_rule(self, monkeypatch):
+        """Tracing credentials in router.env must not reach a tenant engine."""
+        for name in ("LANGCHAIN_API_KEY", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING",
+                     "LANGCHAIN_ENDPOINT", "LANGCHAIN_PROJECT", "LANGCHAIN_SESSION",
+                     "LANGSMITH_API_KEY", "LANGSMITH_TRACING", "LANGSMITH_ENDPOINT"):
+            monkeypatch.setenv(name, "leak")
+        monkeypatch.setenv("LANGCHAIN_STREAM_USAGE", "0")
+        monkeypatch.setenv("LANGCHAIN_MODEL_NAME", "m")
+
+        names = router.forwarded_env_names()
+        env, _key = router.engine_env(None, None)
+
+        assert not [n for n in names if n in router.FORWARD_ENV_DENY or n.startswith("LANGSMITH_")]
+        assert not [k for k, v in env.items() if v == "leak"]
+        assert env["LANGCHAIN_STREAM_USAGE"] == "0"
+        assert env["LANGCHAIN_MODEL_NAME"] == "m"
+
     def test_byok_still_strips_the_builtin_anthropic_credentials(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "builtin")
         monkeypatch.setenv("LANGCHAIN_STREAM_USAGE", "0")
@@ -646,3 +663,52 @@ class TestMemoryDeleteIsAudited:
         assert router.tenant_key(UID)[:8] in line
         assert "project_x.md" in line and "existed=True" in line
         assert not (mem / ".MEMORY.lock").is_symlink()
+
+
+# ── /memory/delete never waits on the index lock past the bound ─────────────
+
+
+class TestMemoryDeleteLockIsBounded:
+    def test_busy_lock_is_waited_for_at_most_the_bound_then_bypassed(self, tenant, monkeypatch, caplog):
+        import fcntl as _fcntl
+        import logging as _logging
+        import time as _time
+
+        mem = tenant / "memory"
+        mem.mkdir()
+        (mem / "project_x.md").write_text("---\nname: x\n---\nbody")
+        (mem / "MEMORY.md").write_text("- [x](project_x.md) — x\n- [y](project_y.md) — y\n")
+        monkeypatch.setattr(router, "MEMORY_LOCK_TIMEOUT_S", 0.3)
+        # Another open file description holding the lock (as a concurrent
+        # host-side editor would) — flock conflicts across descriptions
+        # even within one process.
+        holder = os.open(mem / ".MEMORY.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        _fcntl.flock(holder, _fcntl.LOCK_EX)
+        try:
+            t0 = _time.monotonic()
+            with caplog.at_level(_logging.WARNING, logger="cube-router"):
+                out = _run(router.memory_delete({"uid": UID, "name": "project_x.md"}, authorization=AUTH))
+            elapsed = _time.monotonic() - t0
+        finally:
+            _fcntl.flock(holder, _fcntl.LOCK_UN)
+            os.close(holder)
+
+        assert out == {"ok": True, "deleted": True}
+        assert 0.3 <= elapsed < 3.0, elapsed
+        assert (mem / "MEMORY.md").read_text() == "- [y](project_y.md) — y\n"
+        assert any("index lock busy" in r.getMessage() for r in caplog.records)
+
+    def test_free_lock_is_taken_and_released(self, tenant):
+        import fcntl as _fcntl
+
+        mem = tenant / "memory"
+        mem.mkdir()
+        (mem / "project_x.md").write_text("x")
+        out = _run(router.memory_delete({"uid": UID, "name": "project_x.md"}, authorization=AUTH))
+        assert out["deleted"] is True
+        # Released: a fresh description can take it without waiting.
+        fd = os.open(mem / ".MEMORY.lock", os.O_RDWR)
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        finally:
+            os.close(fd)

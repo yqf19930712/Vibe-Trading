@@ -126,13 +126,27 @@ FORWARD_ENV = [
     "IFIND_MCP_TOKEN", "TICKFLOW_API_KEY", "TICKFLOW_BASE_URL",
 ]
 FORWARD_ENV_PREFIXES = ("LANGCHAIN_", "VIBE_ANTHROPIC_")
+# LangSmith shares the LANGCHAIN_ namespace: with these set, langchain-core in
+# the tenant engine would upload every prompt (holdings included) to a
+# third-party tracing service, so they never ride the prefix rule — whatever
+# router.env contains. Names from langchain-core / langsmith's own env lookups.
+FORWARD_ENV_DENY = frozenset({
+    "LANGCHAIN_API_KEY", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING",
+    "LANGCHAIN_ENDPOINT", "LANGCHAIN_BASE_URL", "LANGCHAIN_PROJECT",
+    "LANGCHAIN_SESSION", "LANGCHAIN_HANDLER", "LANGCHAIN_ENV",
+    "LANGCHAIN_CUSTOM_HEADERS", "LANGCHAIN_REVISION_ID",
+    "LANGCHAIN_HUB_API_URL", "LANGCHAIN_HUB_API_KEY",
+})
+FORWARD_ENV_DENY_PREFIXES = ("LANGSMITH_",)
 
 
 def forwarded_env_names(environ: "dict[str, str] | os._Environ[str]" = os.environ) -> list[str]:
-    """Names in ``environ`` that engine_env() forwards (explicit list + prefixes)."""
+    """Names in ``environ`` that engine_env() forwards (explicit list + prefixes − deny list)."""
     return sorted(
         k for k in environ
-        if k in FORWARD_ENV or k.startswith(FORWARD_ENV_PREFIXES)
+        if (k in FORWARD_ENV or k.startswith(FORWARD_ENV_PREFIXES))
+        and k not in FORWARD_ENV_DENY
+        and not k.startswith(FORWARD_ENV_DENY_PREFIXES)
     )
 
 # In-guest egress tunnel credentials (optional): private key file on the host
@@ -528,11 +542,18 @@ async def get_or_create(
         except BaseException as exc:
             if fresh:
                 # Never became a usable tenant instance: give the slot back
-                # and drop the half-made sandbox instead of leaking it.
+                # and drop the half-made sandbox instead of leaking it. On
+                # cancellation (client gone mid-boot) the delete runs
+                # detached so the cancel is not blocked on CubeAPI; the
+                # sandbox is in neither pool nor state, so nothing else
+                # would ever reap it.
                 if pool.get(tk) is inst:
                     pool.pop(tk, None)
-                if inst.sandbox_id and isinstance(exc, Exception):
-                    await sbx_delete(inst.sandbox_id)
+                if inst.sandbox_id:
+                    if isinstance(exc, Exception):
+                        await sbx_delete(inst.sandbox_id)
+                    else:
+                        _spawn(sbx_delete(inst.sandbox_id))
             raise
         finally:
             inst.booting = False
@@ -1599,6 +1620,24 @@ async def memory_list(uid: str, authorization: Optional[str] = Header(None)):
     return {"files": await asyncio.to_thread(_read)}
 
 
+# Upper bound on waiting for the memory index lock in /memory/delete.
+MEMORY_LOCK_TIMEOUT_S = float(os.environ.get("VIBE_MEMORY_LOCK_TIMEOUT_S", "5"))
+_MEMORY_LOCK_RETRY_S = 0.05
+
+
+def _flock_bounded(fd: int, timeout_s: float) -> bool:
+    """Take an exclusive flock on ``fd`` within ``timeout_s`` (non-blocking + retries)."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_MEMORY_LOCK_RETRY_S)
+
+
 @app.post("/memory/delete")
 async def memory_delete(body: dict, authorization: Optional[str] = Header(None)):
     """Permanently delete one memory file and its MEMORY.md index line."""
@@ -1617,16 +1656,26 @@ async def memory_delete(body: dict, authorization: Optional[str] = Header(None))
         raise HTTPException(404, "not found")
 
     def _delete() -> bool:
-        # Same flock the engine takes around every index rewrite
-        # (``memory/persistent.py``), so this edit cannot race an attempt's
-        # add/consolidate on the frozen-VM side. The lock file is opened
-        # O_NOFOLLOW and guarded like every other tenant path.
+        # Same lock file the engine takes around every index rewrite
+        # (``memory/persistent.py``). flock is only guaranteed to be shared
+        # between processes on the same kernel: the engine runs in a MicroVM
+        # whose view of this directory is a host mount, so this lock excludes
+        # concurrent host-side editors, not necessarily the guest. Taken with
+        # a bound (non-blocking + retries) so a lock nobody on this side can
+        # release never parks a worker thread; past the bound the delete
+        # proceeds unlocked — the engine rebuilds the index from the entry
+        # files, so index drift heals itself. Opened O_NOFOLLOW and guarded
+        # like every other tenant path.
         lock_path = _safe_tenant_path(d, d / ".MEMORY.lock")
         lock_fd: Optional[int] = None
         if lock_path is not None:
             try:
                 lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                if not _flock_bounded(lock_fd, MEMORY_LOCK_TIMEOUT_S):
+                    log.warning("memory/delete tenant %s: index lock busy for %.1fs; editing unlocked",
+                                tenant_key(uid)[:8], MEMORY_LOCK_TIMEOUT_S)
+                    os.close(lock_fd)
+                    lock_fd = None
             except OSError:
                 if lock_fd is not None:
                     os.close(lock_fd)

@@ -11,16 +11,18 @@ from typing import Any, Dict, List, Optional
 
 from src.agent.progress import emit_progress
 from src.agent.tools import BaseTool
-from src.tools.bash_tool import _OUTPUT_HARD_CAP, _audit_command, _cap_output
+from src.tools import bash_tool
+from src.tools.bash_tool import _OUTPUT_HARD_CAP, _audit_command, cap_marker, run_capped
 from src.tools.redaction import redact_secret_values
 from src.tools.subprocess_env import _subprocess_env
 
 WORKDIR = Path(__file__).resolve().parents[2]
 _TIMEOUT_S = 300
-# Output is kept whole (up to bash's memory hard cap, marked when it fires):
-# ``check_background`` hands it to the loop, whose single truncation layer
-# (``agent.tool_result_store``) previews it and offloads the full text for
-# ``read_file`` paging — a second clip here would leave that copy incomplete.
+# Output is kept whole (bash's streaming hard cap kills the process past
+# 1M chars per stream and marks the kept prefix): ``check_background`` hands
+# it to the loop, whose single truncation layer (``agent.tool_result_store``)
+# previews it and offloads the full text for ``read_file`` paging — a second
+# clip here would leave that copy incomplete.
 # Finished tasks are evicted oldest-first past this many entries; running
 # ones are never dropped. Bounds the per-process table (the singleton lives
 # as long as the engine does) without losing a result before it is read.
@@ -77,12 +79,15 @@ class BackgroundManager:
         try:
             # Allowlisted env only: never hand the engine's shared credentials
             # to a shell subprocess.
-            r = subprocess.run(command, shell=True, cwd=str(cwd or WORKDIR), env=_subprocess_env(),
-                               capture_output=True, text=True, timeout=_TIMEOUT_S,
-                               encoding="utf-8", errors="replace")
-            output = redact_secret_values(
-                (_cap_output(r.stdout, "stdout") + _cap_output(r.stderr, "stderr")).strip()
-            )
+            r = run_capped(command, cwd=str(cwd or WORKDIR), env=_subprocess_env(), timeout_s=_TIMEOUT_S)
+            stdout = r.stdout + (cap_marker("stdout") if "stdout" in r.capped else "")
+            stderr = r.stderr + (cap_marker("stderr") if "stderr" in r.capped else "")
+            output = redact_secret_values((stdout + stderr).strip())
+            if r.capped:
+                output = (
+                    f"[output capped: {', '.join(r.capped)} exceeded "
+                    f"{bash_tool._OUTPUT_HARD_CAP} chars; process killed]\n" + output
+                )
             status = "completed"
         except subprocess.TimeoutExpired:
             output, status = f"Timeout ({_TIMEOUT_S}s)", "timeout"
@@ -133,7 +138,8 @@ class BackgroundRunTool(BaseTool):
         "command runs in the current run_dir (same working directory and same "
         f"minimal no-credentials environment as bash), is killed after {_TIMEOUT_S}s, "
         "and its combined stdout+stderr is kept whole (same "
-        f"{_OUTPUT_HARD_CAP // 1_000_000}M-character memory guard as bash). Poll "
+        f"{_OUTPUT_HARD_CAP // 1_000_000}M-character-per-stream cap as bash: past it "
+        "the process is killed and only the kept prefix is returned, marked). Poll "
         "check_background(task_id=...) to get the status and output; a long "
         "result comes back as a preview with its full text offloaded to a file "
         "you can page with read_file, exactly like any other tool result."

@@ -4,22 +4,20 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from src.agent.tool_result_store import TOOL_RESULT_LIMIT, prepare_for_context
-from src.tools.bash_tool import (
-    _HARD_CAP_HEAD,
-    _HARD_CAP_TAIL,
-    _OUTPUT_HARD_CAP,
-    BashTool,
-    _audit_command,
-    _cap_output,
-)
+import src.tools.bash_tool as bash_mod
+from src.tools.bash_tool import BashTool, _audit_command, run_capped
 
 
 class TestSingleTruncationLayer:
     """bash returns its streams whole; the shared envelope is the only cut."""
 
-    def test_short_output_untouched(self) -> None:
-        assert _cap_output("hello", "stdout") == "hello"
+    def test_short_output_untouched(self, tmp_path) -> None:
+        body = json.loads(BashTool().execute(command="printf hello", run_dir=str(tmp_path)))
+        assert body["stdout"] == "hello"
+        assert "output_capped" not in body
 
     def test_60k_output_is_returned_whole_by_the_tool(self, tmp_path) -> None:
         body = json.loads(
@@ -48,16 +46,62 @@ class TestSingleTruncationLayer:
         assert "--- stderr ---" in payload  # the preview says how the file is laid out
         assert str(files[0]) in payload
 
-    def test_hard_cap_only_guards_memory_and_is_marked(self) -> None:
-        text = "H" * _HARD_CAP_HEAD + "M" * 50_000 + "T" * _HARD_CAP_TAIL
-        assert len(text) > _OUTPUT_HARD_CAP
-        out = _cap_output(text, "stdout")
-        assert out.startswith("H" * 100)
-        assert out.endswith("T" * 100)
-        assert "50000 chars dropped" in out
-        assert "M" * 10 not in out
-        # Anything up to the cap passes through untouched.
-        assert _cap_output("x" * _OUTPUT_HARD_CAP, "stdout") == "x" * _OUTPUT_HARD_CAP
+    def test_hard_cap_kills_the_producer_and_marks_the_kept_prefix(self, monkeypatch, tmp_path) -> None:
+        """The cap is enforced while reading: an endless producer ends at the cap, not the timeout."""
+        import time
+
+        monkeypatch.setattr(bash_mod, "_OUTPUT_HARD_CAP", 200_000)
+        t0 = time.monotonic()
+        body = json.loads(BashTool().execute(command="yes A", run_dir=str(tmp_path)))
+        assert time.monotonic() - t0 < 10.0
+        assert body["status"] == "error"
+        assert body["exit_code"] != 0
+        assert body["output_capped"] == ["stdout"]
+        kept, _, marker = body["stdout"].partition("\n\n...[stdout:")
+        assert len(kept) == 200_000 and set(kept) == {"A", "\n"}
+        assert "more than 200000 chars" in marker and "killed" in marker
+        assert body["stderr"] == ""
+
+    def test_stderr_is_capped_independently(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(bash_mod, "_OUTPUT_HARD_CAP", 100_000)
+        r = run_capped("echo out; yes E 1>&2", cwd=str(tmp_path), env=dict(PATH="/usr/bin:/bin"), timeout_s=10)
+        assert r.capped == ("stderr",)
+        assert r.stdout == "out\n"
+        assert len(r.stderr) == 100_000
+
+    def test_output_up_to_the_cap_passes_through_whole(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(bash_mod, "_OUTPUT_HARD_CAP", 100_000)
+        r = run_capped("head -c 100000 /dev/zero | tr '\\0' x", cwd=str(tmp_path), env=dict(PATH="/usr/bin:/bin"), timeout_s=10)
+        assert r.capped == ()
+        assert r.returncode == 0
+        assert r.stdout == "x" * 100_000
+
+    def test_timeout_kills_the_whole_process_group(self, tmp_path) -> None:
+        """A grandchild holding the pipe must not extend the wait past the timeout."""
+        import subprocess
+        import time
+
+        t0 = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired):
+            run_capped("(sleep 30; echo late) & sleep 30", cwd=str(tmp_path), env=dict(PATH="/usr/bin:/bin"), timeout_s=0.5)
+        assert time.monotonic() - t0 < 5.0
+
+    def test_background_run_shares_the_streaming_cap(self, monkeypatch, tmp_path) -> None:
+        import time
+
+        from src.tools.background_tools import BackgroundManager
+
+        monkeypatch.setattr(bash_mod, "_OUTPUT_HARD_CAP", 100_000)
+        mgr = BackgroundManager()
+        task_id = json.loads(mgr.run("yes B", cwd=tmp_path))["task_id"]
+        deadline = time.monotonic() + 10.0
+        while mgr.tasks[task_id]["status"] == "running" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        task = mgr.tasks[task_id]
+        assert task["status"] == "completed"
+        assert task["result"].startswith("[output capped: stdout exceeded 100000 chars; process killed]\n")
+        assert "...[stdout: the process produced more than 100000 chars" in task["result"]
+        assert len(task["result"]) < 100_000 + 500
 
     def test_trajectory_copy_is_bounded_by_the_shared_envelope(self) -> None:
         raw = json.dumps({"status": "ok", "exit_code": 0, "stdout": "y" * 30_000, "stderr": ""})
@@ -113,9 +157,9 @@ def test_bash_timeout_error_points_at_background_run(monkeypatch, tmp_path) -> N
     monkeypatch.setattr(bash_mod, "_DEFAULT_TIMEOUT", 0.05)
 
     def _boom(*args, **kwargs):
-        raise subprocess.TimeoutExpired(cmd="sleep 999", timeout=kwargs.get("timeout", 0))
+        raise subprocess.TimeoutExpired(cmd="sleep 999", timeout=kwargs.get("timeout_s", 0))
 
-    monkeypatch.setattr(bash_mod.subprocess, "run", _boom)
+    monkeypatch.setattr(bash_mod, "run_capped", _boom)
 
     payload = json.loads(
         bash_mod.BashTool().execute(command="sleep 999", run_dir=str(tmp_path))

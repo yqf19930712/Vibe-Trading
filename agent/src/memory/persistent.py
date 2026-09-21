@@ -229,8 +229,13 @@ class _DirLock:
     """Re-entrant per-directory lock: threading.RLock + ``flock`` on a lock file.
 
     The RLock serialises the attempts of one engine process (up to four run
-    concurrently); the file lock serialises against any other process that
-    edits the same memory directory. The file lock is taken only at the
+    concurrently); the file lock serialises against any other process on the
+    same kernel that edits the same memory directory. flock is not guaranteed
+    to cross a VM boundary: in the hosted deployment this directory is a host
+    mount into the MicroVM, so the lock holds inside the engine and among
+    host-side editors (cube-router ``/memory/delete``) respectively, not
+    between the two — cross-side races are tolerated because the index is
+    rebuilt from the entry files. The file lock is taken only at the
     outermost acquisition so nested calls (``consolidate`` → ``_rebuild_index``)
     do not deadlock. A lock file that cannot be opened (read-only volume) is
     tolerated: the in-process lock still holds.

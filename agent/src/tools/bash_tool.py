@@ -5,7 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from src.agent.progress import emit_progress
@@ -17,11 +22,16 @@ from src.tools.subprocess_env import _subprocess_env
 # layer every tool shares (``agent.tool_result_store``: 10k head+tail preview,
 # full streams offloaded to ``<run_dir>/tool-results/`` as plain text for
 # ``read_file`` paging), so this tool returns its streams whole. The hard cap
-# below is a resource guard only — it keeps a runaway process from parking an
-# unbounded string in memory — and is marked explicitly when it fires.
+# below is a resource guard on the process itself: each stream is read
+# incrementally and the process group is killed the moment one of them
+# exceeds the cap, so a runaway producer can neither park an unbounded string
+# in engine memory nor keep the sandbox busy until the timeout. The kept
+# prefix is marked explicitly when it fires.
 _OUTPUT_HARD_CAP = 1_000_000
-_HARD_CAP_HEAD = 800_000
-_HARD_CAP_TAIL = 200_000
+_READ_CHUNK = 65536
+# After the process (group) is gone, how long to wait for stragglers that
+# escaped the group and still hold a pipe before returning what was read.
+_DRAIN_GRACE_S = 2.0
 # Configurable (a bare hard-coded value has no relationship to the tenant's
 # own budget), and clamped per call by the attempt's remaining budget (``_effective_timeout``) so bash always returns
 # its own actionable "use background_run" error BEFORE the loop's write-tool
@@ -73,27 +83,121 @@ def _audit_command(command: str) -> list[str]:
     return [name for name, pattern in _DANGEROUS_PATTERNS if pattern.search(command)]
 
 
-def _cap_output(text: str, stream: str) -> str:
-    """Apply the resource hard cap to one stream (see ``_OUTPUT_HARD_CAP``).
+@dataclass(frozen=True)
+class CappedRun:
+    """Outcome of :func:`run_capped`.
 
-    Args:
-        text: Raw stream output.
-        stream: Stream label ("stdout"/"stderr") named in the marker.
-
-    Returns:
-        ``text`` unchanged when within the cap, otherwise head + explicit
-        marker + tail.
+    Attributes:
+        returncode: Process exit status (negative signal number when killed).
+        stdout: Decoded stdout, at most ``_OUTPUT_HARD_CAP`` bytes' worth.
+        stderr: Decoded stderr, same bound.
+        capped: Names of the streams that exceeded the cap (the process was
+            killed on the first one).
     """
-    if len(text) <= _OUTPUT_HARD_CAP:
-        return text
-    dropped = len(text) - _HARD_CAP_HEAD - _HARD_CAP_TAIL
+
+    returncode: int
+    stdout: str
+    stderr: str
+    capped: tuple[str, ...] = ()
+
+
+def _kill_tree(proc: subprocess.Popen[bytes]) -> None:
+    """SIGKILL the process group started for ``proc`` (falls back to the leader)."""
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:  # pragma: no cover - non-POSIX
+            proc.kill()
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def cap_marker(stream: str) -> str:
+    """Marker appended to a stream whose producer was killed at the cap."""
     return (
-        text[:_HARD_CAP_HEAD]
-        + f"\n\n...[{stream}: {dropped} chars dropped from the middle — the process "
-        f"produced more than {_OUTPUT_HARD_CAP} chars; rerun with a filter "
-        "(head/tail/grep) or redirect to a file under run_dir]...\n\n"
-        + text[-_HARD_CAP_TAIL:]
+        f"\n\n...[{stream}: the process produced more than {_OUTPUT_HARD_CAP} chars "
+        f"and was killed; only the first {_OUTPUT_HARD_CAP} chars were kept. "
+        "Rerun with a filter (head/tail/grep) or redirect to a file under run_dir]...\n"
     )
+
+
+def run_capped(
+    command: str,
+    *,
+    cwd: str | Path | None,
+    env: dict[str, str],
+    timeout_s: float,
+) -> CappedRun:
+    """Run ``command`` in a shell, streaming its output under the hard cap.
+
+    Both pipes are drained on reader threads; the first stream to exceed
+    ``_OUTPUT_HARD_CAP`` bytes kills the whole process group and the read
+    stops there. The process group is also killed on ``timeout_s`` — this
+    covers grandchildren of the shell, which ``subprocess.run`` leaves alive
+    (and blocks on, since they keep the pipes open).
+
+    Raises:
+        subprocess.TimeoutExpired: The process, or a child still holding a
+            pipe, outlived ``timeout_s``.
+    """
+    proc = subprocess.Popen(  # noqa: S602 - shell is the tool's contract
+        command,
+        shell=True,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=hasattr(os, "killpg"),
+    )
+    chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
+    capped: list[str] = []
+
+    def _drain(name: str, pipe: Any) -> None:
+        total = 0
+        try:
+            while True:
+                chunk = pipe.read1(_READ_CHUNK)
+                if not chunk:
+                    return
+                if total < _OUTPUT_HARD_CAP:
+                    chunks[name].append(chunk[: _OUTPUT_HARD_CAP - total])
+                total += len(chunk)
+                if total > _OUTPUT_HARD_CAP:
+                    capped.append(name)
+                    _kill_tree(proc)
+                    return
+        finally:
+            # Closing our end makes any writer that outlived the kill fail
+            # with EPIPE instead of blocking forever.
+            pipe.close()
+
+    readers = [
+        threading.Thread(target=_drain, args=(name, pipe), daemon=True, name=f"bash-{name}")
+        for name, pipe in (("stdout", proc.stdout), ("stderr", proc.stderr))
+    ]
+    for t in readers:
+        t.start()
+    deadline = time.monotonic() + timeout_s
+    try:
+        proc.wait(timeout=timeout_s)
+        for t in readers:
+            t.join(max(0.0, deadline - time.monotonic()))
+        if any(t.is_alive() for t in readers):
+            raise subprocess.TimeoutExpired(command, timeout_s)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        proc.wait()
+        for t in readers:
+            t.join(_DRAIN_GRACE_S)
+        raise subprocess.TimeoutExpired(command, timeout_s) from None
+
+    def _text(name: str) -> str:
+        return b"".join(chunks[name]).decode("utf-8", errors="replace")
+
+    return CappedRun(proc.returncode, _text("stdout"), _text("stderr"), tuple(capped))
 
 
 class BashTool(BaseTool):
@@ -146,30 +250,25 @@ class BashTool(BaseTool):
 
         timeout_s = _effective_timeout()
         try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                cwd=cwd,
-                # Allowlisted env only: the engine process
-                # env carries tenant-shared LLM/data-source credentials.
-                env=_subprocess_env(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=timeout_s,
-                encoding="utf-8",
-                errors="replace",
-            )
+            # Allowlisted env only: the engine process env carries
+            # tenant-shared LLM/data-source credentials.
+            result = run_capped(command, cwd=cwd, env=_subprocess_env(), timeout_s=timeout_s)
             # Value-based scrub here so neither the trajectory copy nor the
             # offloaded full copy (tool_result_store) carries a secret.
             stdout = redact_secret_values(result.stdout)
             stderr = redact_secret_values(result.stderr)
+            if "stdout" in result.capped:
+                stdout += cap_marker("stdout")
+            if "stderr" in result.capped:
+                stderr += cap_marker("stderr")
             payload: dict[str, Any] = {
                 "status": "ok" if result.returncode == 0 else "error",
                 "exit_code": result.returncode,
-                "stdout": _cap_output(stdout, "stdout"),
-                "stderr": _cap_output(stderr, "stderr"),
+                "stdout": stdout,
+                "stderr": stderr,
             }
+            if result.capped:
+                payload["output_capped"] = list(result.capped)
             if audit_findings:
                 payload["security_audit"] = audit_findings
             return json.dumps(payload, ensure_ascii=False)

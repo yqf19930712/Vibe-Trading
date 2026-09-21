@@ -6,6 +6,8 @@ env guards. Live streaming is covered by the deployment smoke.
 
 from __future__ import annotations
 
+import pytest
+
 from src.providers.chat import (
     ChatLLM,
     _content_text,
@@ -225,3 +227,66 @@ class TestAnthropicCacheBreakpoints:
 
         _apply_anthropic_cache_breakpoints(None)
         _apply_anthropic_cache_breakpoints({"messages": "not-a-list", "system": 3})
+
+
+class TestToolChoiceNoneNativeChannel:
+    """The forced text turn keeps ``tools`` and sends ``tool_choice={"type":"none"}``.
+
+    Real ``ChatAnthropic`` (langchain-anthropic) request shaping, offline: the
+    engine's OpenAI-format tool definitions survive ``bind_tools``, the dict
+    form of ``tool_choice`` reaches the payload unchanged, and adaptive
+    thinking does not strip it (the thinking guard only drops ``any``/``tool``).
+    """
+
+    TOOLS = [{"type": "function", "function": {
+        "name": "get_price", "description": "d",
+        "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}}},
+    }}]
+
+    @pytest.fixture()
+    def native_llm(self, monkeypatch):
+        pytest.importorskip("langchain_anthropic")
+        from src.providers.llm import _build_native_anthropic
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+        monkeypatch.delenv("VIBE_ANTHROPIC_THINKING", raising=False)
+        monkeypatch.delenv("VIBE_ANTHROPIC_MAX_TOKENS", raising=False)
+        monkeypatch.delenv("VIBE_MAX_OUTPUT_TOKENS", raising=False)
+        return _build_native_anthropic("claude-opus-5")
+
+    def test_payload_keeps_tools_and_none_with_adaptive_thinking(self, native_llm, recwarn):
+        from langchain_core.messages import HumanMessage
+
+        assert native_llm.thinking == {"type": "adaptive"}
+        bound = native_llm.bind_tools(self.TOOLS, tool_choice={"type": "none"})
+        assert bound.kwargs["tool_choice"] == {"type": "none"}
+
+        payload = native_llm._get_request_payload([HumanMessage("q")], **bound.kwargs)
+
+        assert payload["tool_choice"] == {"type": "none"}
+        assert [t["name"] for t in payload["tools"]] == ["get_price"]
+        assert payload["thinking"] == {"type": "adaptive"}
+        assert payload["max_tokens"] == 32000
+        assert not [w for w in recwarn if "tool_choice" in str(w.message)]
+
+    def test_forced_tool_is_what_the_thinking_guard_drops(self, native_llm):
+        """Guard sanity: ``any`` is dropped under thinking, so ``none`` surviving is meaningful."""
+        with pytest.warns(UserWarning, match="tool_choice is forced"):
+            bound = native_llm.bind_tools(self.TOOLS, tool_choice="any")
+        assert "tool_choice" not in bound.kwargs
+
+    def test_chat_llm_bind_reaches_the_same_payload(self, native_llm, monkeypatch):
+        from langchain_core.messages import HumanMessage
+
+        from src.providers.chat import TOOL_CHOICE_NONE, ChatLLM
+
+        monkeypatch.setenv("LANGCHAIN_PROVIDER", "anthropic")
+        monkeypatch.setenv("LANGCHAIN_MODEL_NAME", "claude-opus-5")
+        monkeypatch.setattr("src.providers.chat.build_llm", lambda **_kw: native_llm)
+        client = ChatLLM()
+        bound = client._bind(self.TOOLS, TOOL_CHOICE_NONE)
+        payload = bound.bound._get_request_payload([HumanMessage("q")], **bound.kwargs)
+        assert payload["tool_choice"] == {"type": "none"}
+        assert payload["tools"]

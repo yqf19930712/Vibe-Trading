@@ -58,7 +58,6 @@ from src.core.token_estimate import estimate_messages_tokens, messages_for_estim
 from src.providers.chat import TOOL_CHOICE_NONE, ChatLLM, LLMResponse, ProviderStreamError
 from src.providers.llm import (
     ANTHROPIC_MAX_OUTPUT_TOKENS_DEFAULT,
-    OPENAI_COMPAT_MAX_OUTPUT_TOKENS_DEFAULT,
     max_output_tokens,
 )
 from src.swarm.models import SwarmAgentSpec, SwarmTask
@@ -404,7 +403,7 @@ class TestMaxOutputTokens:
         monkeypatch.delenv("VIBE_MAX_OUTPUT_TOKENS", raising=False)
         monkeypatch.delenv("VIBE_ANTHROPIC_MAX_TOKENS", raising=False)
         assert max_output_tokens("anthropic") == ANTHROPIC_MAX_OUTPUT_TOKENS_DEFAULT
-        assert max_output_tokens("openai") == OPENAI_COMPAT_MAX_OUTPUT_TOKENS_DEFAULT
+        assert max_output_tokens("openai") is None
 
     def test_shared_env_applies_to_both_and_native_override_wins(self, monkeypatch) -> None:
         monkeypatch.setenv("VIBE_MAX_OUTPUT_TOKENS", "4096")
@@ -415,24 +414,51 @@ class TestMaxOutputTokens:
         assert max_output_tokens("anthropic") == 16000
         assert max_output_tokens("openai") == 4096
 
-    def test_openai_channel_request_carries_max_tokens(self, monkeypatch) -> None:
-        import src.providers.llm as llm_mod
-
-        captured: dict = {}
-
-        class _Fake:
-            def __init__(self, **kwargs: object) -> None:
-                captured.update(kwargs)
-
+    @staticmethod
+    def _compat_env(monkeypatch) -> None:
         monkeypatch.setenv("LANGCHAIN_PROVIDER", "deepseek")
         monkeypatch.setenv("LANGCHAIN_MODEL_NAME", "deepseek-chat")
         monkeypatch.setenv("DEEPSEEK_API_KEY", "k")
         monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
         monkeypatch.setenv("VIBE_TRADING_DEEPSEEK_ADAPTER", "openai-compatible")
+
+    def test_openai_channel_sends_no_ceiling_unless_configured(self, monkeypatch) -> None:
+        """Real ChatOpenAI payload: no cap field by default; ``max_completion_tokens`` once set."""
+        from langchain_core.messages import HumanMessage
+
+        import src.providers.llm as llm_mod
+
+        self._compat_env(monkeypatch)
         monkeypatch.delenv("VIBE_MAX_OUTPUT_TOKENS", raising=False)
-        with patch.object(llm_mod, "ChatOpenAIWithReasoning", _Fake):
-            llm_mod.build_llm()
-        assert captured["max_tokens"] == OPENAI_COMPAT_MAX_OUTPUT_TOKENS_DEFAULT
+        payload = llm_mod.build_llm()._get_request_payload([HumanMessage("q")])
+        assert "max_tokens" not in payload
+        assert "max_completion_tokens" not in payload
+
+        monkeypatch.setenv("VIBE_MAX_OUTPUT_TOKENS", "4096")
+        payload = llm_mod.build_llm()._get_request_payload([HumanMessage("q")])
+        # langchain-openai renames the legacy field in every ChatOpenAI request.
+        assert payload["max_completion_tokens"] == 4096
+        assert "max_tokens" not in payload
+
+    def test_native_deepseek_adapter_follows_the_same_switch(self, monkeypatch) -> None:
+        import src.providers.llm as llm_mod
+
+        captured: list[dict] = []
+
+        class _FakeDeepSeek:
+            def __init__(self, **kwargs: object) -> None:
+                captured.append(kwargs)
+
+        class _Module:
+            ChatDeepSeek = _FakeDeepSeek
+
+        monkeypatch.setattr(llm_mod, "import_module", lambda name: _Module)
+        monkeypatch.delenv("VIBE_MAX_OUTPUT_TOKENS", raising=False)
+        llm_mod._build_native_deepseek(model="deepseek-chat", temperature=0.0)
+        assert captured[-1]["max_tokens"] is None
+        monkeypatch.setenv("VIBE_MAX_OUTPUT_TOKENS", "2048")
+        llm_mod._build_native_deepseek(model="deepseek-chat", temperature=0.0)
+        assert captured[-1]["max_tokens"] == 2048
 
 
 # ── P2 #1: reasoning_content is not context unless the channel sends it ─────

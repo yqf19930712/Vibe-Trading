@@ -192,6 +192,41 @@ class TestRunningCap:
         assert tk not in router.pool
         assert fake_cube["delete"] == [f"sbx-{tk[:6]}"]
 
+    def test_cancelled_cold_start_drops_the_sandbox_without_blocking(self, fake_cube):
+        """Client gone mid-boot: the half-made sandbox is deleted (detached)."""
+        delete_started = asyncio.Event()
+        delete_release = asyncio.Event()
+
+        async def slow_ready(inst, *a, **k):
+            await asyncio.sleep(10)
+
+        async def slow_delete(sandbox_id):
+            delete_started.set()
+            await delete_release.wait()
+            fake_cube["delete"].append(sandbox_id)
+            return True
+
+        async def _scenario():
+            router._ensure_ready = slow_ready
+            router.sbx_delete = slow_delete
+            tk = router.tenant_key("leaver")
+            task = asyncio.create_task(router.get_or_create(tk))
+            await asyncio.sleep(0.05)  # past sbx_create, inside _ensure_ready
+            assert tk in router.pool and router.pool[tk].booting
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            # The cancel returned while the delete was still pending …
+            assert delete_started.is_set()
+            assert fake_cube["delete"] == []
+            assert tk not in router.pool and tk not in router.state
+            # … and the detached task finishes it.
+            delete_release.set()
+            await asyncio.sleep(0.01)
+            assert fake_cube["delete"] == [f"sbx-{tk[:6]}"]
+
+        _run(_scenario())
+
     def test_booting_instance_is_never_a_pause_victim(self, fake_cube):
         booting = _idle_running("boot", idle_s=10_000)
         booting.booting = True
