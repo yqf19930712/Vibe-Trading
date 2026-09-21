@@ -160,7 +160,8 @@ stateDiagram-v2
 
 - **答案判定按 `attempt_id` + `metadata.ok`**：router 发消息拿回本轮 `attempt_id`，轮询 `GET /sessions/<sid>/messages` 直到出现 `linked_attempt_id` 匹配且内容非空的 assistant 消息——复用会话时绝不会把上一轮答案当本轮返回。引擎在这条回复的 `metadata` 里写 `ok`（attempt 是否 `completed`）与 `error`；`ok=false`（或旧引擎的 `metadata.status="failed"`）的消息**不是答案**：router 以 502 `deep engine failed: <error>` 走 **error 帧**（`stats.router.outcome="engine_failed"`），并按「未答即取消」对引擎发 cancel。`_classify_answer_message` 是这段判定的纯函数（`ops/cube-router/test_router_security.py` 钉住）。
 - **终帧携带 stats**：`stats.router` 是 router 分段计时（queue_wait/sandbox_ready/session/first_progress/total、cold_start/booted/session_recovered、attempt_id），`stats.engine` 是引擎 `attempt_stats` 事件原文（迭代/LLM 耗时/逐工具/tokens/data_fetches/data_gaps/early_finalize）——laicai 据此落 `deep_engine_runs`。字段明细见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)。
-- **未答即取消**：router 在拿不到答案的所有路径（504 超时、客户端断开、内部异常）对引擎 `POST /sessions/<sid>/cancel` 止损，避免孤儿 attempt 继续烧钱并阻塞同租户后续请求。
+- **未答即取消**：router 在拿不到答案的所有路径（504 超时、客户端断开、内部异常）对引擎 `POST /sessions/<sid>/cancel` 止损，避免孤儿 attempt 继续烧钱并阻塞同租户后续请求；deep_team 的 swarm run 随 attempt 一起被取消（worker 在下一次迭代/重试前停下）。ask_log 的 `engine_cancelled` 只在引擎回 `status=cancelled` 时为 true。
+- **准备段失败也是 `engine_failed`**：attempt 在引擎 loop 之外失败（LLM 凭据缺失、registry 构建、租户盘写满导致 run 目录/trace 建不出来）同样写 `ok=false` 回执并发 `attempt.failed` 事件；router 在事件流上看到本 attempt 的 `attempt.failed` 就立即以 502 `engine_failed` 收尾，不等满预算。
 - **会话失效自愈**：`vibeSessionId` 指向的会话在引擎侧 404（沙箱被删除重建、或该会话已被 `/sessions/delete` 删除）→ router 透明新建会话、重发本问，终帧回传**新** `vibeSessionId`，laicai 应重绑线程。上下文丢失但长期记忆仍在（记忆在 `memory/`，不在 session）。
 - 常见错误：401 未鉴权；400 model/llm/intent 参数非法；**400 问题过长**（引擎 pydantic 422 由 router 转译：detail 为「问题过长，请精简后重试（引擎单次输入上限 20000 字符，含注入的持仓上下文）」，其他 422 原样截 200 字符转 400）；503 实例忙（在途请求持有不同 LLM 指纹，或 RUNNING 沙箱满且无可换出者）；502 沙箱创建/引擎 boot 失败，或 attempt 以 `failed` 结束（`outcome=engine_failed`）；504 引擎超时。
 - 并发：全局同时处理的 `/ask` 数受 `VIBE_MAX_CONCURRENT_ACTIVE`（信号量）钳制，超出者排队等待。
@@ -269,7 +270,7 @@ flowchart LR
 | 沙箱规格 | 2C / 2G（模板默认） | MicroVM 硬隔离，租户内 runaway 不外溢 |
 | 沙箱 writable layer | 4G（模板 `--writable-layer-size`） | 沙箱 rootfs 的可写层，只装引擎代码之外的临时产物（pip 缓存、/tmp）。**租户数据不在这里** |
 | 租户数据目录 | 宿主 `/data/shared/vibe/<tk>`，**无文件系统配额** | 租户全部落盘状态（记忆/会话/trace/上传/runs/logs）在宿主 bind-mount 上，受限于宿主数据盘总容量。`VIBE_TENANT_QUOTA_BYTES`（默认 4G）**只是 `/healthz` / `/tenants/usage` 计算 `pct` 与 `over_watermark` 的分母**，不是 quota——写满不会被拒，直到宿主盘满（引擎侧记忆/索引写盘失败已结构化为工具错误，不杀 attempt）。超 80%（`VIBE_TENANT_WATERMARK`）打 warn 并列进 `over_watermark` tk8 列表；`disk_used_pct` 曝光整盘水位。**目前只曝光不清扫**——自动保留策略见 §3.3.1 与 `router.py` 的 `TODO(retention)`；单会话删除见 §3.2.1 |
-| RUNNING 沙箱上限 | `VIBE_MAX_INSTANCES`（默认 3；**生产现配 4**，配合 laicai 作战室四份专业报告并行，宿主已加 2G swap） | 8G 宿主机：OS + CubeSandbox 控制面 ≈2.5G，余量 ≈3 个 RUNNING；满则 pause LRU 空闲者，全忙 503 |
+| RUNNING 沙箱上限 | `VIBE_MAX_INSTANCES`（默认 3；**生产现配 4**，配合 laicai 作战室四份专业报告并行，宿主已加 2G swap） | 8G 宿主机：OS + CubeSandbox 控制面 ≈2.5G，余量 ≈3 个 RUNNING；满则 pause LRU 空闲者，全忙 503。计数含**正在冷启/重挂/resume 的实例**（`booting`，在建沙箱前就占位，`capacity_lock` 串行化「腾位 + 占位」），所以并发冷启与 router 重启后的 state 重挂都不会越过上限；booting 实例不会被 LRU 或 reaper 当空闲 pause 掉 |
 | 并发 `/ask` | `VIBE_MAX_CONCURRENT_ACTIVE`（默认 2；**生产现配 4**） | 信号量排队 |
 | 空闲 pause | `VIBE_IDLE_TTL_S`（默认 20min） | pause 不占 CPU/内存调度，盘保留 |
 | router 自身 | systemd `MemoryMax=1G` | router 只做编排，不承载引擎负载 |

@@ -103,7 +103,7 @@ AgentLoop 在 **attempt 结束时**（成功/失败/取消/异常四条路径都
      "ms": 231000, "agents": 4, "tasks": 4}
     // status ∈ completed/failed/cancelled/start_failed/error/
     //          wait_budget_exhausted（等待预算耗尽、run 仍在后台跑）/timeout/
-    //          cancelled_wait（attempt 被取消、等待放弃，run 仍在后台且可用 run_id 续等）
+    //          cancelled_wait（attempt 被取消：等待放弃并对 run 发 cancel_run，run 进入 cancelled；只有 wait_budget_exhausted 才保留 run 供 run_id 续等）
   ],
   "early_finalize": false,  // 见 §4
   "model": "claude-opus-5",
@@ -144,7 +144,11 @@ attempt 绝对 deadline（`time.monotonic()` 基准）的 contextvar + 三个工
 
 ### 3.6 cancel（`src/core/cancel.py`）
 
-budget 的姊妹模块：`AgentLoop.run()` 开头把自己的 `threading.Event` 经 `bind_cancel_event` 绑进 contextvar，工具线程随 copy_context 继承。`sleep_unless_cancelled(seconds)` 是轮询循环里 `time.sleep` 的替代（事件一触发立即返回 True）；工具看门狗 `invoke_tool_guarded` 按 `CANCEL_POLL_S=1s` 切片等待 worker 队列，取消命中即返回 `error_code=cancelled` 的结构化结果而不是等工具自己回来。取消与 deadline 恰好同时到期时**取消优先**（最后一个切片里落地的 cancel 报 `cancelled`，不报成工具超时）。`run_swarm` 的等待循环用同一事件，取消时返回 `cancelled_wait`（run 保留在盘上，可用 `run_id` 续等）。会话层：`SessionService` 对同一会话的新 attempt 先 `cancel()` 仍在注册表里的旧 loop 再覆盖；`delete_session` 也先 cancel。
+budget 的姊妹模块：`AgentLoop.run()` 开头把自己的 `threading.Event` 经 `bind_cancel_event` 绑进 contextvar，工具线程随 copy_context 继承。这枚令牌属于本 attempt，`run()` **不清零**它：在 run 开跑前就到达的取消（executor 排队、`build_registry` 期间）由第一个检查点直接转成 `cancelled` 终态。`sleep_unless_cancelled(seconds)` 是轮询循环里 `time.sleep` 的替代（事件一触发立即返回 True）；工具看门狗 `invoke_tool_guarded` 按 `CANCEL_POLL_S=1s` 切片等待 worker 队列，取消命中即返回 `error_code=cancelled` 的结构化结果而不是等工具自己回来。取消与 deadline 恰好同时到期时**取消优先**（最后一个切片里落地的 cancel 报 `cancelled`，不报成工具超时）。
+
+`run_swarm` 的等待循环用同一事件，两种非终态出口刻意不同：**等待预算耗尽**返回 `wait_budget_exhausted`，run 不动、可用 `run_id` 续等；**attempt 级取消**（router 兜底、删会话、注销）返回 `cancelled_wait` 并调用 `cancel_run`——没有任何调用方会在 attempt 消失后续等一个 run。取消注册表是进程级的（`swarm/runtime.py` 以 run_id 建 `threading.Event`，工具每次调用新建的 `SwarmRuntime` 与 API 单例共用），并按会话登记在等的 run（`register_session_run`），所以 `SessionService.cancel_current` / `delete_session` 也能停掉已经 `wait_budget_exhausted` 交还、没人再等的 run（`cancel_session_runs`）。run 内部：`_execute_run` 在层边界检查，`run_worker` 在**每次迭代顶部**检查并把事件传给工具看门狗，`_run_worker_with_retries` 在**每次重试前**检查——被取消的 worker 以 `status=cancelled` 返回，任务记 `TaskStatus.cancelled`（事件 `task_cancelled`），run 终态 `cancelled`。
+
+会话层：`SessionService` 对同一会话的新 attempt 先 `cancel()` 仍在注册表里的旧 loop 再覆盖；`delete_session` 也先 cancel。取消到达时 attempt 还在 `build_registry`（尚无 loop 可签）则记为 pending，loop 一注册立即投递；`POST /sessions/<sid>/cancel` 只有在「确实没有在途 attempt 也没有登记的 swarm run」时才回 `no_active_loop`。
 
 ## 4. 预算体系与提前收敛
 
@@ -177,7 +181,8 @@ router 侧的 `max(60, …)` 下限意味着引擎拿到的 `deadline_s` 永远�
 | bash 命令超时 | `VIBE_BASH_TIMEOUT_S`（默认 120s），同样被 attempt 剩余预算钳制（reserve 15s / floor 10s）；超时回 `bash_timeout` 并指向 `background_run` |
 | market_data 总预算 | `min(VIBE_TRADING_FETCH_BUDGET_S=120, 剩余预算)`，见 §5 |
 | 迭代上限 | `VIBE_MAX_ITERATIONS`（引擎默认 50 与上游一致；**router 给 laicai 租户同样下发 50**——swarm 意图的长任务仅数据收集阶段就要 ~20 迭代，墙钟 deadline 才是硬止损） |
-| router 兜底取消 | `/ask` 未拿到答案（504/客户端断开/异常/attempt 以 failed 结束）一律 `POST /sessions/<sid>/cancel`，止住「超时后继续烧 + 拖死同租户重试」。引擎侧取消事件穿透在途工具等待与 swarm 轮询（§3.6），≤1s 内生效，不必等 30 分钟的工具自己回来 |
+| router 兜底取消 | `/ask` 未拿到答案（504/客户端断开/异常/attempt 以 failed 结束）一律 `POST /sessions/<sid>/cancel`，止住「超时后继续烧 + 拖死同租户重试」。引擎侧取消事件穿透在途工具等待与 swarm 轮询（§3.6），≤1s 内生效，不必等 30 分钟的工具自己回来；对 `intent=deep_team` 同样有效——swarm run 随 attempt 一起被 `cancel_run`，worker 在下一次迭代/重试前停下，不再跑完当前层。ask_log 的 `engine_cancelled` 只在引擎回 `status=cancelled` 时为 true，`engine_cancel_status` 记原始答复（`no_active_loop` / `http_<code>` / `unreachable`） |
+| attempt 准备段失败 | 引擎在 loop 之外失败（`ChatLLM()` 凭据缺失、`build_registry`、run 目录/trace 文件写不进盘）也产出 `status=failed` 结果 + `attempt_stats{status:"error"}`，会话层写同形的 `ok=false` 回执并发 `attempt.failed`；router 在事件流上看到本 attempt 的 `attempt.failed` 即打断答案轮询，以 502 `engine_failed` 收尾而不是等满预算 |
 | 单次输入上限 | 引擎 `SendMessageRequest.content` 20000 字符（含 laicai 注入的持仓上下文）；超限的 422 由 router 转为 400「问题过长」 |
 
 ## 5. 数据可靠性
@@ -254,7 +259,8 @@ flowchart LR
 | `queue_wait_ms` | 全局并发信号量等待 |
 | `cold_start` / `resumed` / `booted` | 沙箱路径标记 |
 | `sandbox_ready_ms` / `session_ms` / `first_progress_ms` / `total_ms` | 分段计时 |
-| `attempt_id` / `engine_status` / `iterations` / `engine_cancelled` | 引擎侧关联与结局 |
+| `attempt_id` / `engine_status` / `iterations` | 引擎侧关联与结局 |
+| `engine_cancelled` / `engine_cancel_status` | 未答路径的兜底 cancel：前者仅在引擎确认（`cancelled`）时为 true，后者是引擎对 cancel 的原始答复（`cancelled` / `no_active_loop` / `http_<code>` / `unreachable`）；这一行日志由 cancel 任务在拿到答复后写出 |
 | `error` | 失败详情（截断 300 字符） |
 
 同一份 stats 会随 answer/error 终帧的 `stats.router` 回传给 laicai。
@@ -343,4 +349,4 @@ less /data/shared/vibe/$TK/sessions/<vibe_session_id>/trace.jsonl
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8990/healthz | jq .
 ```
 
-常见结论速查：`web_search` 大量 errors → 看 `/health` 的 `egress_tunnel` 与 B 端 tinyproxy；`data_gaps` 带 `rate_limited` → tushare 限频（节流器/积分档位）；`early_finalize=true` 高频 → 预算太紧或迭代太慢，对照瀑布图看时间去向；`outcome=incomplete` → 客户端（laicai）在终帧前断开，配合 `engine_cancelled` 确认止损生效；`outcome=engine_failed` → 引擎 attempt 自身失败（`error` 里是引擎的 `attempt.error`），去 trace 找 `end` 事件前的最后一个错误；`outcome=error` 且 detail 为「问题过长」→ laicai 注入的持仓上下文 + 问题超过 20000 字符；`/obs/*` 突然返回空而宿主上文件明明在 → 检查该路径或其父目录是否变成了 symlink（守卫按不存在处理）。
+常见结论速查：`web_search` 大量 errors → 看 `/health` 的 `egress_tunnel` 与 B 端 tinyproxy；`data_gaps` 带 `rate_limited` → tushare 限频（节流器/积分档位）；`early_finalize=true` 高频 → 预算太紧或迭代太慢，对照瀑布图看时间去向；`outcome=incomplete` → 客户端（laicai）在终帧前断开，`engine_cancelled=true` 表示引擎确认止损生效，false 时看 `engine_cancel_status`（`no_active_loop` = 引擎侧已无在途 attempt，`unreachable` = 沙箱不可达）；`outcome=engine_failed` → 引擎 attempt 自身失败（`error` 里是引擎的 `attempt.error`），去 trace 找 `end` 事件前的最后一个错误；`outcome=error` 且 detail 为「问题过长」→ laicai 注入的持仓上下文 + 问题超过 20000 字符；`/obs/*` 突然返回空而宿主上文件明明在 → 检查该路径或其父目录是否变成了 symlink（守卫按不存在处理）。
