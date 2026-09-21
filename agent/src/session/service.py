@@ -7,12 +7,28 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Coroutine, Dict, Optional, Set
 
 # Dedicated thread pool limited to four concurrent agents to avoid exhausting the default executor.
 _AGENT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="agent")
+
+logger = logging.getLogger(__name__)
+
+# Strong references for fire-and-forget tasks: the event loop only keeps
+# weak ones, so an attempt task with no other referrer could be collected
+# mid-flight.
+_bg_tasks: Set["asyncio.Task[Any]"] = set()
+
+
+def _spawn(coro: Coroutine[Any, Any, Any]) -> "asyncio.Task[Any]":
+    """Schedule ``coro`` as a task that stays referenced until it finishes."""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
 
 from src.session.events import EventBus
 from src.session.models import (
@@ -51,6 +67,11 @@ class SessionService:
         self.event_bus = event_bus
         self.runs_dir = runs_dir
         self._active_loops: Dict[str, "AgentLoop"] = {}
+        # Sessions with an attempt in flight, and those whose cancel arrived
+        # while the attempt was still building its registry (no loop to
+        # signal yet): the loop is cancelled the moment it registers.
+        self._inflight: Set[str] = set()
+        self._pending_cancel: Set[str] = set()
         self._search_index = get_shared_index()
 
     def create_session(self, title: str = "", config: Optional[Dict[str, Any]] = None) -> Session:
@@ -78,23 +99,77 @@ class SessionService:
         return self.store.list_sessions(limit)
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session: cancel its live loop, drop files, events and FTS rows.
+        """Delete a session: cancel its live loop, drop files, runs, events and FTS rows.
 
-        The search index (``sessions.db``) used to keep the deleted session's
-        rows, so ``session_search`` kept returning dead links (P1 2026-09-04).
+        Everything the session produced goes with it: the session directory,
+        every ``runs/<id>`` whose ``req.json`` names the session (the run
+        directories are the only other place the request lands), and the
+        ``sessions.db`` rows (otherwise ``session_search`` keeps returning
+        the deleted conversation as a snippet). Goal-ledger rows are the
+        caller's job (``api_server`` owns the GoalStore).
         """
         self.cancel_current(session_id)
         self.event_bus.clear(session_id)
         deleted = self.store.delete_session(session_id)
+        self._delete_session_runs(session_id)
         try:
             self._search_index.delete_session(session_id)
         except Exception as exc:  # noqa: BLE001 - index cleanup is best-effort
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "search index cleanup failed for session %s: %s", session_id, exc
-            )
+            logger.warning("search index cleanup failed for session %s: %s", session_id, exc)
         return deleted
+
+    def _delete_session_runs(self, session_id: str) -> int:
+        """Remove the run directories linked to ``session_id``; returns the count."""
+        import shutil
+
+        from src.core.state import runs_for_session
+
+        removed = 0
+        try:
+            candidates = runs_for_session(self.runs_dir, session_id)
+        except OSError as exc:
+            logger.warning("run lookup failed for session %s: %s", session_id, exc)
+            return 0
+        for run_dir in candidates:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            if not run_dir.exists():
+                removed += 1
+        return removed
+
+    def reconcile_orphans(self, goal_store: Optional[Any] = None) -> list[str]:
+        """Drop index/ledger rows of sessions whose directory is gone.
+
+        Runs once at engine start. A session can be deleted from the host
+        while this engine is not running (router offline delete): the
+        directory disappears but its ``sessions.db`` rows — FTS messages,
+        goal ledger — stay. This binds the search index to the store (so a
+        later ``search()`` also drops orphans on sight), sweeps the FTS rows,
+        and purges the goal ledger of every orphan session.
+
+        Args:
+            goal_store: ``GoalStore`` to purge alongside (optional).
+
+        Returns:
+            Session ids removed from the search index.
+        """
+        try:
+            self._search_index.bind_store(self.store.base_dir)
+            removed = list(self._search_index.reconcile_with_store())
+        except Exception as exc:  # noqa: BLE001 - startup tidy-up must not block serving
+            logger.warning("session index reconcile failed: %s", exc)
+            removed = []
+        if goal_store is not None:
+            try:
+                for sid in goal_store.list_session_ids():
+                    if not (self.store.base_dir / sid).is_dir():
+                        goal_store.delete_session_goals(sid)
+                        if sid not in removed:
+                            removed.append(sid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("goal ledger reconcile failed: %s", exc)
+        if removed:
+            logger.info("dropped %d orphan session(s) from sessions.db", len(removed))
+        return removed
 
     async def send_message(
         self,
@@ -136,7 +211,8 @@ class SessionService:
         self.store.update_session(session)
         self.event_bus.emit(session_id, "attempt.created", {"attempt_id": attempt.attempt_id, "prompt": content})
 
-        asyncio.create_task(
+        self._inflight.add(session_id)
+        _spawn(
             self._run_attempt(
                 session,
                 attempt,
@@ -157,13 +233,28 @@ class SessionService:
             session_id: Session ID.
 
         Returns:
-            Whether cancellation succeeded. True means an active loop existed and received a cancel signal.
+            Whether anything received a cancel signal: a live loop, an attempt
+            still in its preparation phase (cancelled as soon as its loop
+            registers), or a swarm run this session left running.
         """
         loop = self._active_loops.get(session_id)
-        if loop is None:
-            return False
-        loop.cancel()
-        return True
+        if loop is not None:
+            loop.cancel()
+            cancelled = True
+        elif session_id in self._inflight:
+            self._pending_cancel.add(session_id)
+            cancelled = True
+        else:
+            cancelled = False
+        # A cancelled attempt has no one left to resume a swarm run it was
+        # waiting on (or had handed back as wait_budget_exhausted), so the
+        # run is stopped with it instead of burning on in the background.
+        from src.swarm.runtime import cancel_session_runs
+
+        runs = cancel_session_runs(session_id)
+        if runs:
+            logger.info("cancelled %d swarm run(s) of session %s: %s", len(runs), session_id, runs)
+        return cancelled or bool(runs)
 
     async def _run_attempt(
         self,
@@ -174,11 +265,29 @@ class SessionService:
         deadline_s: Optional[float] = None,
     ) -> None:
         """Execute an Attempt in the background."""
-        attempt.mark_running()
-        self.store.update_attempt(attempt)
-        self.event_bus.emit(session.session_id, "attempt.started", {"attempt_id": attempt.attempt_id})
-
+        self._inflight.add(session.session_id)
         try:
+            await self._run_attempt_inner(
+                session, attempt, include_shell_tools=include_shell_tools, deadline_s=deadline_s
+            )
+        finally:
+            self._inflight.discard(session.session_id)
+            self._pending_cancel.discard(session.session_id)
+
+    async def _run_attempt_inner(
+        self,
+        session: Session,
+        attempt: Attempt,
+        *,
+        include_shell_tools: bool,
+        deadline_s: Optional[float],
+    ) -> None:
+        receipt_written = False
+        try:
+            attempt.mark_running()
+            self.store.update_attempt(attempt)
+            self.event_bus.emit(session.session_id, "attempt.started", {"attempt_id": attempt.attempt_id})
+
             messages = self.store.get_messages(session.session_id)
             result = await self._run_with_agent(
                 attempt,
@@ -198,11 +307,11 @@ class SessionService:
             if attempt.run_dir:
                 reply_metadata["run_id"] = Path(attempt.run_dir).name
             reply_metadata["status"] = attempt.status.value
-            # Machine-readable outcome (P1 2026-09-04): the router used to
-            # take ANY non-empty assistant message linked to the attempt as
-            # the answer, so "Execution failed: …" prose was forwarded to the
-            # user as if it were the research result. Keep the prose, add
-            # the flag; the router keys on it.
+            # Machine-readable outcome: without the flag the router would take
+            # ANY non-empty assistant message linked to the attempt as the
+            # answer, forwarding "Execution failed: …" prose to the user as if
+            # it were the research result. Keep the prose, add the flag; the
+            # router keys on it.
             reply_metadata["ok"] = attempt.status == AttemptStatus.COMPLETED
             if attempt.status != AttemptStatus.COMPLETED:
                 reply_metadata["error"] = attempt.error or "unknown error"
@@ -216,6 +325,7 @@ class SessionService:
                 metadata=reply_metadata,
             )
             self.store.append_message(reply)
+            receipt_written = True
             self._search_index.index_message(session.session_id, "assistant", reply.content)
             self.event_bus.emit(
                 session.session_id,
@@ -225,9 +335,52 @@ class SessionService:
             )
 
         except Exception as exc:
-            attempt.mark_failed(error=str(exc))
+            self._fail_attempt(session, attempt, exc, receipt_written=receipt_written)
+
+    def _fail_attempt(
+        self, session: Session, attempt: Attempt, exc: Exception, *, receipt_written: bool
+    ) -> None:
+        """Terminal bookkeeping for an attempt that raised outside the loop.
+
+        Writes the same ``ok=false`` assistant receipt the in-loop failure
+        path writes, so a consumer polling the message list (the router) sees
+        the failure at once instead of waiting out its whole budget. Each
+        step is independent: a store that is failing (full disk) must not
+        stop the event from going out, and vice versa.
+        """
+        logger.exception(
+            "attempt %s of session %s failed outside the agent loop: %s",
+            attempt.attempt_id, session.session_id, exc,
+        )
+        error = str(exc) or type(exc).__name__
+        attempt.mark_failed(error=error)
+        try:
             self.store.update_attempt(attempt)
-            self.event_bus.emit(session.session_id, "attempt.failed", {"attempt_id": attempt.attempt_id, "error": str(exc)})
+        except Exception:  # noqa: BLE001 - keep going, the receipt matters more
+            logger.warning("attempt %s: update_attempt failed", attempt.attempt_id, exc_info=True)
+        if not receipt_written:
+            reply = Message(
+                session_id=session.session_id, role="assistant",
+                content=self._format_result_message(attempt),
+                linked_attempt_id=attempt.attempt_id,
+                metadata={"status": attempt.status.value, "ok": False, "error": error},
+            )
+            try:
+                self.store.append_message(reply)
+            except Exception:  # noqa: BLE001
+                logger.warning("attempt %s: failure receipt not stored", attempt.attempt_id, exc_info=True)
+            try:
+                self._search_index.index_message(session.session_id, "assistant", reply.content)
+            except Exception:  # noqa: BLE001
+                logger.debug("attempt %s: receipt not indexed", attempt.attempt_id, exc_info=True)
+        try:
+            self.event_bus.emit(
+                session.session_id, "attempt.failed",
+                {"attempt_id": attempt.attempt_id, "status": attempt.status.value,
+                 "error": error, "run_dir": attempt.run_dir},
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("attempt %s: attempt.failed event not emitted", attempt.attempt_id, exc_info=True)
 
     async def _run_with_agent(
         self,
@@ -306,9 +459,9 @@ class SessionService:
             ),
         )
 
-        # Iteration ceiling is an env knob now (batch 3): the multi-tenant
-        # router hands laicai tenants 25 — the incident data showed 50 lets a
-        # single question grind for 15-19 minutes, past every outer budget.
+        # Iteration ceiling is an env knob: the multi-tenant router hands
+        # laicai tenants their tier (50, see ops/cube-router engine_env);
+        # wall-clock deadlines, not the iteration count, are the hard stop.
         try:
             max_iterations = max(1, int(os.getenv("VIBE_MAX_ITERATIONS", "50")))
         except ValueError:
@@ -320,13 +473,18 @@ class SessionService:
             max_iterations=max_iterations,
             persistent_memory=pm,
         )
-        # A second attempt on the same session used to silently overwrite
-        # the registry entry, orphaning the first loop: unreachable by
-        # cancel_current, still burning tokens (P1 2026-09-04).
+        # A second attempt on the same session must not silently overwrite
+        # the registry entry: that orphans the first loop — unreachable by
+        # cancel_current, still burning tokens.
         previous = self._active_loops.get(session_id)
         if previous is not None and previous is not agent:
             previous.cancel()
         self._active_loops[session_id] = agent
+        # A cancel that arrived during build_registry had no loop to hit;
+        # deliver it now, before the loop is even scheduled.
+        if session_id in self._pending_cancel:
+            self._pending_cancel.discard(session_id)
+            agent.cancel()
 
         # Build the message history context.
         history = (
@@ -370,7 +528,7 @@ class SessionService:
         LLM can still see previous artifact paths and strategy content during
         iterative updates.
 
-        Two layers since V2:
+        Two layers:
 
         1. The session's stored handoff summary (produced by Layer 3 of a
            previous attempt) is prepended as background reference. Without it,

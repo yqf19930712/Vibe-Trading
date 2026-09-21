@@ -57,7 +57,39 @@ def estimate_text_tokens(text: str) -> int:
     return int(ascii_chars / 4 + cjk_chars * 0.6 + other_chars / 3)
 
 
-def estimate_messages_tokens(messages: list) -> int:
+# Assistant-message field that most channels drop at request serialization.
+REASONING_FIELD = "reasoning_content"
+
+
+def messages_for_estimate(messages: list, *, count_reasoning: bool = False) -> list:
+    """Return the message list as the provider will actually receive it.
+
+    ``reasoning_content`` (the model's thinking transcript, kept on assistant
+    tool-call messages for the trace and for providers that require it on
+    replay) is dropped unless ``count_reasoning`` — only moonshot/kimi send it
+    back upstream; every other channel discards it at serialization, so
+    counting it would charge the context estimate for text that never leaves
+    the process. Shallow copies only; the originals are untouched.
+
+    Args:
+        messages: Message list.
+        count_reasoning: Keep ``reasoning_content`` in the returned copies.
+
+    Returns:
+        A new list; messages without the field are the same objects.
+    """
+    if count_reasoning:
+        return list(messages)
+    out: list = []
+    for msg in messages:
+        if isinstance(msg, dict) and REASONING_FIELD in msg:
+            out.append({k: v for k, v in msg.items() if k != REASONING_FIELD})
+        else:
+            out.append(msg)
+    return out
+
+
+def estimate_messages_tokens(messages: list, *, count_reasoning: bool = False) -> int:
     """Estimate the token count of an OpenAI-format message list.
 
     Serializes the whole list (roles, tool_calls, content) so structural
@@ -65,10 +97,13 @@ def estimate_messages_tokens(messages: list) -> int:
 
     Args:
         messages: Message list.
+        count_reasoning: Include ``reasoning_content`` (only when the
+            provider sends it back upstream — see :func:`messages_for_estimate`).
 
     Returns:
         Estimated token count.
     """
+    messages = messages_for_estimate(messages, count_reasoning=count_reasoning)
     try:
         serialized = json.dumps(messages, default=str, ensure_ascii=False)
     except (TypeError, ValueError):

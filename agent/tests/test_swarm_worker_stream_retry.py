@@ -63,7 +63,7 @@ class _FlakyChatLLM:
         """
         return self
 
-    def stream_chat(self, messages, tools=None, on_text_chunk=None, timeout=None) -> LLMResponse:
+    def stream_chat(self, messages, tools=None, on_text_chunk=None, timeout=None, should_cancel=None, tool_choice=None) -> LLMResponse:
         """Raise the next queued error or return the final response.
 
         Args:

@@ -5,6 +5,8 @@ category: data-source
 ---
 # yfinance
 
+> **Hosted sandbox note:** in the managed multi-tenant sandbox, `bash` subprocesses carry neither data-source credentials (`TUSHARE_TOKEN` / `TICKFLOW_API_KEY` / `IFIND_MCP_TOKEN`) nor direct access to sites outside mainland China. Use `get_market_data` for OHLCV and `read_url` for web pages; the script examples in this skill only work in a self-hosted deployment where the token and network are available to the shell.
+
 ## Overview
 
 yfinance is an open-source Python wrapper for Yahoo Finance, providing global market data (US stocks, HK stocks, ETFs, indices) including historical and real-time quotes. **Completely free, no registration or API key required.**

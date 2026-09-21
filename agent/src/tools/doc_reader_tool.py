@@ -73,8 +73,8 @@ def _envelope(path: Path, fmt: str, text: str, **extra: Any) -> str:
     }
     payload.update(extra)
     payload = with_security_warnings(payload, fields=("text",))
-    # V2: uploaded statements / PDFs are the storage-injection vector named in
-    # the engine's own threat model (docs/HISTORY.md) — declare them as
+    # Uploaded statements / PDFs are the storage-injection vector named in
+    # the engine's own threat model (docs/HISTORY.md §1) — declare them as
     # untrusted DATA the same way recalled memories are declared.
     payload["text"] = wrap_external_content(
         payload["text"],

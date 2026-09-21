@@ -571,6 +571,12 @@ class GoalStore:
         return count
 
     @_synchronized
+    def list_session_ids(self) -> list[str]:
+        """Return every session id that owns at least one goal row."""
+        rows = self._conn.execute("SELECT DISTINCT session_id FROM goals").fetchall()
+        return [str(r[0]) for r in rows if r[0]]
+
+    @_synchronized
     def get_current_snapshot(self, session_id: str) -> dict | None:
         """Return the current goal plus ledger rows for a session."""
         goal = self.get_current_goal(session_id)

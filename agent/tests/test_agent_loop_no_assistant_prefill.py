@@ -45,6 +45,7 @@ class _StubLLM:
         on_text_chunk: Any = None,
         on_reasoning_chunk: Any = None,
         should_cancel: Any = None,
+        tool_choice: str | None = None,
     ) -> Any:
         messages = [m for m in messages]
         self.call_count += 1

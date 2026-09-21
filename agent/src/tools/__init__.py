@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import importlib
 import logging
-import os
 import pkgutil
 from collections.abc import Mapping
 from collections import deque
@@ -31,22 +30,22 @@ _SUBCLASSES_CACHE: list[type[BaseTool]] | None = None
 _SHELL_TOOL_NAMES = {"bash", "background_run"}
 
 # Tools excluded when this instance is an isolated single-user tenant behind a
-# shared multi-tenant gateway (env VIBE_TRADING_TENANT_SAFE=1, injected by the
-# vibe-router). Only the hard safety red line is blocked here: real broker
-# order placement / fund-mandate surfaces (trading_* by prefix, and
-# propose_mandate_profiles) — a read-only analysis product must never be able
-# to move money, regardless of resource posture.
+# shared multi-tenant gateway (env VIBE_TRADING_TENANT_SAFE=1, injected by
+# ops/cube-router through the launcher /boot env). Only the hard safety red
+# line is blocked here: real broker order placement / fund-mandate surfaces
+# (trading_* by prefix, and propose_mandate_profiles) — a read-only analysis
+# product must never be able to move money, regardless of resource posture.
 #
-# TEST PHASE: run_swarm / session_search / background_* are intentionally NOT
-# blocked. Per-process + per-HOME isolation already scopes their state to the
-# tenant (swarm runs → swarm_runs_root()/VIBE_DATA_DIR; session_search index →
+# run_swarm / session_search / background_* are deliberately NOT blocked.
+# Per-sandbox + per-HOME isolation already scopes their state to the tenant
+# (swarm runs → swarm_runs_root()/VIBE_DATA_DIR; session_search index →
 # Path.home()/.vibe-trading/sessions.db, so it searches ONLY this tenant's own
-# full session history across threads, never another tenant's). Their resource
-# blow-up (parallel swarm workers, lingering background tasks) is accepted for
-# now and bounded only by the pool-level cgroup MemoryMax; revisit before any
-# real multi-user load. background_run additionally needs the shell-tools gate
-# (VIBE_TRADING_ENABLE_SHELL_TOOLS=1, injected by the router) since it runs
-# arbitrary host commands. See PRODUCT_DESIGN.md §2.3.
+# full session history across threads, never another tenant's), and their
+# resource blow-up (parallel swarm workers, lingering background tasks) is
+# contained by the MicroVM's own CPU/memory spec. background_run additionally
+# needs the shell-tools gate (VIBE_TRADING_ENABLE_SHELL_TOOLS=1, injected by the
+# router) since it runs arbitrary commands inside the guest. See
+# PRODUCT_DESIGN.md §2.3.
 _TENANT_SAFE_BLOCKED_NAMES = {
     "propose_mandate_profiles",
 }
@@ -55,7 +54,9 @@ _TENANT_SAFE_BLOCKED_PREFIXES = ("trading_",)
 
 def _tenant_safe_enabled() -> bool:
     """Whether the multi-tenant safety profile is active for this process."""
-    return os.getenv("VIBE_TRADING_TENANT_SAFE", "").strip().lower() in {"1", "true", "yes"}
+    from src.config.tenant import tenant_safe_enabled
+
+    return tenant_safe_enabled()
 
 
 def _discover_subclasses() -> list[type[BaseTool]]:
@@ -177,7 +178,13 @@ def build_registry(
             elif cls in goal_tool_classes:
                 registry.register(cls(default_session_id=session_id, event_callback=event_callback))
             elif cls is SwarmTool:
-                registry.register(cls(include_shell_tools=include_shell_tools, event_callback=event_callback))
+                registry.register(
+                    cls(
+                        include_shell_tools=include_shell_tools,
+                        event_callback=event_callback,
+                        session_id=session_id or "",
+                    )
+                )
             else:
                 registry.register(cls())
         except Exception as exc:

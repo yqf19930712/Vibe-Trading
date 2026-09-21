@@ -108,7 +108,16 @@ class OptionsPricingTool(BaseTool):
     """Options pricing tool: Black-Scholes theoretical price and Greeks."""
 
     name = "options_pricing"
-    description = "Options pricing: compute theoretical price and Greeks using the Black-Scholes model."
+    description = (
+        "Options pricing: Black-Scholes theoretical price and Greeks "
+        "(delta/gamma/theta/vega) of a single European call/put from spot, "
+        "strike, expiry_days, annualised volatility (e.g. 0.25) and option_type. "
+        "Use it for single-leg valuation and scenario tables; multi-leg payoff "
+        "and options backtests are skills, not this tool. Returns {status:'ok', "
+        "price, delta, gamma, theta, vega, inputs}; status:'degenerate' with a "
+        "warning at expiry (T=0) or on extreme inputs, status:'error' on invalid "
+        "inputs (non-positive spot/strike/volatility, unknown option_type)."
+    )
     parameters = {
         "type": "object",
         "properties": {

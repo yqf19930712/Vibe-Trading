@@ -4,6 +4,8 @@ category: data-source
 description: CCXT unified crypto exchange library (100+ exchanges). Free public market data. Fallback when OKX is unavailable.
 ---
 
+> **Hosted sandbox note:** in the managed multi-tenant sandbox, `bash` subprocesses carry neither data-source credentials (`TUSHARE_TOKEN` / `TICKFLOW_API_KEY` / `IFIND_MCP_TOKEN`) nor direct access to sites outside mainland China. Use `get_market_data` for OHLCV and `read_url` for web pages; the script examples in this skill only work in a self-hosted deployment where the token and network are available to the shell.
+
 ## Overview
 
 CCXT is a unified cryptocurrency exchange trading library supporting 100+ exchanges including Binance, Bybit, OKX, Coinbase, Kraken, and more. Public market data (OHLCV, tickers, order books) requires no API key.

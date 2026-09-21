@@ -39,7 +39,9 @@ class SaveSkillTool(BaseTool):
         "least 2 relevant existing skills (by load_skill name) so the skill "
         "graph stays navigable — pick candidates from the Skills summary in "
         "the system prompt and confirm each name with load_skill before "
-        "linking it."
+        "linking it. Skills are indexed by their frontmatter name: content "
+        "whose frontmatter name matches a bundled skill replaces that bundled "
+        "skill's summary and body for this user."
     )
     is_readonly = False
     parameters = {
@@ -105,7 +107,11 @@ class PatchSkillTool(BaseTool):
     name = "patch_skill"
     description = (
         "Fix or update an existing skill by replacing specific text. "
-        "Useful when a skill has outdated API parameters or incorrect examples."
+        "Useful when a skill has outdated API parameters or incorrect examples. "
+        "Patching a bundled skill first copies it whole into "
+        "~/.vibe-trading/skills/user/ (copy-on-write): from then on your copy "
+        "permanently shadows the bundled version, including any later bundled "
+        "updates; delete_skill on the copy restores the bundled one."
     )
     is_readonly = False
     parameters = {
@@ -181,7 +187,8 @@ class DeleteSkillTool(BaseTool):
     description = (
         "Delete a user-created skill and all its files. "
         "Only works on skills in ~/.vibe-trading/skills/user/. "
-        "Cannot delete bundled skills."
+        "Cannot delete bundled skills; deleting the user copy that patch_skill "
+        "made of a bundled skill restores the bundled version."
     )
     is_readonly = False
     parameters = {

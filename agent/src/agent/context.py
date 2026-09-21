@@ -6,6 +6,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from src.agent.context_policy import mark_request_message
 from src.agent.memory import WorkspaceMemory
 from src.agent.skills import SkillsLoader
 from src.agent.tools import ToolRegistry
@@ -211,7 +212,7 @@ class ContextBuilder:
                 if recalls:
                     lines = [f"- **{r.title}** ({r.memory_type}): {r.body[:500]}" for r in recalls]
                     recall_block = "\n".join(lines)
-                    # F7②: recalled bodies are DATA (possibly distilled from
+                    # Recalled bodies are DATA (possibly distilled from
                     # external content) — declare them non-instructional so an
                     # injected imperative inside a stored memory does not read
                     # as a directive.
@@ -226,7 +227,9 @@ class ContextBuilder:
             except Exception as exc:
                 logger.debug("Auto-recall failed: %s", exc)
 
-        messages.append({"role": "user", "content": enriched})
+        # Marked as this attempt's request so the context layers can tell it
+        # from replayed history / handoff summaries by class, not position.
+        messages.append(mark_request_message({"role": "user", "content": enriched}))
         return messages
 
     def _format_tool_descriptions(self) -> str:
@@ -235,7 +238,7 @@ class ContextBuilder:
         The full description + per-parameter schema of every tool is already
         sent to the API in the ``tools`` payload on every call — repeating it
         here duplicated thousands of tokens in the system prompt for zero
-        information gain (E5). The prompt only needs a compact index: tool
+        information gain. The prompt only needs a compact index: tool
         name + first sentence of its description.
         """
         lines = []

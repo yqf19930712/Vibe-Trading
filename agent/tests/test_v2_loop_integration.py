@@ -46,6 +46,7 @@ class _ScriptedLLM:
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        tool_choice: str | None = None,
     ) -> _Response:
         idx = min(self.stream_calls, len(self.script) - 1)
         self.stream_calls += 1

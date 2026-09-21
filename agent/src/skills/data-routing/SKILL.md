@@ -4,6 +4,8 @@ category: data-source
 description: Data source selection decision tree. Load this skill BEFORE any backtest or data-fetching task to choose the best available data source.
 ---
 
+> **Hosted sandbox note:** in the managed multi-tenant sandbox, `bash` subprocesses carry neither data-source credentials (`TUSHARE_TOKEN` / `TICKFLOW_API_KEY` / `IFIND_MCP_TOKEN`) nor direct access to sites outside mainland China. Use `get_market_data` for OHLCV and `read_url` for web pages; the script examples in this skill only work in a self-hosted deployment where the token and network are available to the shell.
+
 ## Data Source Overview
 
 | Source | Markets | Auth Required | Network | Skill |

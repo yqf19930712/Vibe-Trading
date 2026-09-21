@@ -15,7 +15,14 @@ class WriteFileTool(BaseTool):
     """Create or overwrite a workspace file, creating parent directories as needed."""
 
     name = "write_file"
-    description = "Write content to a file in the workspace. Creates parent directories automatically."
+    description = (
+        "Write content to a file under run_dir (path is relative to run_dir), "
+        "creating parent directories; an existing file is overwritten whole — "
+        "use edit_file for a targeted change. Use it for strategy code "
+        "(code/signal_engine.py, config.json), notes and reports. Returns "
+        "{status:'ok', path, bytes_written}; status:'error' with the reason when "
+        "the path resolves outside run_dir or the write fails."
+    )
     is_readonly = False
     parameters = {
         "type": "object",

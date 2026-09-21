@@ -48,6 +48,9 @@ class WorkerStatus(str, Enum):
     fabricated/mock numbers, unparsed tool markup, or a data agent that
     made no tool call and wrote no report). It must never be folded into
     ``completed`` (see P01/P03).
+
+    ``cancelled`` is the run's cancel signal landing inside the worker (per
+    iteration, or before a retry); it is never retried.
     """
 
     completed = "completed"
@@ -55,6 +58,7 @@ class WorkerStatus(str, Enum):
     timeout = "timeout"
     token_limit = "token_limit"
     incomplete = "incomplete"
+    cancelled = "cancelled"
 
 
 class SwarmAgentSpec(BaseModel):
@@ -204,7 +208,7 @@ class WorkerResult(BaseModel):
     """Return value after worker execution completes.
 
     Attributes:
-        status: WorkerStatus — completed|failed|timeout|token_limit|incomplete.
+        status: WorkerStatus — completed|failed|timeout|token_limit|incomplete|cancelled.
         summary: Execution summary.
         artifact_paths: List of generated artifact file paths.
         iterations: Actual ReAct iterations executed.

@@ -26,6 +26,9 @@ class _SecretRegistry:
 
     _tools: dict[str, Any] = {}
 
+    def get_definitions(self) -> list[dict[str, Any]]:
+        return []
+
     def get(self, tool_name: str) -> _Tool:
         return _Tool()
 
@@ -98,6 +101,7 @@ class _LongAnswerLLM:
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        tool_choice: str | None = None,
     ) -> _LongAnswerResponse:
         del messages, tools, on_reasoning_chunk
         if on_text_chunk:

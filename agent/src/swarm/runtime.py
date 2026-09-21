@@ -56,8 +56,8 @@ logger = logging.getLogger(__name__)
 _RETRYABLE_WORKER_STATUSES = frozenset({"failed", "incomplete"})
 
 # Cap on a single upstream report injected into a downstream worker's system
-# prompt (V2). ``task_summaries`` holds the full report.md text, and an
-# editor/PM role with several upstreams used to concatenate all of them with no
+# prompt. ``task_summaries`` holds the full report.md text, and an editor/PM
+# role with several upstreams would otherwise concatenate all of them with no
 # budget at all. Workers have ``read_file``, so the pointer is enough.
 UPSTREAM_SUMMARY_MAX_CHARS = 8_000
 _UPSTREAM_HEAD_CHARS = 6_000
@@ -105,6 +105,65 @@ def _clip_upstream_summary(
     )
 
 
+# Process-wide cancel registry. Runs are started by whichever SwarmRuntime
+# instance the caller built (the agent tool builds one per call, the REST API
+# holds a singleton), but a cancel arrives through a different path — the
+# session layer, the API, a later tool call resuming by run_id — so the
+# events are keyed by run_id at module level, not per instance.
+_CANCEL_EVENTS: dict[str, threading.Event] = {}
+# session_id -> run_ids the session's attempts are (or were) waiting on, so a
+# session-level cancel / delete can stop a run whose waiter is already gone.
+_SESSION_RUNS: dict[str, set[str]] = {}
+_RUN_SESSION: dict[str, str] = {}
+_REGISTRY_LOCK = threading.Lock()
+
+
+def cancel_run(run_id: str) -> bool:
+    """Signal cancellation for a running swarm.
+
+    Returns:
+        True if a live run received the signal, False if it is unknown or
+        already finished.
+    """
+    with _REGISTRY_LOCK:
+        cancel_event = _CANCEL_EVENTS.get(run_id)
+    if cancel_event is None:
+        return False
+    cancel_event.set()
+    return True
+
+
+def register_session_run(session_id: str, run_id: str) -> None:
+    """Remember that ``session_id`` is waiting on ``run_id`` (no-op when empty)."""
+    if not session_id or not run_id:
+        return
+    with _REGISTRY_LOCK:
+        _SESSION_RUNS.setdefault(session_id, set()).add(run_id)
+        _RUN_SESSION[run_id] = session_id
+
+
+def cancel_session_runs(session_id: str) -> list[str]:
+    """Cancel every live run registered to ``session_id``; returns those hit."""
+    if not session_id:
+        return []
+    with _REGISTRY_LOCK:
+        run_ids = sorted(_SESSION_RUNS.get(session_id, ()))
+    return [rid for rid in run_ids if cancel_run(rid)]
+
+
+def _forget_run(run_id: str) -> None:
+    """Drop a finished run from the cancel and session registries."""
+    with _REGISTRY_LOCK:
+        _CANCEL_EVENTS.pop(run_id, None)
+        session_id = _RUN_SESSION.pop(run_id, None)
+        if session_id is not None:
+            runs = _SESSION_RUNS.get(session_id)
+            if runs is not None:
+                runs.discard(run_id)
+                if not runs:
+                    _SESSION_RUNS.pop(session_id, None)
+
+
 class SwarmRuntime:
     """Swarm DAG orchestration engine.
 
@@ -138,7 +197,6 @@ class SwarmRuntime:
         self._store = store
         self._max_workers = max_workers
         self._agent_config = agent_config
-        self._cancel_events: dict[str, threading.Event] = {}
         self._live_callbacks: dict[str, Callable] = {}
         self._lock = threading.Lock()
 
@@ -190,8 +248,9 @@ class SwarmRuntime:
         self._store.create_run(run)
 
         cancel_event = threading.Event()
+        with _REGISTRY_LOCK:
+            _CANCEL_EVENTS[run.id] = cancel_event
         with self._lock:
-            self._cancel_events[run.id] = cancel_event
             if live_callback is not None:
                 self._live_callbacks[run.id] = live_callback
 
@@ -221,12 +280,7 @@ class SwarmRuntime:
         Returns:
             True if cancellation was signalled, False if run not found.
         """
-        with self._lock:
-            cancel_event = self._cancel_events.get(run_id)
-        if cancel_event is None:
-            return False
-        cancel_event.set()
-        return True
+        return cancel_run(run_id)
 
     def _emit_event(self, run_id: str, event: SwarmEvent) -> None:
         """Persist an event and forward to live callback if registered.
@@ -286,7 +340,9 @@ class SwarmRuntime:
             2. Initialize TaskStore, save all tasks
             3. Compute topological layers
             4. For each layer:
-               a. Check cancellation
+               a. Check cancellation (workers also check it per iteration and
+                  before each retry, so a cancel lands mid-layer, not only
+                  at the next layer boundary)
                b. Submit all tasks to ThreadPoolExecutor
                c. Collect results, resolve dependencies, update store
             5. Update run status to completed/failed
@@ -392,6 +448,31 @@ class SwarmRuntime:
                                 },
                             ),
                         )
+                    elif result.status == "cancelled":
+                        all_succeeded = False
+                        task_store.update_status(
+                            tid,
+                            TaskStatus.cancelled,
+                            error=redact_internal_paths(result.error) or "cancelled",
+                            completed_at=result.finished_at
+                            or datetime.now(timezone.utc).isoformat(),
+                            worker_iterations=result.iterations,
+                            llm_ms=result.llm_ms,
+                            tool_ms=result.tool_ms,
+                        )
+                        self._emit_event(
+                            run_id,
+                            self._make_event(
+                                "task_cancelled",
+                                task_id=tid,
+                                data={
+                                    "iterations": result.iterations,
+                                    "input_tokens": result.input_tokens,
+                                    "output_tokens": result.output_tokens,
+                                    "finished_at": result.finished_at,
+                                },
+                            ),
+                        )
                     else:
                         all_succeeded = False
                         task_store.update_status(
@@ -463,8 +544,8 @@ class SwarmRuntime:
         self._emit_event(run_id, self._make_event("run_completed", data={"status": final_status.value}))
 
         # Cleanup cancel event and live callback
+        _forget_run(run_id)
         with self._lock:
-            self._cancel_events.pop(run_id, None)
             self._live_callbacks.pop(run_id, None)
 
     def _sync_run_tasks_snapshot(self, run: SwarmRun, task_store: TaskStore) -> None:
@@ -645,9 +726,9 @@ class SwarmRuntime:
                 )
 
                 # Build upstream summaries from input_from mapping.
-                # V2: each upstream report is capped — the value here is the
-                # full report.md text, and a multi-upstream role concatenated
-                # every one of them into its system prompt unbudgeted. Over the
+                # Each upstream report is capped — the value here is the full
+                # report.md text, and a multi-upstream role would otherwise
+                # concatenate every one of them into its system prompt. Over the
                 # cap the worker gets head + tail and the artifact path to
                 # read_file (book §2.7.6: return conclusions plus a pointer,
                 # not the whole document).
@@ -679,6 +760,7 @@ class SwarmRuntime:
                         run_id=run.id,
                         include_shell_tools=include_shell_tools,
                         grounding_block=grounding_block,
+                        cancel_event=cancel_event,
                     ),
                 )
                 futures[future] = tid
@@ -738,12 +820,14 @@ class SwarmRuntime:
         run_id: str,
         include_shell_tools: bool = False,
         grounding_block: str = "",
+        cancel_event: threading.Event | None = None,
     ) -> WorkerResult:
         """Run a worker with automatic retry on failure.
 
         Retries up to agent_spec.max_retries times. Emits a "task_retry" event
         before each retry attempt. Token counts are accumulated across all
-        attempts.
+        attempts. A set ``cancel_event`` stops the task before its first run
+        and before every retry (the worker itself checks it per iteration).
 
         Args:
             agent_spec: Agent role specification.
@@ -769,6 +853,19 @@ class SwarmRuntime:
         result: WorkerResult | None = None
 
         for attempt in range(max_retries + 1):
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = WorkerResult(
+                    status="cancelled",
+                    summary=result.summary if result is not None else "",
+                    error="cancelled before " + ("retry" if attempt > 0 else "start"),
+                    iterations=result.iterations if result is not None else 0,
+                    input_tokens=cumulative_input_tokens,
+                    output_tokens=cumulative_output_tokens,
+                    llm_ms=cumulative_llm_ms,
+                    tool_ms=cumulative_tool_ms,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
+                return cancelled
             if attempt > 0:
                 self._emit_event(
                     run_id,
@@ -800,9 +897,10 @@ class SwarmRuntime:
                 include_shell_tools=include_shell_tools,
                 grounding_block=grounding_block,
                 agent_config=self._agent_config,
+                cancel_event=cancel_event,
             )
             # Real per-task completion time. The layer barrier persists task
-            # status much later (all tasks used to share one completed_at).
+            # status much later (tasks must not share one completed_at).
             result = result.model_copy(
                 update={"finished_at": datetime.now(timezone.utc).isoformat()}
             )

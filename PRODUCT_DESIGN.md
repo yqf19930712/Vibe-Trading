@@ -13,6 +13,7 @@
 7. [会话连续性](#7-会话连续性)
 8. [与 laicai 的对接](#8-与-laicai-的对接)
 9. [观测、预算与出境代理（概要）](#9-观测预算与出境代理概要)
+10. [附录 A：测试矩阵（验收基线）](#附录-a测试矩阵验收基线)
 
 ## 1. 系统定位与拓扑
 
@@ -93,14 +94,14 @@ stateDiagram-v2
 
 1. **MicroVM 硬边界**：guest 独立内核 + 独立 rootfs（模板镜像 + 4G writable layer）。shell 工具（`bash` / `background_run`）的任意命令执行落在 guest 内，宿主机不暴露；跨租户无共享文件系统、无共享进程空间。宿主侧唯一与 guest 共享的路径是该租户自己的 bind-mount 目录，其他租户的目录不可见。
 2. **HOME 收口**：镜像内以用户 `vibe` 运行，`HOME=/home/vibe`，`~/.vibe-trading` 是宿主 `/data/shared/vibe/<tk>` 的 bind-mount → 长期记忆、搜索索引、oauth、shadow 账户、GoalStore 等一切 `Path.home()` 派生状态都在宿主的租户目录里，跨 pause/resume、跨沙箱重建持久。guest 内以 uid 1000 可在该目录任意建文件（含 symlink），因此 router 侧凡是宿主直读直写这些路径的端点都拒绝 symlink 与目录外解析（见 §3.4）。
-3. **shell 子进程最小 env**（`agent/src/tools/subprocess_env.py`）：`bash` / `background_run` 不继承引擎进程 env，只带白名单（`PATH`/`HOME`/locale/`TZ`/`TMPDIR`/python venv 变量 + 全部 `VIBE_*`），且名字含 `_KEY`/`_TOKEN`/`_SECRET`/`_PASSWORD` 段或以 `OPENAI_`/`ANTHROPIC_`/`LANGCHAIN_` 开头者一律剔除——`env`、`cat .env` 之类命令拿不到全租户共享的 LLM/数据源凭据。配套**按值脱敏**（`redaction.redact_secret_values`）：引擎进程 env 里凭据形名字、长度 ≥12 的值，在任何工具结果进入轨迹/trace/校验器之前替换为 `[redacted:<KEYNAME>]`。引擎自身的 LLM 调用是进程内 httpx，不受影响。
+3. **子进程最小 env**（`agent/src/tools/subprocess_env.py`）：引擎替模型拉起的每个子进程都不继承引擎进程 env。`bash` / `background_run` 与 MCP stdio 服务端子进程（`tools/mcp.py`）只带白名单（`PATH`/`HOME`/locale/`TZ`/`TMPDIR`/python venv 变量 + 全部 `VIBE_*`；MCP 再叠加操作员写在该 server `env` 块里的变量），`backtest` 的 Runner 子进程（`core/runner.py`，会 import 模型写的 `signal_engine.py`，AST 扫描只拦 import 期语句、拦不住方法体里的 `os.environ`）带 `backtest_subprocess_env()` = 同一白名单 + loader 在子进程内认证用的三个数据 token（`TUSHARE_TOKEN`/`TICKFLOW_API_KEY`/`IFIND_MCP_TOKEN`）+ 代理/CA 变量（`HTTP(S)_PROXY`/`NO_PROXY` 等）与 `TUSHARE_`/`TICKFLOW_`/`IFIND_`/`CCXT_`/`OKX_`/`FUTU_`/`RSSHUB_` 前缀的调参项。名字含 `_KEY`/`_TOKEN`/`_SECRET`/`_PASSWORD` 段或以 `OPENAI_`/`ANTHROPIC_`/`LANGCHAIN_` 开头者一律剔除，`API_AUTH_KEY`/`JINA_API_KEY`/`ROUTER_*` 不进任何子进程——`env`、`cat .env`、回测策略里 `open("artifacts/x").write(os.environ)` 之类都拿不到全租户共享的 LLM 凭据。配套**按值脱敏**（`redaction.redact_secret_values`）：引擎进程 env 里凭据形名字、长度 ≥12 的值，在任何工具结果进入轨迹/trace/校验器之前替换为 `[redacted:<KEYNAME>]`。引擎自身的 LLM 调用是进程内 httpx，不受影响。同一边界的配置面：租户档位（`VIBE_TRADING_TENANT_SAFE=1`）下 `src/config/loader.py` 不读 `~/.vibe-trading/agent.json` / `swarm-agent.json`（那是租户可写的 bind-mount，bash 写一个文件就能让下一次 attempt 以引擎身份拉起任意 stdio 命令），MCP 服务端只认 `VIBE_TRADING_AGENT_CONFIG` / `VIBE_TRADING_SWARM_AGENT_CONFIG` 指向的镜像内只读路径（生产模板不放这两个文件，即租户引擎无 MCP 服务端）。
 4. **引擎 env 档位**（router 经 `/boot` 注入每个租户引擎）：
 
 | env | 作用 |
 |---|---|
 | `VIBE_DATA_DIR=/home/vibe/.vibe-trading` | `runs/` `sessions/` `uploads/` `logs/` `memory/` 统一落在租户数据根（= 宿主 bind-mount） |
 | `VIBE_MULTITENANT=1` | fail-loud 标记：缺 `VIBE_DATA_DIR` 时引擎拒绝启动，杜绝静默写共享安装目录 |
-| `VIBE_TRADING_TENANT_SAFE=1` | `build_registry` 排除**动钱红线**：`trading_*` 前缀全部工具 + `propose_mandate_profiles`。只读分析产品在任何配置下都不得触发真实下单/资金授权 |
+| `VIBE_TRADING_TENANT_SAFE=1` | `build_registry` 排除**动钱红线**：`trading_*` 前缀全部工具 + `propose_mandate_profiles`。只读分析产品在任何配置下都不得触发真实下单/资金授权。同时 `config/loader.py` 忽略 `~/.vibe-trading` 下的 `agent.json` / `swarm-agent.json`（见 §2.3 第 3 条） |
 | `VIBE_TRADING_ENABLE_SHELL_TOOLS=1` | 放开 shell 类工具（上游默认关）——任意命令执行已被 MicroVM 圈住，视为安全 |
 | `API_AUTH_KEY=<随机>` | 引擎对非 loopback 调用方的 Bearer 鉴权 key，见 §5 |
 | `VIBE_MAX_ITERATIONS=50` | 租户档位：ReAct 迭代上限（与引擎默认一致；router env 可覆盖） |
@@ -109,7 +110,7 @@ stateDiagram-v2
 | `VIBE_TRADING_ALLOWED_FILE_ROOTS=/tmp` | 放行 `/tmp` 给 `read_document` 等文件工具（模型习惯先下载到 /tmp 再读；沙箱硬隔离，/tmp 无宿主风险） |
 | `VIBE_TRADING_DATA_CACHE=1` | 开启 loader parquet 缓存（落租户数据目录，跨会话/重建持久） |
 | `VIBE_TRADING_SEARCH_BACKENDS=auto` | ddgs 搜索后端（9.x 已无 google/bing，auto 轮询全部引擎） |
-| `VIBE_TRADING_EGRESS_PROXY=http://127.0.0.1:8118` | 仅配置了 egress key 时注入；web_search/yfinance 专用出境代理（沙箱内加密隧道，见 §9） |
+| `VIBE_TRADING_EGRESS_PROXY=http://127.0.0.1:8118` | 仅配置了 egress key 时注入；web_search / read_url（r.jina.ai）/ yfinance 专用出境代理（沙箱内加密隧道，见 §9） |
 
 `run_swarm` / `session_search` / `background_*` 不裁剪：其状态已被 HOME + 租户目录限定在本租户内（如 `session_search` 索引 = 本租户自己的 `~/.vibe-trading/sessions.db`，只搜本人跨线程历史）。
 
@@ -160,7 +161,8 @@ stateDiagram-v2
 
 - **答案判定按 `attempt_id` + `metadata.ok`**：router 发消息拿回本轮 `attempt_id`，轮询 `GET /sessions/<sid>/messages` 直到出现 `linked_attempt_id` 匹配且内容非空的 assistant 消息——复用会话时绝不会把上一轮答案当本轮返回。引擎在这条回复的 `metadata` 里写 `ok`（attempt 是否 `completed`）与 `error`；`ok=false`（或旧引擎的 `metadata.status="failed"`）的消息**不是答案**：router 以 502 `deep engine failed: <error>` 走 **error 帧**（`stats.router.outcome="engine_failed"`），并按「未答即取消」对引擎发 cancel。`_classify_answer_message` 是这段判定的纯函数（`ops/cube-router/test_router_security.py` 钉住）。
 - **终帧携带 stats**：`stats.router` 是 router 分段计时（queue_wait/sandbox_ready/session/first_progress/total、cold_start/booted/session_recovered、attempt_id），`stats.engine` 是引擎 `attempt_stats` 事件原文（迭代/LLM 耗时/逐工具/tokens/data_fetches/data_gaps/early_finalize）——laicai 据此落 `deep_engine_runs`。字段明细见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)。
-- **未答即取消**：router 在拿不到答案的所有路径（504 超时、客户端断开、内部异常）对引擎 `POST /sessions/<sid>/cancel` 止损，避免孤儿 attempt 继续烧钱并阻塞同租户后续请求。
+- **未答即取消**：router 在拿不到答案的所有路径（504 超时、客户端断开、内部异常）对引擎 `POST /sessions/<sid>/cancel` 止损，避免孤儿 attempt 继续烧钱并阻塞同租户后续请求；deep_team 的 swarm run 随 attempt 一起被取消（worker 在下一次迭代/重试前停下）。ask_log 的 `engine_cancelled` 只在引擎回 `status=cancelled` 时为 true。
+- **准备段失败也是 `engine_failed`**：attempt 在引擎 loop 之外失败（LLM 凭据缺失、registry 构建、租户盘写满导致 run 目录/trace 建不出来）同样写 `ok=false` 回执并发 `attempt.failed` 事件；router 在事件流上看到本 attempt 的 `attempt.failed` 就立即以 502 `engine_failed` 收尾，不等满预算。
 - **会话失效自愈**：`vibeSessionId` 指向的会话在引擎侧 404（沙箱被删除重建、或该会话已被 `/sessions/delete` 删除）→ router 透明新建会话、重发本问，终帧回传**新** `vibeSessionId`，laicai 应重绑线程。上下文丢失但长期记忆仍在（记忆在 `memory/`，不在 session）。
 - 常见错误：401 未鉴权；400 model/llm/intent 参数非法；**400 问题过长**（引擎 pydantic 422 由 router 转译：detail 为「问题过长，请精简后重试（引擎单次输入上限 20000 字符，含注入的持仓上下文）」，其他 422 原样截 200 字符转 400）；503 实例忙（在途请求持有不同 LLM 指纹，或 RUNNING 沙箱满且无可换出者）；502 沙箱创建/引擎 boot 失败，或 attempt 以 `failed` 结束（`outcome=engine_failed`）；504 引擎超时。
 - 并发：全局同时处理的 `/ask` 数受 `VIBE_MAX_CONCURRENT_ACTIVE`（信号量）钳制，超出者排队等待。
@@ -177,14 +179,14 @@ stateDiagram-v2
 
 ### 3.2.1 `POST /sessions/delete` — 单会话删除
 
-laicai「删除对话」时清掉线程绑定的引擎会话（`sessions/<sid>/` 下的 `messages.jsonl`、含完整 prompt 的 `trace.jsonl`、压缩转储 `transcript_*.jsonl`、`handoff.json`）。请求体 `{"uid": "...", "session_id": "..."}`（`session_id` 须匹配 `[A-Za-z0-9_-]{4,64}`，否则 400）。响应：
+laicai「删除对话」时清掉线程绑定的引擎会话（`sessions/<sid>/` 下的 `messages.jsonl`、含完整 prompt 的 `trace.jsonl`、压缩转储 `transcript_*.jsonl`、`handoff.json`）以及该会话产生的全部 `runs/<id>/`（run 目录通过 `req.json` 的 `context.session_id` 归属会话；`req.json` 本身只存 prompt 前 200 字符 + 长度 + sha256，全文只在随会话删除的 `trace.jsonl` 里）。请求体 `{"uid": "...", "session_id": "..."}`（`session_id` 须匹配 `[A-Za-z0-9_-]{4,64}`，否则 400）。响应：
 
 | 情形 | 响应 |
 |---|---|
 | 成功 | 200 `{"ok": true, "mode": "engine" \| "offline", "deleted": bool}`；`deleted=false` = 会话本就不存在（幂等） |
 | 宿主目录删除失败 | 500 `{"ok": false, "mode": ..., "error": "..."}`，调用方可重试 |
 
-两种 `mode` 由 router 选定：**`engine`**——租户沙箱在 RUNNING，router 对引擎 `DELETE /sessions/<sid>`，引擎侧 `SessionService.delete_session` 取消该会话在跑的 loop、删目录、清 event bus、并删 `sessions.db` 里的消息行与会话行（FTS 影子表随触发器同步，`session_search` 不再返回死链）；引擎回 200/404 之外的状态或不可达则落到 offline 路径。**`offline`**——无 RUNNING 沙箱（未建/paused/被换出），直接删宿主 bind-mount 上的会话目录；`sessions.db` 的 FTS 行**不从宿主碰**（引擎可能在冻结的 VM 里持有 WAL），引擎的 `session_search` 容忍目录缺失，下次 reindex 时掉行。两种 mode 都在最后再做一次宿主侧目录删除兜底。会话目录是 symlink 时拒绝（500）。
+两种 `mode` 由 router 选定：**`engine`**——租户沙箱在 RUNNING，router 对引擎 `DELETE /sessions/<sid>`，引擎侧 `SessionService.delete_session` 取消该会话在跑的 loop、删目录、删归属该会话的 `runs/<id>/`、清 event bus、删 `sessions.db` 里的消息行与会话行（FTS 影子表随触发器同步），`api_server` 再删该会话的目标账本行（`GoalStore.delete_session_goals`）；引擎回 200/404 之外的状态或不可达则落到 offline 路径。**`offline`**——无 RUNNING 沙箱（未建/paused/被换出），直接删宿主 bind-mount 上的会话目录与其 `runs/<id>/`（按 `req.json` 扫描，逐个过 `_safe_tenant_path`，symlink 跳过不跟）；`sessions.db` 的 FTS 行与目标账本行**不从宿主碰**（引擎可能在冻结的 VM 里持有 WAL），由引擎自己清：引擎启动构造 `SessionService` 时 `reconcile_orphans()` 对账「`sessions.db` 有、目录已不在」的会话并删其 FTS 行与 goal 账本行；此外 `session_search` 把索引绑定到会话目录后，命中的会话目录缺失即当场删行、不返回。因此 offline 删掉的对话在引擎下次启动或下次被搜到时彻底消失，中间不会被 `session_search` 召回成 snippet。两种 mode 都在最后再做一次宿主侧目录删除兜底。会话目录是 symlink 时拒绝（500）。
 
 ### 3.3 `GET /healthz`
 
@@ -247,7 +249,7 @@ launcher（`ops/cube-engine/launcher.py`）是镜像的常驻进程与模板探�
 
 ```mermaid
 flowchart LR
-    A["router env 默认<br/>（FORWARD_ENV 白名单转发：<br/>OPENAI_* / ANTHROPIC_* / LANGCHAIN_* /<br/>TUSHARE_TOKEN / SEARCH_BACKENDS）"]
+    A["router env 默认<br/>（FORWARD_ENV 显式名单 +<br/>LANGCHAIN_* / VIBE_ANTHROPIC_* 前缀转发，<br/>清单见 README_CUSTOM env 表）"]
     B["/ask model 覆盖<br/>只改 LANGCHAIN_MODEL_NAME<br/>指纹 builtin:&lt;model&gt;"]
     C["/ask llm{} BYOK<br/>剔除 ANTHROPIC_*，注入<br/>LANGCHAIN_PROVIDER/MODEL_NAME +<br/>OPENAI_API_KEY/BASE_URL/API_BASE<br/>指纹 byok:sha256(...)[:16]"]
     A --> B --> C
@@ -269,7 +271,7 @@ flowchart LR
 | 沙箱规格 | 2C / 2G（模板默认） | MicroVM 硬隔离，租户内 runaway 不外溢 |
 | 沙箱 writable layer | 4G（模板 `--writable-layer-size`） | 沙箱 rootfs 的可写层，只装引擎代码之外的临时产物（pip 缓存、/tmp）。**租户数据不在这里** |
 | 租户数据目录 | 宿主 `/data/shared/vibe/<tk>`，**无文件系统配额** | 租户全部落盘状态（记忆/会话/trace/上传/runs/logs）在宿主 bind-mount 上，受限于宿主数据盘总容量。`VIBE_TENANT_QUOTA_BYTES`（默认 4G）**只是 `/healthz` / `/tenants/usage` 计算 `pct` 与 `over_watermark` 的分母**，不是 quota——写满不会被拒，直到宿主盘满（引擎侧记忆/索引写盘失败已结构化为工具错误，不杀 attempt）。超 80%（`VIBE_TENANT_WATERMARK`）打 warn 并列进 `over_watermark` tk8 列表；`disk_used_pct` 曝光整盘水位。**目前只曝光不清扫**——自动保留策略见 §3.3.1 与 `router.py` 的 `TODO(retention)`；单会话删除见 §3.2.1 |
-| RUNNING 沙箱上限 | `VIBE_MAX_INSTANCES`（默认 3；**生产现配 4**，配合 laicai 作战室四份专业报告并行，宿主已加 2G swap） | 8G 宿主机：OS + CubeSandbox 控制面 ≈2.5G，余量 ≈3 个 RUNNING；满则 pause LRU 空闲者，全忙 503 |
+| RUNNING 沙箱上限 | `VIBE_MAX_INSTANCES`（默认 3；**生产现配 4**，配合 laicai 作战室四份专业报告并行，宿主已加 2G swap） | 8G 宿主机：OS + CubeSandbox 控制面 ≈2.5G，余量 ≈3 个 RUNNING；满则 pause LRU 空闲者，全忙 503。计数含**正在冷启/重挂/resume 的实例**（`booting`，在建沙箱前就占位，`capacity_lock` 串行化「腾位 + 占位」），所以并发冷启与 router 重启后的 state 重挂都不会越过上限；booting 实例不会被 LRU 或 reaper 当空闲 pause 掉 |
 | 并发 `/ask` | `VIBE_MAX_CONCURRENT_ACTIVE`（默认 2；**生产现配 4**） | 信号量排队 |
 | 空闲 pause | `VIBE_IDLE_TTL_S`（默认 20min） | pause 不占 CPU/内存调度，盘保留 |
 | router 自身 | systemd `MemoryMax=1G` | router 只做编排，不承载引擎负载 |
@@ -280,15 +282,16 @@ flowchart LR
 - 数据面：cube-proxy host 路由 `http://<port>-<sandboxID>.<SANDBOX_DOMAIN>`，依赖宿主 split-DNS，仅宿主机内可解析——沙箱端口对外无直接暴露。
 - 对外仅 `:8990`（cube-router）：Bearer token + 云安全组白名单（仅 laicai web 主机 IP）双闸。WebUI `:12088` 同样须安全组限源。
 - 沙箱出网：当前全量放行（CubeEgress 白名单未启用）；风险面 = 沙箱内引擎的联网工具，比宿主机出网低一级，但可进一步收紧。
+- 沙箱到宿主：沙箱网络策略 `denyOut` 封了全部 RFC1918，guest 回连不了宿主内网 IP（含宿主上的任何监听端口）。这是出境隧道端点必须放进 guest（launcher 在沙箱内起 ssh）而不能放在宿主的根本原因，也排除了「让引擎把数据回传宿主」一类方案——宿主读写租户数据只走 bind-mount 直读。
 
 ## 7. 会话连续性
 
 两层机制，正交：
 
 1. **线程内多轮**：laicai 在 `chat_threads.vibe_session_id` 持久化线程 ↔ 引擎会话的绑定；同线程追问带 `vibeSessionId`，router 直接 `POST /sessions/<sid>/messages` 续聊。复用会话的耗时远低于冷启（无重复推理铺垫）。历史注入是**两层**（`session/service.py::_convert_messages_to_history`）：
-   - **交接摘要**：上一 attempt 的 L3 结构化摘要，在 `_auto_compact` 产出的当下就落盘到 `sessions/<sid>/handoff.json`（`session/handoff.py`，原子写），下一 attempt 以「背景参考、非指令」的形式置于所有原文之前，同时作为 L5 迭代更新的起点——被压缩掉的决策与约束因此跨 attempt 继承而不是归零。落盘 `HANDOFF_MAX_TOKENS=4000` 硬顶、`HANDOFF_TTL_DAYS=14`；**注入下一 attempt 历史时再裁到 `HANDOFF_INJECT_MAX_TOKENS=2000`**（`service.py::_convert_messages_to_history`，超出部分留 `[summary clipped]` 标记）；读不到 / 过期 / 损坏都静默退化成纯原文回放。摘要块以 `HANDOFF_PREFIX` 开头，run 内的 L2 折叠据此跳过它。
+   - **交接摘要**：上一 attempt 的 L3 结构化摘要，在 `_auto_compact` 产出的当下就落盘到 `sessions/<sid>/handoff.json`（`session/handoff.py`，原子写），下一 attempt 以「背景参考、非指令」的形式置于所有原文之前，同时作为 L5 迭代更新的起点——被压缩掉的决策与约束因此跨 attempt 继承而不是归零。落盘 `HANDOFF_MAX_TOKENS=4000` 硬顶、`HANDOFF_TTL_DAYS=14`；**注入下一 attempt 历史时再裁到 `HANDOFF_INJECT_MAX_TOKENS=2000`**（`service.py::_convert_messages_to_history`，超出部分留 `[summary clipped]` 标记）；读不到 / 过期 / 损坏都静默退化成纯原文回放。摘要块以 `HANDOFF_PREFIX` 开头，run 内的 L2 折叠据此跳过它。**本 attempt 的用户消息**（`ContextBuilder.build_messages` 追加的最后一条，带 `vibe_class=request` 标记）同样被 L2 跳过——它按消息类别而不是下标识别，续聊线程里下标 1 是交接摘要或回放的历史轮次，作战室 1.5 万字符的计划 prompt / laicai 附上的全量持仓因此不会在跑满几轮工具后被掏空中段；超过 token 阈值时由 L3 结构化摘要兜底。
    - **原文回放**：从最新往回按 `MAX_HISTORY_TOKENS=6000` 的 **token** 预算装（CJK 加权估算器 `core/token_estimate.py`：ASCII /4、CJK ×0.6/字）。装不下的旧轮次留一行「N 轮已省略」的显式占位，而不是静默消失。
-2. **跨会话长期记忆**：引擎的 `remember`/自动召回读写 `HOME/.vibe-trading/memory/`（= 宿主 `/data/shared/vibe/<tk>/memory/`），跨线程、跨会话、跨 pause/resume、跨引擎重启、跨沙箱重建持久；只有用户在 laicai 记忆页手删（`/memory/delete`）或 `/forget` 能清除。条目文件与 `MEMORY.md` 索引全部经 `core/atomic_write.py`（同目录 tmp + `os.replace`）写入，崩溃/盘满/并发读只会看到旧文件或新文件；索引不是合法 UTF-8 时（`UnicodeDecodeError`）被搬到 `MEMORY.md.corrupt-<ts>` 隔离、本 run 以空快照继续，条目文件不动，`consolidate()`/`_rebuild_index` 可从条目重建索引；单个条目解码失败只跳过该条。索引逼近 200 行上限时（≥180 行）每次 run 收尾自动跑一次 `consolidate()` 合并同名条目；同名同 type 覆盖会把旧正文折入新文件尾部的 merge 标记。
+2. **跨会话长期记忆**：引擎的 `remember`/自动召回读写 `HOME/.vibe-trading/memory/`（= 宿主 `/data/shared/vibe/<tk>/memory/`），跨线程、跨会话、跨 pause/resume、跨引擎重启、跨沙箱重建持久；只有用户在 laicai 记忆页手删（`/memory/delete`）、模型 `remember forget` 或 `/forget` 能清除，前两者都留审计痕迹（router 一行 `memory/delete tenant <tk8> name <file> existed=…` 日志；引擎 `memory_forgotten` progress 事件进 trace/SSE + 一行 info 日志）。条目文件与 `MEMORY.md` 索引全部经 `core/atomic_write.py`（同目录 tmp + `os.replace`）写入，崩溃/盘满/并发读只会看到旧文件或新文件；索引不是合法 UTF-8 时（`UnicodeDecodeError`）被搬到 `MEMORY.md.corrupt-<ts>` 隔离、本 run 以空快照继续，条目文件不动，`consolidate()`/`_rebuild_index` 可从条目重建索引；单个条目解码失败只跳过该条。**索引只有一个写入者** `_rebuild_index()`（add / remove / consolidate 都经它从条目文件重建），顺序即淘汰序：`user` 类条目永远在前，其余按 mtime 新到旧；满 200 行时被挤出快照的是最旧的非 `user` 条目（文件保留、`recall` 仍可召回，`remember save` 的返回带 warning），只有 200 行全是 `user` 条目时新存的非 `user` 条目才不进索引。每次读-改-写都在同目录的进程内 RLock + `.MEMORY.lock` 上的 `flock` 里进行，同租户并发 attempt 不会互相丢索引行；`flock` 只在同一内核内有保证，租户目录又是宿主 bind-mount 进 MicroVM 的，所以它在引擎内有效、router `/memory/delete` 取的同名锁只防宿主侧并发（有上限：非阻塞 + 重试，默认 5s，超时 warning 后不加锁照删），两侧之间不保证互斥——靠索引由条目文件重建自愈。`VIBE_MEMORY_TTL_DAYS`（router 转发，默认不设 = 永不过期）给非 `user` 条目一个软过期：超过 N 天未更新的条目退出索引快照与自动召回，文件保留、按标题仍可找到。`recall`/自动召回同分时按 frontmatter `created` 新者优先，再按 mtime。索引逼近 200 行上限时（≥180 行）每次 run 收尾自动跑一次 `consolidate()` 合并同名条目；同名同 type 覆盖会把旧正文折入新文件尾部的 merge 标记。
 
 失效路径见 §3.1 会话失效自愈：会话丢失只损失线程内上下文，长期记忆不受影响。用户删除对话时的会话清理见 §3.2.1。
 
@@ -296,12 +299,27 @@ flowchart LR
 
 laicai 侧的桥接实现（触发词门控、NDJSON 消费、进度事件透传、会话绑定、用量记账、`deep_engine_runs` 落库与 admin 观测面板）见主仓库 `app/src/server/vibe-trading.ts` 与 laicai 侧文档，此处不复述。
 
+**已知缺口——「来财AI 回顾历史」在功能层未闭环**：`session_search` 在租户档位在册，但引擎对「上次 / 之前那次分析」类问题倾向现场重算，laicai 外层模型也不主动把回顾类问题转交引擎；跨线程的回顾目前只靠长期记忆召回（§7）。
+
 ## 9. 观测、预算与出境代理（概要）
 
 详细技术文档见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)，此处只列骨架：
 
 - **观测主干**：引擎 attempt 结束发 `attempt_stats` 事件（SSE + trace.jsonl 双写）→ router 连同自身分段计时放进 `/ask` 终帧 `stats` → laicai 落 `deep_engine_runs` → admin 面板。`attempt_id` 是全链路 trace id（`deep_engine_runs` / `ask_log.jsonl` / `engine.jsonl` / SSE 事件同键）。
 - **引擎结构化日志**：`logging_setup.py` JSONL 落 `<VIBE_DATA_DIR>/logs/engine.jsonl`（多租户下宿主 bind-mount 直读），contextvars 绑定 session/attempt id 并经 `copy_context` 穿透工具线程。
-- **预算体系**：`deadline_s` 沿 laicai timeoutS → router（`max(60, 预算 − 已耗 − 10)`）→ messages API → AgentLoop 单向传递；剩余 <25% 起**每轮**随状态栏注入收尾提示，剩余不足一轮（`max(60s, 1.2×平均迭代)`）强制出文本（`early_finalize`，明标未完成部分）；单工具/swarm/取数链的内部超时都被剩余预算钳制（`core/budget.py` 的 `cap_timeout`）；router 对未答请求兜底 cancel，引擎侧取消事件（`core/cancel.py`）穿透工具等待与 swarm 轮询，在途工具 ≤1s 内被放弃。
+- **预算体系**：`deadline_s` 沿 laicai timeoutS → router（`max(60, 预算 − 已耗 − 10)`）→ messages API → AgentLoop 单向传递；剩余 <25% 起**每轮**随状态栏注入收尾提示，剩余不足一轮（`max(60s, 1.2×平均迭代)`）强制出文本（`early_finalize`，明标未完成部分；工具定义保留、`tool_choice=none` 禁止调用，Anthropic 原生通道对「有 tool 块却无 tools」的请求回 400）；输出被 `max_tokens` 截断（`finish_reason=length`）时续写而不是当作完整答案，续不完则末尾附「（输出被截断）」；单工具/swarm/取数链的内部超时都被剩余预算钳制（`core/budget.py` 的 `cap_timeout`）；router 对未答请求兜底 cancel，引擎侧取消事件（`core/cancel.py`）穿透工具等待与 swarm 轮询，在途工具 ≤1s 内被放弃。
 - **数据可靠性**：主源异常**或单标的空结果**都会沿 `FALLBACK_CHAINS` 逐源降级（总预算 120s），耗尽才返回 `_gaps` 明细（限频标注 `rate_limited`）；tushare 进程内节流 + 重试；`socket.setdefaulttimeout` 兜底无超时 SDK；loader 缓存对租户默认开启；每次 loader 调用经 `core/fetch_stats.py` 计入 attempt_stats 的 `data_fetches`/`data_gaps`。
-- **出境代理**：沙箱内 SSH 隧道（launcher 管理）→ B 服务器 loopback tinyproxy（域名白名单 FilterDefaultDeny）；仅 `web_search` 与 yfinance loader 走 `VIBE_TRADING_EGRESS_PROXY`，国内源与 LLM 上游直连。
+- **出境代理**：沙箱内 SSH 隧道（launcher 管理）→ B 服务器 loopback tinyproxy（域名白名单 FilterDefaultDeny）；三个消费方走 `VIBE_TRADING_EGRESS_PROXY`——`web_search`、`read_url`（上游 `r.jina.ai`，须在白名单内）与 yfinance loader，国内源与 LLM 上游直连。
+## 附录 A：测试矩阵（验收基线）
+
+设计定稿时确立、v1 生产验收执行通过、v2 切流复验核心项（过程见 [docs/HISTORY.md](docs/HISTORY.md) §6）。动隔离 / 连续性 / 容量相关代码时按此回归：
+
+| 类别 | 用例 |
+|---|---|
+| 隔离 | A `remember` 的内容 B 召不回/搜不到；A 的 uploads/shadow/sessions.db/goals/swarm 产物 B 不可见 |
+| 工具档位 | tenant-safe 下工具列表无 `trading_*`/`propose_mandate_profiles` |
+| 跨租户 session 拒绝 | B 用 A 的 `vibe_session_id` 发消息 → 404/拒绝，不串答 |
+| 连续性 | 同线程两轮答案不同；跨线程长期记忆本人可召回；`vibe_session_id` 失效 → 透明新建并回传新 id |
+| 资源 | 并发超限排队不 OOM；`VIBE_MAX_INSTANCES` 含 booting 实例不被越过；在途长任务不被 reaper 误杀（refcount / lock） |
+| 故障 | 沙箱被杀 → 下次自动重建；router 重启 → 不泄漏（state.json 重挂）、用户数据不丢 |
+| 注销 | `/forget` 后宿主数据目录删除、沙箱删除，失败返回 `{ok:false}` 供 laicai 重试 |

@@ -87,6 +87,9 @@ def test_latch_still_skips_second_call(tmp_path, fresh, monkeypatch, caplog):
     """Behavior preserved: still loads once per process (no log on re-entry)."""
     monkeypatch.setattr(llm, "_ENV_CANDIDATES", [tmp_path / "nope.env"])
     llm._ensure_dotenv()
+    # The first call's own log line is captured whenever an earlier test left
+    # the logger at INFO; only the re-entry must be silent.
+    caplog.clear()
     with caplog.at_level(logging.INFO, logger=LOGGER):
         llm._ensure_dotenv()  # latched -> early return, no new log
     assert not [r for r in caplog.records if "dotenv resolved" in r.getMessage()]

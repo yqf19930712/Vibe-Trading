@@ -25,14 +25,15 @@ from mcp import types as mcp_types
 
 from src.agent.tools import BaseTool
 from src.config.schema import MCPServerConfig
-from src.security.scanner import with_security_warnings
+from src.security.scanner import with_security_warnings, wrap_external_content
+from src.tools.subprocess_env import _subprocess_env
 
 logger = logging.getLogger(__name__)
 
-# F5: remote MCP results are third-party content. Unlike the in-house reader
-# tools (web_search / read_url / read_document), they used to reach the model
-# unbounded and unscanned. They now get a size cap and the same
-# prompt-injection warning layer the reader tools use.
+# Remote MCP results are third-party content: like the in-house reader tools
+# (web_search / read_url / read_document) they get a size cap and the same
+# prompt-injection warning layer, instead of reaching the model unbounded and
+# unscanned.
 _RESULT_CHAR_LIMIT = 50_000
 _STRING_FIELD_TRUNC = 20_000
 # Remote tool DESCRIPTIONS are untrusted third-party input too — they are
@@ -405,7 +406,11 @@ class MCPServerAdapter:
         transport_type = self.server_config.resolved_transport()
 
         if transport_type == "stdio":
-            env = os.environ.copy()
+            # Same allowlist as the shell tools: the child never sees the
+            # engine's LLM / data-source credentials or API_AUTH_KEY. Anything
+            # a server needs beyond that is what the operator wrote into its
+            # ``env`` block.
+            env = _subprocess_env()
             env.update(self.server_config.env)
             transport = StdioTransport(
                 command=self.server_config.command,
@@ -601,6 +606,11 @@ class MCPRemoteTool(BaseTool):
         payload = with_security_warnings(
             payload, fields=("text", "error", "data", "content.*.text")
         )
+        payload = _wrap_remote_text(
+            payload,
+            source=f"mcp:{payload.get('server') or 'remote'}/"
+            f"{payload.get('remote_tool') or self._spec.remote_name}",
+        )
         return json.dumps(payload, ensure_ascii=False, default=_json_default)
 
     def _filter_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -644,6 +654,33 @@ def _clamp_remote_description(description: str | None, tool_name: str, server_na
     if len(text) > _DESCRIPTION_CHAR_LIMIT:
         text = text[: _DESCRIPTION_CHAR_LIMIT - 1].rstrip() + "…"
     return text
+
+
+def _wrap_remote_text(payload: dict[str, Any], *, source: str) -> dict[str, Any]:
+    """Declare a remote MCP result's prose as untrusted data.
+
+    A third-party server's natural-language output (quotes commentary,
+    company events, search hits) is external content like a web page: the
+    flattened ``text`` and every ``content[*].text`` block are wrapped in the
+    same ``<external-content>`` envelope the reader tools use, with the
+    scanner's findings promoted to its banner.
+    """
+    findings = payload.get("security_warnings")
+    findings = findings if isinstance(findings, list) else None
+    text = payload.get("text")
+    if isinstance(text, str) and text:
+        payload["text"] = wrap_external_content(
+            text, source=source, kind="mcp_result", findings=findings
+        )
+    content = payload.get("content")
+    if isinstance(content, list):
+        for block in content:
+            block_text = block.get("text") if isinstance(block, dict) else None
+            if isinstance(block_text, str) and block_text:
+                block["text"] = wrap_external_content(
+                    block_text, source=source, kind="mcp_result", findings=findings
+                )
+    return payload
 
 
 def _truncate_long_strings(value: Any) -> Any:

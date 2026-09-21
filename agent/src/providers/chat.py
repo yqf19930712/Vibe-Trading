@@ -9,7 +9,15 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from src.providers.capabilities import ProviderCapabilities, get_provider_capabilities
 from src.providers.llm import build_llm
+
+# The only ``tool_choice`` value the engine sends. A forced text turn keeps
+# the tool definitions in the payload and tells the model not to call any:
+# the Anthropic Messages API rejects a request whose history contains
+# tool_use / tool_result blocks but no ``tools`` (400), so dropping the
+# definitions is not a way to force text there.
+TOOL_CHOICE_NONE = "none"
 
 
 def _content_text(content: Any) -> str:
@@ -151,6 +159,11 @@ class ProviderStreamError(RuntimeError):
         return not 400 <= self.status_code < 500
 
 
+def _effective_provider() -> str:
+    """Return the configured provider name (``LANGCHAIN_PROVIDER``, default openai)."""
+    return os.getenv("LANGCHAIN_PROVIDER", "openai").strip().lower() or "openai"
+
+
 def _redact_provider_error(message: str) -> str:
     """Redact configured secret/proxy values from provider errors."""
     redacted = message
@@ -180,19 +193,86 @@ class ChatLLM:
         """
         self.model_name = model_name
         self._llm = build_llm(model_name=model_name)
+        self._provider = _effective_provider()
+        self._caps: ProviderCapabilities = get_provider_capabilities(
+            self._provider, model_name or os.getenv("LANGCHAIN_MODEL_NAME", "")
+        )
 
-    def chat(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None, timeout: Optional[int] = None) -> LLMResponse:
+    @property
+    def provider(self) -> str:
+        """Effective provider name (``LANGCHAIN_PROVIDER``, default openai)."""
+        cached = getattr(self, "_provider", None)
+        if cached is None:
+            cached = self._provider = _effective_provider()
+        return cached
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        """Capability record of the effective provider/model."""
+        cached = getattr(self, "_caps", None)
+        if cached is None:
+            cached = self._caps = get_provider_capabilities(
+                self.provider, self.model_name or os.getenv("LANGCHAIN_MODEL_NAME", "")
+            )
+        return cached
+
+    @property
+    def sends_reasoning_content(self) -> bool:
+        """Whether assistant ``reasoning_content`` is sent back upstream.
+
+        Only providers that require the field on multi-turn continuations
+        (moonshot/kimi) count it toward the context estimate; every other
+        channel drops it at request serialization, so counting it would
+        inflate the estimate by the whole thinking transcript.
+        """
+        return self.capabilities.send_reasoning_content
+
+    @property
+    def supports_tool_choice_none(self) -> bool:
+        """Whether a forced text turn can keep the tools and send tool_choice none."""
+        return self.capabilities.tool_choice_none
+
+    def _bind(self, tools: Optional[List[Dict[str, Any]]], tool_choice: Optional[str]) -> Any:
+        """Return the model bound to ``tools`` honouring ``tool_choice``.
+
+        Args:
+            tools: Tool definitions, or None/empty for a bare call.
+            tool_choice: ``None`` (model decides) or :data:`TOOL_CHOICE_NONE`.
+
+        Returns:
+            A runnable ready for ``invoke`` / ``stream``.
+        """
+        if not tools:
+            return self._llm
+        if tool_choice is None:
+            return self._llm.bind_tools(tools)
+        if tool_choice != TOOL_CHOICE_NONE:
+            raise ValueError(f"unsupported tool_choice {tool_choice!r}")
+        if not self.capabilities.tool_choice_none:
+            # Provider fallback: omit the tools list for this turn.
+            return self._llm
+        choice: Any = {"type": TOOL_CHOICE_NONE} if self.provider == "anthropic" else TOOL_CHOICE_NONE
+        return self._llm.bind_tools(tools, tool_choice=choice)
+
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        timeout: Optional[int] = None,
+        tool_choice: Optional[str] = None,
+    ) -> LLMResponse:
         """Call the LLM synchronously.
 
         Args:
             messages: Message list (OpenAI format).
             tools: Tool definition list (OpenAI function calling format).
             timeout: Optional per-call timeout in seconds.
+            tool_choice: ``None`` or :data:`TOOL_CHOICE_NONE` (see ``_bind``).
 
         Returns:
             LLMResponse.
         """
-        llm = self._llm.bind_tools(tools) if tools else self._llm
+        llm = self._bind(tools, tool_choice)
         config = {"timeout": timeout} if timeout else {}
         ai_message = llm.invoke(messages, config=config)
         return self._parse_response(ai_message)
@@ -205,6 +285,7 @@ class ChatLLM:
         on_reasoning_chunk: Optional[Any] = None,
         timeout: Optional[int] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
+        tool_choice: Optional[str] = None,
     ) -> LLMResponse:
         """Stream the LLM and optionally forward text deltas (e.g. thinking).
 
@@ -221,12 +302,16 @@ class ChatLLM:
             should_cancel: Optional predicate polled per chunk; when it returns
                 True the stream stops early and the partial response is returned.
                 Lets a caller abort a live stream promptly (cooperative cancel).
+            tool_choice: ``None`` (model decides) or :data:`TOOL_CHOICE_NONE`
+                for a forced text turn — tools stay in the payload, the model
+                is told not to call any (providers without ``none`` support
+                get the tools omitted instead, see capabilities).
 
         Returns:
             Parsed ``LLMResponse``.
         """
         try:
-            llm = self._llm.bind_tools(tools) if tools else self._llm
+            llm = self._bind(tools, tool_choice)
             config = {"timeout": timeout} if timeout else {}
             accumulated = None
             for chunk in llm.stream(messages, config=config):
@@ -248,9 +333,8 @@ class ChatLLM:
                 return LLMResponse(content="", tool_calls=[], finish_reason="stop")
             return self._parse_response(accumulated)
         except Exception as exc:
-            provider = os.getenv("LANGCHAIN_PROVIDER", "openai").strip().lower() or "openai"
             model = self.model_name or os.getenv("LANGCHAIN_MODEL_NAME", "").strip() or "(unset)"
-            raise ProviderStreamError(provider=provider, model=model, original=exc) from exc
+            raise ProviderStreamError(provider=self.provider, model=model, original=exc) from exc
 
     @staticmethod
     def _tool_call_thought_signature_maps(ai_message: Any) -> tuple[dict[str, str], dict[int, str]]:

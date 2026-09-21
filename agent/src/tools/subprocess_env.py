@@ -1,12 +1,17 @@
-"""Minimal environment for shell subprocesses spawned by the agent's tools.
+"""Minimal environment for every subprocess the engine spawns for the model.
 
-Why this exists (review 2026-09-04, P0): ``bash`` / ``background_run`` used
-to inherit the whole engine process env. In the multi-tenant deployment that
-env carries the SHARED builtin LLM credentials (``OPENAI_API_KEY`` /
+Two policies live here: ``_subprocess_env()`` for ``bash`` / ``background_run``
+and MCP stdio servers, and ``backtest_subprocess_env()`` for the backtest
+Runner (the shell allowlist plus the data-source tokens and network plumbing
+the loaders read in that child).
+
+Why this exists: the engine process env in the multi-tenant deployment
+carries the SHARED builtin LLM credentials (``OPENAI_API_KEY`` /
 ``ANTHROPIC_*``), the data-source tokens (``TUSHARE_TOKEN``, ``JINA_API_KEY``,
 ``IFIND_MCP_TOKEN`` …) and the engine's own Bearer key (``API_AUTH_KEY``) —
-so a single ``env`` command run by the model dumped every tenant-shared
-secret into the tool result, the trace and the LLM context.
+if ``bash`` / ``background_run`` inherited it, a single ``env`` command run by
+the model would dump every tenant-shared secret into the tool result, the
+trace and the LLM context.
 
 The engine's own LLM calls are unaffected: those are in-process httpx calls
 that read ``os.environ`` directly, not subprocesses.
@@ -43,6 +48,50 @@ ALLOWED_EXACT: frozenset[str] = frozenset(
     }
 )
 ALLOWED_PREFIXES: tuple[str, ...] = ("VIBE_",)
+
+# Backtest subprocess (``src/core/runner.py``): the model's ``signal_engine.py``
+# is imported in that process, so it gets the same allowlist as ``bash`` plus
+# only what the data loaders in ``backtest/loaders`` actually read there —
+# the three data-source tokens they authenticate with, the loader tuning
+# knobs, and network plumbing (proxy / CA bundle) so OKX / yfinance / ccxt can
+# reach their endpoints. LLM credentials, the engine's ``API_AUTH_KEY``,
+# ``JINA_API_KEY`` and ``ROUTER_*`` never cross into it.
+BACKTEST_DATA_TOKENS: tuple[str, ...] = ("TUSHARE_TOKEN", "TICKFLOW_API_KEY", "IFIND_MCP_TOKEN")
+BACKTEST_ALLOWED_EXACT: frozenset[str] = frozenset(
+    {
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "all_proxy",
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        # Windows: CPython needs SYSTEMROOT to start, data libraries cache
+        # under the profile directories.
+        "SYSTEMROOT",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP",
+    }
+)
+# Loader tuning knobs (base URLs, timeouts, throttles); a credential-looking
+# name under these prefixes is still dropped unless listed in
+# ``BACKTEST_DATA_TOKENS``.
+BACKTEST_ALLOWED_PREFIXES: tuple[str, ...] = (
+    "TUSHARE_",
+    "TICKFLOW_",
+    "IFIND_",
+    "CCXT_",
+    "OKX_",
+    "FUTU_",
+    "RSSHUB_",
+)
 
 DENIED_PREFIXES: tuple[str, ...] = ("OPENAI_", "ANTHROPIC_", "LANGCHAIN_")
 # Matched as ``<seg>`` at the end of the name or followed by ``_`` (so
@@ -104,5 +153,31 @@ def _subprocess_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
         if is_secret_env_name(name):
             continue
         if name in ALLOWED_EXACT or name.startswith(ALLOWED_PREFIXES):
+            out[name] = value
+    return out
+
+
+def backtest_subprocess_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Build the env dict for the backtest runner subprocess.
+
+    The shell allowlist (:func:`_subprocess_env`) plus the data-source tokens
+    and network/loader plumbing listed in ``BACKTEST_*`` above. Every other
+    credential (LLM keys, ``API_AUTH_KEY``, ``JINA_API_KEY``, ``ROUTER_*``)
+    stays out: the model-written strategy code runs in that process.
+
+    Args:
+        source: Environment to filter (defaults to ``os.environ``).
+
+    Returns:
+        A new dict for ``subprocess.run(env=...)``.
+    """
+    env = os.environ if source is None else source
+    out = _subprocess_env(env)
+    for name, value in env.items():
+        if name in BACKTEST_DATA_TOKENS:
+            out[name] = value
+        elif name in BACKTEST_ALLOWED_EXACT:
+            out[name] = value
+        elif name.startswith(BACKTEST_ALLOWED_PREFIXES) and not is_secret_env_name(name):
             out[name] = value
     return out

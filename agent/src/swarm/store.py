@@ -63,10 +63,10 @@ def swarm_runs_root() -> Path:
     """Single source of truth for where swarm runs are persisted.
 
     The swarm store (mcp_server) and the run-dir sandbox allow-list
-    (src.tools.path_utils) must agree on this path. They previously each
-    derived ``<agent_root>/.swarm/runs`` independently; a packaging layout
-    where the two anchors resolved differently silently put every worker
-    run_dir outside the allow-list (P03-A). Deriving it here once keeps
+    (src.tools.path_utils) must agree on this path. Deriving
+    ``<agent_root>/.swarm/runs`` independently in each place lets a packaging
+    layout where the two anchors resolve differently silently put every worker
+    run_dir outside the allow-list. Deriving it here once keeps
     the store location and the allow-list from drifting again.
 
     Honors ``VIBE_DATA_DIR`` (multi-tenant: per-user HOME) so swarm run
@@ -548,8 +548,8 @@ class SwarmStore:
     def _atomic_write(self, path: Path, content: str) -> None:
         """Atomically write a file: write to a unique temp file then rename.
 
-        Same tmp + ``os.replace`` contract as ``src.core.atomic_write`` (review
-        2026-09-04), kept local so the Windows ``_replace_with_retry`` path
+        Same tmp + ``os.replace`` contract as ``src.core.atomic_write``, kept
+        local so the Windows ``_replace_with_retry`` path
         stays in front of the rename. The temp name carries the pid so two
         engine processes sharing a run dir cannot clobber each other's
         half-written temp, and a failed write never leaves a stray ``.tmp``

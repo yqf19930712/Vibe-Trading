@@ -1,8 +1,8 @@
 """cube-router — multi-tenant orchestrator for Vibe-Trading on CubeSandbox.
 
-Successor of ops/vibe-router/router.py. Same public API (`/ask` NDJSON,
-`/forget`, `/healthz`, same bearer auth), but tenant instances are no longer
-host processes: each tenant gets a KVM MicroVM sandbox created from a
+Same public API as the retired ops/vibe-router (`/ask` NDJSON, `/forget`,
+`/healthz`, same bearer auth), but tenant instances are KVM MicroVM sandboxes
+rather than host processes: each tenant gets a KVM MicroVM sandbox created from a
 CubeSandbox template (image: python + vibe-trading + in-guest launcher).
 
 Per-tenant layout inside the sandbox (template default):
@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fcntl
 import hashlib
 import hmac
 import json
@@ -90,10 +91,10 @@ DEFAULT_ASK_TIMEOUT_S = int(os.environ.get("VIBE_ASK_TIMEOUT_S", str(15 * 60)))
 # multi-iteration workers).
 SWARM_ASK_TIMEOUT_S = int(os.environ.get("VIBE_SWARM_ASK_TIMEOUT_S", str(2 * 60 * 60)))
 # THE single place a caller's budget tier is decided. Callers declare a
-# structured `intent` and the number is derived here — previously 7200 was
-# written out in four places (laicai chat-tools, laicai warlab-engine, the
-# SWARM_TIMEOUT env below, and the engine's swarm_tool), and the 2026-08-24
-# incident was exactly those four drifting apart. An explicit `timeoutS` still
+# structured `intent` and the number is derived here — writing 7200 out in
+# several places (laicai chat-tools, laicai warlab-engine, the SWARM_TIMEOUT
+# env below, the engine's swarm_tool) lets them drift apart. An explicit
+# `timeoutS` still
 # wins so laicai can be rolled back on its own without touching the router.
 BUDGET_BY_INTENT = {
     "standard": DEFAULT_ASK_TIMEOUT_S,
@@ -110,15 +111,43 @@ def budget_for(intent: Optional[str], explicit: Optional[int]) -> int:
 # attempt_id) so slow/failed asks can be traced without any extra infra.
 ASK_LOG = Path(os.environ.get("VIBE_ASK_LOG", "/var/lib/cube-router/ask_log.jsonl"))
 ASK_LOG_MAX_BYTES = 20 * 1024 * 1024
-# LLM / data-source env forwarded into each tenant engine (via launcher /boot).
+# LLM / data-source env forwarded into each tenant engine (via launcher /boot):
+# the explicit names below plus every router env var carrying one of the
+# FORWARD_ENV_PREFIXES. The engine reads its LLM knobs (thinking mode, output
+# cap, usage block, reasoning effort, …) from the LANGCHAIN_* / VIBE_ANTHROPIC_*
+# families, so the prefix rule is what lets router.env tune them without a
+# router code change; the explicit list carries the credentials and the
+# single-name knobs (VIBE_MAX_OUTPUT_TOKENS, VIBE_LENGTH_CONTINUATIONS, …).
 FORWARD_ENV = [
     "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_MODEL",
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-    "LANGCHAIN_PROVIDER", "LANGCHAIN_MODEL_NAME", "LANGCHAIN_TEMPERATURE",
-    "LANGCHAIN_NO_TEMPERATURE_MODELS",
+    "VIBE_MAX_OUTPUT_TOKENS", "VIBE_LENGTH_CONTINUATIONS", "VIBE_MEMORY_TTL_DAYS",
     "TUSHARE_TOKEN", "VIBE_TRADING_SEARCH_BACKENDS", "JINA_API_KEY",
-    "IFIND_MCP_TOKEN", "TICKFLOW_API_KEY",
+    "IFIND_MCP_TOKEN", "TICKFLOW_API_KEY", "TICKFLOW_BASE_URL",
 ]
+FORWARD_ENV_PREFIXES = ("LANGCHAIN_", "VIBE_ANTHROPIC_")
+# LangSmith shares the LANGCHAIN_ namespace: with these set, langchain-core in
+# the tenant engine would upload every prompt (holdings included) to a
+# third-party tracing service, so they never ride the prefix rule — whatever
+# router.env contains. Names from langchain-core / langsmith's own env lookups.
+FORWARD_ENV_DENY = frozenset({
+    "LANGCHAIN_API_KEY", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING",
+    "LANGCHAIN_ENDPOINT", "LANGCHAIN_BASE_URL", "LANGCHAIN_PROJECT",
+    "LANGCHAIN_SESSION", "LANGCHAIN_HANDLER", "LANGCHAIN_ENV",
+    "LANGCHAIN_CUSTOM_HEADERS", "LANGCHAIN_REVISION_ID",
+    "LANGCHAIN_HUB_API_URL", "LANGCHAIN_HUB_API_KEY",
+})
+FORWARD_ENV_DENY_PREFIXES = ("LANGSMITH_",)
+
+
+def forwarded_env_names(environ: "dict[str, str] | os._Environ[str]" = os.environ) -> list[str]:
+    """Names in ``environ`` that engine_env() forwards (explicit list + prefixes − deny list)."""
+    return sorted(
+        k for k in environ
+        if (k in FORWARD_ENV or k.startswith(FORWARD_ENV_PREFIXES))
+        and k not in FORWARD_ENV_DENY
+        and not k.startswith(FORWARD_ENV_DENY_PREFIXES)
+    )
 
 # In-guest egress tunnel credentials (optional): private key file on the host
 # + ssh destination (server B). Injected into each sandbox via launcher /boot.
@@ -168,7 +197,7 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
     Returns (env, api_key): the engine validates `Authorization: Bearer
     <API_AUTH_KEY>` on every non-loopback call, so the router must keep the
     key it minted for the instance."""
-    env = {k: os.environ[k] for k in FORWARD_ENV if k in os.environ}
+    env = {k: os.environ[k] for k in forwarded_env_names()}
     if llm is not None:
         for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
             env.pop(k, None)
@@ -189,12 +218,11 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
             "VIBE_TRADING_ENABLE_SHELL_TOOLS": "1",
         }
     )
-    # Tenant performance/reliability tier (batches 2+3). Router env overrides;
-    # incident 2026-08-24 showed the engine defaults (50 iters, 1800s tool and
-    # swarm timeouts) let a run outlive every caller budget.
-    # 2026-08-26: iterations back to 50 (operator decision) — 25 starved
-    # swarm-intent runs whose data-collection phase alone ate ~20 iterations
-    # (attempt c5810ef14c1e); wall-clock deadlines remain the hard stop.
+    # Tenant performance/reliability tier. Router env overrides. The engine
+    # defaults (1800s tool timeout) let a run outlive every caller budget;
+    # iterations stay at 50 because 25 starves swarm-intent runs whose
+    # data-collection phase alone eats ~20 iterations — wall-clock deadlines
+    # are the hard stop, not the iteration count.
     for key, default in (
         ("VIBE_MAX_ITERATIONS", "50"),
         ("VIBE_TRADING_DATA_CACHE", "1"),
@@ -206,10 +234,10 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
         # matching budget (intent="deep_team", or an explicit timeoutS).
         ("SWARM_TIMEOUT", str(SWARM_ASK_TIMEOUT_S)),
         # LLM streaming read timeout (httpx). The engine default of 120s is
-        # too tight for long-context opus-class calls: incident 2026-08-24, a
-        # swarm worker's stream went silent >120s twice in a row (ReadTimeout
-        # at iteration 10 and again on the task retry), failing the whole
-        # investment_committee run. 300s rides out thinking pauses while a
+        # too tight for long-context opus-class calls: a swarm worker's
+        # stream can go silent >120s twice in a row (ReadTimeout on the
+        # iteration and again on the task retry), failing the whole run.
+        # 300s rides out thinking pauses while a
         # genuinely dead upstream still fails within one worker iteration.
         ("TIMEOUT_SECONDS", "300"),
         # ddgs 9.x has no google/bing; "auto" rotates every engine it has.
@@ -221,9 +249,10 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
     ):
         env[key] = os.environ.get(key, default)
     # Whitelisted foreign egress: the launcher builds an in-guest SSH tunnel
-    # to server B's loopback tinyproxy (domain filter there); web_search and
-    # the yfinance loader then use VIBE_TRADING_EGRESS_PROXY. Key material is
-    # consumed by the launcher and never enters the engine process env.
+    # to server B's loopback tinyproxy (domain filter there); web_search,
+    # read_url (r.jina.ai) and the yfinance loader then use
+    # VIBE_TRADING_EGRESS_PROXY. Key material is consumed by the launcher and
+    # never enters the engine process env.
     if _EGRESS_KEY_B64 and EGRESS_SSH_DEST:
         env["VIBE_EGRESS_SSH_KEY_B64"] = _EGRESS_KEY_B64
         env["VIBE_EGRESS_SSH_DEST"] = EGRESS_SSH_DEST
@@ -293,7 +322,7 @@ async def sbx_info(sandbox_id: str) -> Optional[dict]:
     r = await api.get(f"/sandboxes/{sandbox_id}")
     if r.status_code == 404:
         return None
-    # Half-deleted sandbox (2026-08-27 incident): cubelet already reaped the
+    # Half-deleted sandbox: cubelet already reaped the
     # task but the CubeAPI/cubemaster record lingers, answering 500 with
     # "NotFoundAtCubelet". Treat it as gone so callers take the same
     # rebuild path as a clean 404 instead of erroring forever.
@@ -323,8 +352,8 @@ async def sbx_delete(sandbox_id: str) -> bool:
     CubeAPI refuses to delete a paused sandbox ("sandbox not in normal state")
     and answers 500 — which httpx does not raise on, so without the status check
     below the failure is swallowed and the sandbox leaks forever, holding disk
-    and a slot against VIBE_MAX_INSTANCES. Callers that must know (``/forget``,
-    P1 2026-09-04) read the bool; the self-heal paths ignore it as before.
+    and a slot against VIBE_MAX_INSTANCES. Callers that must know (``/forget``)
+    read the bool; the self-heal paths ignore it as before.
     """
     try:
         await sbx_resume(sandbox_id)
@@ -359,6 +388,10 @@ class Instance:
         self.last_activity = time.monotonic()
         self.lock = asyncio.Lock()
         self.paused = False
+        # Sandbox being created / resumed / booted for an ask: already counts
+        # as RUNNING for the capacity cap, never a pause victim, not yet
+        # usable by /sessions/delete.
+        self.booting = False
 
     @property
     def base_url(self) -> str:
@@ -373,6 +406,21 @@ pool: dict[str, Instance] = {}
 pool_mutex = asyncio.Lock()
 uid_locks: dict[str, asyncio.Lock] = {}
 active_sem = asyncio.Semaphore(MAX_CONCURRENT_ACTIVE)
+# Serialises "evict until there is room, then take the slot" so concurrent
+# cold starts / resumes see each other's reservations and the RUNNING count
+# never exceeds MAX_RUNNING.
+capacity_lock = asyncio.Lock()
+
+# Strong references for fire-and-forget tasks (engine cancel, reaper, sweep):
+# the event loop only keeps weak ones.
+_bg_tasks: set["asyncio.Task[Any]"] = set()
+
+
+def _spawn(coro: Any) -> "asyncio.Task[Any]":
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
 
 
 async def _launcher_health(inst: Instance) -> Optional[dict]:
@@ -417,10 +465,10 @@ async def _ensure_ready(
             await asyncio.sleep(1.5)
             h = await _launcher_health(inst)
         if h is None:
-            # 2026-08-27 incident: resume reported success but the VM never
-            # came up; cubelet then reaped the failed task, leaving a
-            # half-deleted record (sbx_info 500 NotFoundAtCubelet) that the
-            # 404-only self-heal never clears. Tear the sandbox down and drop
+            # Resume can report success while the VM never comes up; cubelet
+            # then reaps the failed task, leaving a half-deleted record
+            # (sbx_info 500 NotFoundAtCubelet) that a 404-only self-heal
+            # never clears. Tear the sandbox down and drop
             # the mapping HERE so the tenant's next ask cold-rebuilds cleanly.
             log.warning("tenant %s sandbox %s unreachable after resume; discarding",
                         inst.tk[:8], inst.sandbox_id[:12])
@@ -470,35 +518,88 @@ async def get_or_create(
                     state.pop(tk, None)
                     _save_state()
                 else:
+                    # Re-attached from state.json after a router restart: the
+                    # sandbox may be running or paused, either way it is not
+                    # counted yet.
                     inst = Instance(tk, st["sandbox_id"], st.get("llm_fp"), st.get("api_key"))
-        if inst is None:
-            await _evict_for_capacity()
-            sandbox_id = await sbx_create(tk)
-            inst = Instance(tk, sandbox_id, None)
-            if meta is not None:
-                meta["cold_start"] = True
-            log.info("tenant %s -> new sandbox %s", tk[:8], sandbox_id[:12])
-        env, api_key = engine_env(model, llm)
-        await _ensure_ready(inst, fp, env, api_key, meta=meta)
+                    inst.paused = True
+        fresh = inst is None
+        if fresh:
+            inst = Instance(tk, "", None)
+        # Anything not currently counted as RUNNING (new, re-attached, paused)
+        # takes its slot BEFORE the sandbox is created/resumed, so the cap
+        # holds while READY_TIMEOUT_S of boot is still in flight.
+        if fresh or inst.paused:
+            await _reserve_running_slot(inst)
+        try:
+            if fresh:
+                inst.sandbox_id = await sbx_create(tk)
+                if meta is not None:
+                    meta["cold_start"] = True
+                log.info("tenant %s -> new sandbox %s", tk[:8], inst.sandbox_id[:12])
+            env, api_key = engine_env(model, llm)
+            await _ensure_ready(inst, fp, env, api_key, meta=meta)
+        except BaseException as exc:
+            if fresh:
+                # Never became a usable tenant instance: give the slot back
+                # and drop the half-made sandbox instead of leaking it. On
+                # cancellation (client gone mid-boot) the delete runs
+                # detached so the cancel is not blocked on CubeAPI; the
+                # sandbox is in neither pool nor state, so nothing else
+                # would ever reap it.
+                if pool.get(tk) is inst:
+                    pool.pop(tk, None)
+                if inst.sandbox_id:
+                    if isinstance(exc, Exception):
+                        await sbx_delete(inst.sandbox_id)
+                    else:
+                        _spawn(sbx_delete(inst.sandbox_id))
+            raise
+        finally:
+            inst.booting = False
         if meta is not None:
             meta["sandbox_ready_ms"] = int((time.monotonic() - t0) * 1000)
-        async with pool_mutex:
-            pool[tk] = inst
         return inst
 
 
+async def _reserve_running_slot(inst: Instance) -> None:
+    """Make room under MAX_RUNNING and count ``inst`` as RUNNING (booting)."""
+    async with capacity_lock:
+        await _evict_for_capacity()
+        inst.paused = False
+        inst.booting = True
+        inst.last_activity = time.monotonic()
+        async with pool_mutex:
+            pool[inst.tk] = inst
+
+
 async def _evict_for_capacity() -> None:
-    """Cap concurrently RUNNING sandboxes: pause the LRU idle one when full."""
-    running = [i for i in pool.values() if not i.paused]
-    if len(running) < MAX_RUNNING:
-        return
-    idle = sorted((i for i in running if i.refcount == 0), key=lambda i: i.last_activity)
-    if not idle:
-        raise HTTPException(503, "all instances busy; retry shortly")
-    victim = idle[0]
-    log.info("pausing LRU tenant %s (%s)", victim.tk[:8], victim.sandbox_id[:12])
-    await sbx_pause(victim.sandbox_id)
-    victim.paused = True
+    """Pause LRU idle sandboxes until RUNNING (booting included) < MAX_RUNNING.
+
+    Raises 503 when the cap is reached and nothing idle is left to pause; a
+    booting instance is never a victim (it is not idle, it is on its way up),
+    nor is one whose per-instance lock is held (a request is inside the
+    engine — e.g. a session delete — even though its refcount is 0).
+    """
+    while True:
+        running = [i for i in pool.values() if not i.paused]
+        if len(running) < MAX_RUNNING:
+            return
+        idle = sorted(
+            (
+                i for i in running
+                if i.refcount == 0 and not i.booting and not i.lock.locked()
+            ),
+            key=lambda i: i.last_activity,
+        )
+        if not idle:
+            raise HTTPException(503, "all instances busy; retry shortly")
+        victim = idle[0]
+        log.info("pausing LRU tenant %s (%s)", victim.tk[:8], victim.sandbox_id[:12])
+        # Counted out before the pause call yields, so a concurrent count
+        # cannot hand the same slot to two callers.
+        victim.paused = True
+        await sbx_pause(victim.sandbox_id)
 
 
 # ── Vibe session helpers (unchanged semantics from v1) ───────────────────────
@@ -511,19 +612,42 @@ async def _vibe(inst: Instance, method: str, path: str, **kw):
     return await http.request(method, f"{inst.base_url}{path}", headers=headers, **kw)
 
 
-async def _cancel_attempt_bg(inst: Instance, sid: str, tk: str) -> None:
+async def _cancel_attempt_bg(
+    inst: Instance, sid: str, tk: str, stats: dict, finalize: Any = None
+) -> None:
     """Fire-and-forget engine cancel, detached from the (possibly dying) ask
     generator. Called from the unanswered path of _ask_stream: on client
     disconnect uvicorn *cancels* the generator task, so any `await` in its
     finally raises CancelledError before the HTTP request goes out — the
-    engine kept grinding, got frozen by pause, and resumed as a zombie that
-    422'd new asks (2026-08-28 incident). A separate task survives that
-    cancellation and reliably delivers the cancel."""
+    engine keeps grinding, gets frozen by pause, and resumes as a zombie that
+    422s new asks. A separate task survives that
+    cancellation and reliably delivers the cancel.
+
+    Owns the ask-log line for this ask: ``engine_cancelled`` means the engine
+    confirmed a loop or attempt received the signal (``status=cancelled``),
+    ``engine_cancel_status`` carries the raw answer (``no_active_loop``,
+    ``http_<code>``, ``unreachable``) so "sent" and "took effect" stay
+    distinguishable in the log.
+    """
     try:
-        await _vibe(inst, "POST", f"/sessions/{sid}/cancel", timeout=10.0)
-        log.info("cancelled unfinished attempt (tenant %s, sid %s)", tk[:8], sid)
+        r = await _vibe(inst, "POST", f"/sessions/{sid}/cancel", timeout=10.0)
+        status = f"http_{r.status_code}"
+        if r.status_code == 200:
+            try:
+                status = str((r.json() or {}).get("status") or "unknown")
+            except Exception:  # noqa: BLE001 - non-JSON body
+                status = "unknown"
+        stats["engine_cancel_status"] = status
+        stats["engine_cancelled"] = status == "cancelled"
+        log.info("cancel unfinished attempt (tenant %s, sid %s) -> %s", tk[:8], sid, status)
     except Exception as e:  # noqa: BLE001
+        stats["engine_cancel_status"] = "unreachable"
+        stats["engine_cancelled"] = False
         log.warning("background cancel failed (tenant %s, sid %s): %s", tk[:8], sid, e)
+    finally:
+        if finalize is not None:
+            finalize()
+        _record_ask(stats)
 
 
 async def _ensure_session(inst: Instance, vibe_session_id: Optional[str]) -> str:
@@ -548,7 +672,7 @@ async def _post_turn(
     payload: dict = {"content": query}
     if deadline_s is not None:
         # The engine finalizes with what it has before this budget runs out
-        # (batch 3) instead of grinding past the caller's timeout.
+        # instead of grinding past the caller's timeout.
         payload["deadline_s"] = round(deadline_s, 1)
     # Structured intent rides alongside deadline_s. Engines that don't know
     # these fields yet ignore them (the request model tolerates extras), so the
@@ -564,7 +688,7 @@ async def _post_turn(
     if r.status_code == 422:
         # Pydantic validation on the engine side. The one users actually hit
         # is the input length cap (portfolio context + question); say so
-        # instead of surfacing a bare 422 (P1 2026-09-04).
+        # instead of surfacing a bare 422.
         raise HTTPException(400, _engine_422_detail(r))
     r.raise_for_status()
     return r.json().get("attempt_id")
@@ -598,10 +722,10 @@ def _classify_answer_message(msg: dict, attempt_id: Optional[str]) -> tuple[str,
     Returns ``(kind, text)`` with kind ∈ {"skip", "answer", "failed"}. Pure
     so the router test can pin it without an engine.
 
-    A failed attempt used to be forwarded as the answer: the engine writes
-    an assistant message "Execution failed: …" linked to the attempt, and
-    the old loop accepted any non-empty linked assistant text (P1
-    2026-09-04). The engine now stamps ``metadata.ok`` / ``metadata.error``;
+    A failed attempt must not be forwarded as the answer: the engine writes
+    an assistant message "Execution failed: …" linked to the attempt, so
+    accepting any non-empty linked assistant text would hand that prose to
+    the user. The engine stamps ``metadata.ok`` / ``metadata.error``;
     ``metadata.status == "failed"`` (which older engines already wrote)
     is honoured as well.
     """
@@ -618,12 +742,39 @@ def _classify_answer_message(msg: dict, attempt_id: Optional[str]) -> tuple[str,
     return "answer", content
 
 
+class _FailSignal:
+    """``attempt.failed`` seen on the engine event stream for this attempt.
+
+    ``_wait_answer`` sleeps on it between message polls, so an attempt that
+    dies before writing anything (disk full in the engine's preparation
+    segment, registry build error) ends the ask at once instead of after
+    the whole budget.
+    """
+
+    def __init__(self) -> None:
+        self.event = asyncio.Event()
+        self.error = ""
+
+    def fire(self, error: str) -> None:
+        self.error = error
+        self.event.set()
+
+
 async def _wait_answer(
-    inst: Instance, sid: str, attempt_id: Optional[str], timeout_s: int
+    inst: Instance, sid: str, attempt_id: Optional[str], timeout_s: int,
+    failed: Optional[_FailSignal] = None,
 ) -> str:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        await asyncio.sleep(POLL_INTERVAL_S)
+        if failed is None:
+            await asyncio.sleep(POLL_INTERVAL_S)
+        else:
+            try:
+                await asyncio.wait_for(failed.event.wait(), timeout=POLL_INTERVAL_S)
+            except asyncio.TimeoutError:
+                pass
+            if failed.event.is_set():
+                raise _EngineFailed(failed.error or "attempt failed")
         m = await _vibe(inst, "GET", f"/sessions/{sid}/messages", params={"limit": 50})
         if m.status_code != 200:
             continue
@@ -729,7 +880,7 @@ class AskBody(BaseModel):
     vibeSessionId: Optional[str] = None
     model: Optional[str] = None
     llm: Optional[LlmOverride] = None
-    # Structured research-depth intent (cross-repo contract, 2026-08-29).
+    # Structured research-depth intent (cross-repo contract with laicai).
     # "deep_team" = multi-agent swarm committee. The router derives the budget
     # from it (BUDGET_BY_INTENT) instead of every caller hardcoding 7200.
     # Optional on purpose: an older laicai that sends only `timeoutS` behaves
@@ -750,9 +901,9 @@ def _auth(authorization: Optional[str]) -> None:
 
 
 # In-flight attempts (attempt_id → (inst, sid)) so a graceful router shutdown
-# can tell engines to stop. Incident run #9 (2026-08-24): a deploy restart
-# killed the stream mid-run, the generator finally never ran, and the orphaned
-# attempt burned 27 minutes writing an answer nobody would read.
+# can tell engines to stop: a deploy restart that kills the stream mid-run
+# never runs the generator's finally, and the orphaned attempt would burn
+# half an hour writing an answer nobody will read.
 _INFLIGHT: dict[str, tuple[Instance, str]] = {}
 
 
@@ -792,11 +943,21 @@ async def _ask_stream(body: AskBody, timeout_s: int):
         "outcome": "incomplete",
     }
     engine_stats: Optional[dict] = None
+    # Set when the unanswered path handed the engine cancel to a detached
+    # task; that task then also writes the ask-log line (with the engine's
+    # answer to the cancel), so the line is written exactly once.
+    cancel_task: Optional["asyncio.Task[Any]"] = None
 
     def _grab_engine_stats(ev: dict) -> None:
         nonlocal engine_stats
         if ev.get("ev") == "attempt_stats" and isinstance(ev.get("data"), dict):
             engine_stats = ev["data"]
+
+    def _finalize_stats() -> None:
+        stats.setdefault("total_ms", int((time.monotonic() - t_req) * 1000))
+        if engine_stats:
+            stats["engine_status"] = engine_stats.get("status")
+            stats["iterations"] = engine_stats.get("iterations")
 
     try:
         sem_t0 = time.monotonic()
@@ -810,9 +971,9 @@ async def _ask_stream(body: AskBody, timeout_s: int):
             inst.refcount += 1
             try:
                 # Per-tenant serialization point: a second ask for the same
-                # tenant queues HERE while the first is running — previously
-                # invisible (incident run #9: 93 min of silent lock wait read
-                # as a giant first_progress). Measure it explicitly.
+                # tenant queues HERE while the first is running — unmeasured,
+                # a long silent lock wait reads as a giant first_progress.
+                # Measure it explicitly.
                 lock_t0 = time.monotonic()
                 async with inst.lock:
                     stats["lock_wait_ms"] = int((time.monotonic() - lock_t0) * 1000)
@@ -854,8 +1015,21 @@ async def _ask_stream(body: AskBody, timeout_s: int):
 
                     answered = False
                     q: "asyncio.Queue[dict]" = asyncio.Queue()
+                    failed = _FailSignal()
+
+                    def _note_attempt_failed(ev: dict) -> None:
+                        if ev.get("ev") != "attempt.failed":
+                            return
+                        data = ev.get("data")
+                        if not isinstance(data, dict):
+                            return
+                        if data.get("attempt_id") in (attempt_id, None):
+                            failed.fire(str(data.get("error") or "attempt failed")[:500])
+
                     pump = asyncio.create_task(_pump_events(inst, sid, q))
-                    waiter = asyncio.create_task(_wait_answer(inst, sid, attempt_id, timeout_s))
+                    waiter = asyncio.create_task(
+                        _wait_answer(inst, sid, attempt_id, timeout_s, failed=failed)
+                    )
                     try:
                         while not waiter.done():
                             try:
@@ -867,6 +1041,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                                 "first_progress_ms", int((time.monotonic() - t_req) * 1000)
                             )
                             _grab_engine_stats(ev)
+                            _note_attempt_failed(ev)
                             yield _frame({"t": "progress", **ev})
                         while not q.empty():
                             ev = q.get_nowait()
@@ -890,14 +1065,17 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                         if not answered:
                             # Timeout / client gone / internal error: tell the
                             # engine to stop burning tokens on an answer nobody
-                            # will receive (incident 2026-08-24: a 504'd attempt
-                            # kept grinding and starved the tenant's retry).
-                            # MUST be a detached task, not an await — on client
-                            # disconnect this generator is being cancelled and
-                            # an await here dies before sending (2026-08-28
-                            # zombie-attempt incident).
-                            stats["engine_cancelled"] = True
-                            asyncio.create_task(_cancel_attempt_bg(inst, sid, tk))
+                            # will receive (a 504'd attempt that keeps grinding
+                            # starves the tenant's retry). MUST be a detached
+                            # task, not an await — on client disconnect this
+                            # generator is being cancelled and an await here
+                            # dies before sending, leaving a zombie attempt. It
+                            # stamps
+                            # engine_cancelled from the engine's answer and
+                            # writes the ask-log line.
+                            cancel_task = _spawn(
+                                _cancel_attempt_bg(inst, sid, tk, stats, _finalize_stats)
+                            )
             finally:
                 inst.refcount -= 1
     except HTTPException as e:
@@ -919,11 +1097,9 @@ async def _ask_stream(body: AskBody, timeout_s: int):
             "stats": {"router": dict(stats), "engine": engine_stats},
         })
     finally:
-        stats.setdefault("total_ms", int((time.monotonic() - t_req) * 1000))
-        if engine_stats:
-            stats["engine_status"] = engine_stats.get("status")
-            stats["iterations"] = engine_stats.get("iterations")
-        _record_ask(stats)
+        _finalize_stats()
+        if cancel_task is None:
+            _record_ask(stats)
 
 
 @app.post("/ask")
@@ -981,7 +1157,7 @@ async def forget(body: dict, authorization: Optional[str] = Header(None)):
     if errors:
         # laicai's engine-forget job keys on `res.ok` (engine-forget.ts): a
         # non-2xx keeps the job pending for the 23:30 retry instead of
-        # marking a half-done purge as finished (P1 2026-09-04).
+        # marking a half-done purge as finished.
         detail = "; ".join(errors)
         log.warning("forget tenant %s incomplete: %s", tk[:8], detail)
         return JSONResponse(status_code=500, content={"ok": False, "error": detail})
@@ -1012,19 +1188,23 @@ def _rmtree_tenant_dir(path: Path) -> Optional[str]:
 # ── Per-session deletion (laicai "删除对话" → engine session) ────────────────
 # laicai deletes a chat thread; the bound engine session (messages.jsonl,
 # trace.jsonl with every prompt, transcript_*.jsonl compaction dumps,
-# handoff.json) used to stay on the host forever — the only purge path was
-# the whole-tenant /forget at account deletion (P1 2026-09-04).
+# handoff.json) and the ``runs/<id>`` directories it produced (linked through
+# ``req.json`` ``context.session_id``) go with it — otherwise the only purge
+# path would be the whole-tenant /forget at account deletion.
 #
 # Two modes, chosen by the router, reported back in ``mode``:
 #   engine  — the tenant's sandbox is up: DELETE /sessions/{id} on the engine,
-#             which cancels a live loop, drops the dir AND its sessions.db FTS
-#             rows (search would otherwise keep returning a dead session).
+#             which cancels a live loop, drops the dir, its runs AND its
+#             sessions.db FTS rows (search would otherwise keep returning the
+#             deleted conversation).
 #   offline — no running sandbox (never created / paused / evicted): the
-#             session dir is removed straight off the host bind-mount. FTS
-#             rows in sessions.db are NOT touched from the host (the engine
-#             may hold WAL state in the frozen VM); the engine's session_search
-#             tolerates a missing dir and the row is dropped on the next
-#             reindex.
+#             session dir and its runs are removed straight off the host
+#             bind-mount. FTS / goal-ledger rows in sessions.db are NOT touched
+#             from the host (the engine may hold WAL state in the frozen VM):
+#             the engine drops them itself — at its next start
+#             (``SessionService.reconcile_orphans``) and on sight during
+#             ``session_search`` (a hit whose directory is gone is deleted,
+#             not returned).
 # Idempotent: a session that is already gone answers ok=true, deleted=false.
 
 
@@ -1033,27 +1213,64 @@ class SessionDeleteBody(BaseModel):
     session_id: str
 
 
+def _session_run_dirs(root: Path, session_id: str) -> list[Path]:
+    """``runs/<id>`` dirs under the tenant whose ``req.json`` names ``session_id``.
+
+    Every candidate passes :func:`_safe_tenant_path` (a symlinked run dir or
+    ``req.json`` is skipped, never followed). Cost is one small JSON read per
+    run directory, paid only on a session delete.
+    """
+    runs = _safe_tenant_path(root, root / "runs")
+    if runs is None or not runs.is_dir():
+        return []
+    out: list[Path] = []
+    for d in runs.iterdir():
+        if d.is_symlink() or not d.is_dir() or _safe_tenant_path(runs, d) is None:
+            continue
+        req = _safe_tenant_path(d, d / "req.json")
+        if req is None or not req.is_file():
+            continue
+        try:
+            data = json.loads(req.read_text("utf-8", "replace"))
+        except (OSError, ValueError):
+            continue
+        ctx = data.get("context") if isinstance(data, dict) else None
+        if isinstance(ctx, dict) and ctx.get("session_id") == session_id:
+            out.append(d)
+    return out
+
+
+def _rmtree_collect(path: Path, failures: list[str]) -> None:
+    def _onerror(_fn: Any, p: Any, exc_info: Any) -> None:
+        failures.append(f"{Path(str(p)).name}: {exc_info[1]}")
+
+    shutil.rmtree(path, onerror=_onerror)
+
+
 def _remove_session_dir(uid: str, session_id: str) -> tuple[bool, Optional[str]]:
-    """Remove ``DATA_ROOT/<tk>/sessions/<sid>`` from the host.
+    """Remove ``DATA_ROOT/<tk>/sessions/<sid>`` and the session's run dirs.
 
     Returns:
-        ``(removed, error)`` — ``removed`` is False when nothing was there;
-        ``error`` is set when the dir exists but could not be removed
-        (or is a symlink, which is refused rather than followed).
+        ``(removed, error)`` — ``removed`` is False when no session dir was
+        there (its runs, if any, are still removed); ``error`` is set when a
+        dir exists but could not be removed (or the session dir is a symlink,
+        which is refused rather than followed).
     """
     root = _tenant_root(uid)
     candidate = root / "sessions" / session_id
     if candidate.is_symlink():
         return False, f"session dir {session_id} is a symlink; refusing to remove"
+    failures: list[str] = []
+    for run_dir in _session_run_dirs(root, session_id):
+        _rmtree_collect(run_dir, failures)
+        if run_dir.exists():
+            failures.append(f"{run_dir.name}: still present")
     path = _safe_tenant_path(root, candidate)
     if path is None or not path.is_dir():
+        if failures:
+            return False, f"run dir removal incomplete ({'; '.join(failures[:3])})"
         return False, None
-    failures: list[str] = []
-
-    def _onerror(_fn: Any, p: Any, exc_info: Any) -> None:
-        failures.append(f"{Path(str(p)).name}: {exc_info[1]}")
-
-    shutil.rmtree(path, onerror=_onerror)
+    _rmtree_collect(path, failures)
     if failures or path.exists():
         return False, f"session dir removal incomplete ({'; '.join(failures[:3])})"
     return True, None
@@ -1078,7 +1295,7 @@ async def sessions_delete(
     inst = pool.get(tk)
     mode = "offline"
     engine_deleted = False
-    if inst is not None and not inst.paused:
+    if inst is not None and not inst.paused and not inst.booting:
         # Live sandbox: the engine owns sessions.db, so let it do the delete
         # (loop cancel + dir + FTS rows). Any failure falls through to the
         # host-side removal so the data still goes away.
@@ -1118,8 +1335,8 @@ def _safe_tenant_path(base: Path, p: Path) -> Optional[Path]:
 
     The engine runs as uid 1000 inside the tenant's own bind-mount and can
     create symlinks there at will; the router runs as root on the host and
-    read/wrote whatever those paths pointed at (P0 2026-09-04: a tenant
-    ``memory/x.md -> /etc/shadow`` was readable through ``/memory``, and
+    would read/write whatever those paths point at (a tenant
+    ``memory/x.md -> /etc/shadow`` readable through ``/memory``,
     ``MEMORY.md -> /root/.ssh/authorized_keys`` writable through
     ``/memory/delete``). Rules:
 
@@ -1378,7 +1595,7 @@ async def memory_list(uid: str, authorization: Optional[str] = Header(None)):
             return []
         out = []
         for p in d.iterdir():
-            # Symlink entries are skipped outright (P0 2026-09-04): is_file()
+            # Symlink entries are skipped outright: is_file()
             # follows links, so without this a tenant-planted link read
             # arbitrary host files through the memory page.
             if _safe_tenant_path(d, p) is None:
@@ -1403,6 +1620,24 @@ async def memory_list(uid: str, authorization: Optional[str] = Header(None)):
     return {"files": await asyncio.to_thread(_read)}
 
 
+# Upper bound on waiting for the memory index lock in /memory/delete.
+MEMORY_LOCK_TIMEOUT_S = float(os.environ.get("VIBE_MEMORY_LOCK_TIMEOUT_S", "5"))
+_MEMORY_LOCK_RETRY_S = 0.05
+
+
+def _flock_bounded(fd: int, timeout_s: float) -> bool:
+    """Take an exclusive flock on ``fd`` within ``timeout_s`` (non-blocking + retries)."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_MEMORY_LOCK_RETRY_S)
+
+
 @app.post("/memory/delete")
 async def memory_delete(body: dict, authorization: Optional[str] = Header(None)):
     """Permanently delete one memory file and its MEMORY.md index line."""
@@ -1421,25 +1656,59 @@ async def memory_delete(body: dict, authorization: Optional[str] = Header(None))
         raise HTTPException(404, "not found")
 
     def _delete() -> bool:
-        existed = path.is_file()
-        if existed:
-            path.unlink()
-        # The index is rewritten in place: refuse when it is (or sits under)
-        # a symlink, otherwise root would write through it (P0 2026-09-04).
-        idx = _safe_tenant_path(d, d / "MEMORY.md")
-        if idx is not None and idx.is_file():
+        # Same lock file the engine takes around every index rewrite
+        # (``memory/persistent.py``). flock is only guaranteed to be shared
+        # between processes on the same kernel: the engine runs in a MicroVM
+        # whose view of this directory is a host mount, so this lock excludes
+        # concurrent host-side editors, not necessarily the guest. Taken with
+        # a bound (non-blocking + retries) so a lock nobody on this side can
+        # release never parks a worker thread; past the bound the delete
+        # proceeds unlocked — the engine rebuilds the index from the entry
+        # files, so index drift heals itself. Opened O_NOFOLLOW and guarded
+        # like every other tenant path.
+        lock_path = _safe_tenant_path(d, d / ".MEMORY.lock")
+        lock_fd: Optional[int] = None
+        if lock_path is not None:
             try:
-                lines = idx.read_text("utf-8", "replace").splitlines(keepends=True)
-                kept = [l for l in lines if f"({name})" not in l]
-                if len(kept) != len(lines):
-                    tmp = idx.with_name(f".{idx.name}.{os.getpid()}.tmp")
-                    tmp.write_text("".join(kept), encoding="utf-8")
-                    tmp.replace(idx)
+                lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+                if not _flock_bounded(lock_fd, MEMORY_LOCK_TIMEOUT_S):
+                    log.warning("memory/delete tenant %s: index lock busy for %.1fs; editing unlocked",
+                                tenant_key(uid)[:8], MEMORY_LOCK_TIMEOUT_S)
+                    os.close(lock_fd)
+                    lock_fd = None
             except OSError:
-                pass  # index cleanup is best-effort; the engine tolerates drift
+                if lock_fd is not None:
+                    os.close(lock_fd)
+                lock_fd = None
+        try:
+            existed = path.is_file()
+            if existed:
+                path.unlink()
+            # The index is rewritten in place: refuse when it is (or sits under)
+            # a symlink, otherwise root would write through it.
+            idx = _safe_tenant_path(d, d / "MEMORY.md")
+            if idx is not None and idx.is_file():
+                try:
+                    lines = idx.read_text("utf-8", "replace").splitlines(keepends=True)
+                    kept = [l for l in lines if f"({name})" not in l]
+                    if len(kept) != len(lines):
+                        tmp = idx.with_name(f".{idx.name}.{os.getpid()}.tmp")
+                        tmp.write_text("".join(kept), encoding="utf-8")
+                        tmp.replace(idx)
+                except OSError:
+                    pass  # index cleanup is best-effort; the engine tolerates drift
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
         return existed
 
     existed = await asyncio.to_thread(_delete)
+    # Audit line: the only record of "which memory was removed, for which
+    # tenant, when" once the file is gone.
+    log.info("memory/delete tenant %s name %s existed=%s", tenant_key(uid)[:8], name, existed)
     return {"ok": True, "deleted": existed}
 
 
@@ -1479,7 +1748,7 @@ def _dir_bytes(path: Path) -> int:
     Walks with ``followlinks=False`` and skips symlinked files: a tenant can
     plant ``big -> /`` inside its bind-mount and the old ``rglob`` (which
     descends into symlinked directories) would have walked the whole host
-    filesystem as root (P0 2026-09-04).
+    filesystem as root.
     """
     if path.is_symlink() or not path.is_dir():
         return 0
@@ -1571,8 +1840,8 @@ async def tenants_usage(
         "data_root_bytes": sum(r["disk_bytes"] for r in rows),
         "disk_used_pct": _disk_used_pct(DATA_ROOT),
         "tenants_total": len(rows),
-        # tk8 list (was a bare count, P1 2026-09-04): a consumer could see
-        # THAT someone was over the line but not WHO, so nothing could act.
+        # tk8 list, not a bare count: a consumer must see WHO is over the
+        # line, not just THAT someone is, or nothing can act.
         "over_watermark": _over_watermark_tk8s(rows),
         "tenants": rows[: max(1, min(limit, 200))],
     }
@@ -1590,6 +1859,7 @@ async def healthz(authorization: Optional[str] = Header(None)):
     return {
         "instances": len(pool),
         "running": sum(1 for i in pool.values() if not i.paused),
+        "booting": sum(1 for i in pool.values() if i.booting),
         "active": MAX_CONCURRENT_ACTIVE - active_sem._value,  # noqa: SLF001
         "max_running": MAX_RUNNING,
         "asks": {
@@ -1616,6 +1886,7 @@ async def healthz(authorization: Optional[str] = Header(None)):
                 "tk8": i.tk[:8],
                 "sandbox": i.sandbox_id[:12],
                 "paused": i.paused,
+                "booting": i.booting,
                 "refcount": i.refcount,
                 "idle_s": round(time.monotonic() - i.last_activity),
                 "disk_bytes": (by_tk8.get(i.tk[:8]) or {}).get("disk_bytes", 0),
@@ -1627,18 +1898,29 @@ async def healthz(authorization: Optional[str] = Header(None)):
 
 
 # ── Background reaper: pause idle sandboxes ──────────────────────────────────
+async def _reap_idle_once() -> list[Instance]:
+    """Pause every idle instance past IDLE_TTL_S.
+
+    A booting instance is not idle, and neither is one whose lock is held.
+    """
+    now = time.monotonic()
+    victims = [
+        i for i in pool.values()
+        if i.refcount == 0 and not i.paused and not i.booting
+        and not i.lock.locked()
+        and (now - i.last_activity) > IDLE_TTL_S
+    ]
+    for v in victims:
+        log.info("pausing idle tenant %s (idle %ds)", v.tk[:8], round(now - v.last_activity))
+        v.paused = True
+        await sbx_pause(v.sandbox_id)
+    return victims
+
+
 async def _reaper():
     while True:
         await asyncio.sleep(60)
-        now = time.monotonic()
-        victims = [
-            i for i in pool.values()
-            if i.refcount == 0 and not i.paused and (now - i.last_activity) > IDLE_TTL_S
-        ]
-        for v in victims:
-            log.info("pausing idle tenant %s (idle %ds)", v.tk[:8], round(now - v.last_activity))
-            await sbx_pause(v.sandbox_id)
-            v.paused = True
+        await _reap_idle_once()
 
 
 # ── Startup sweep: destroy stale-template sandboxes, then delete old templates ─
@@ -1667,15 +1949,15 @@ def _vibe_template_ids() -> set[str]:
 
 
 async def _sweep_stale_templates() -> None:
-    """One-shot cleanup after a template switch (2026-08-27 operator policy).
+    """One-shot cleanup after a template switch.
 
     A template switch always involves a router restart with no in-flight asks,
     so any old-template sandbox found here serves nobody. For each sandbox
     whose template is not the current one: running instances are paused first
     (graceful quiesce), then deleted (the delete helper resumes paused ones —
     a CubeAPI quirk); finally every superseded vibe-engine template is removed.
-    Covers both state.json tenants and orphans state no longer tracks (the v3
-    fossil that pinned its template for days). Non-vibe templates (e.g. the
+    Covers both state.json tenants and orphans state does not track (a stale
+    sandbox can otherwise pin its template for days). Non-vibe templates (e.g. the
     sandbox-code base) are never touched. Disable with
     VIBE_SWEEP_STALE_TEMPLATES=0.
     """
@@ -1748,9 +2030,9 @@ async def _startup():
     global state
     state = _load_state()
     log.info("loaded %d tenant mappings from %s", len(state), STATE_FILE)
-    asyncio.create_task(_reaper())
+    _spawn(_reaper())
     if SWEEP_STALE:
-        asyncio.create_task(_sweep_stale_templates())
+        _spawn(_sweep_stale_templates())
 
 
 @app.on_event("shutdown")

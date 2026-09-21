@@ -51,7 +51,7 @@ from src.goal.context import (
     goal_needs_continuation,
     goal_progress_tuple,
 )
-from src.providers.chat import ChatLLM, ProviderStreamError
+from src.providers.chat import TOOL_CHOICE_NONE, ChatLLM, ProviderStreamError
 from src.session import handoff
 from src.tools.background_tools import get_background_manager
 from src.tools.redaction import redact_payload, redact_secret_values
@@ -59,7 +59,11 @@ from src.core import budget as _budget
 from src.core import cancel as _cancel
 from src.core import fetch_stats as _fetch_stats
 from src.core.paths import data_root, runs_root
-from src.core.token_estimate import estimate_messages_tokens, estimate_text_tokens
+from src.core.token_estimate import (
+    estimate_messages_tokens,
+    estimate_text_tokens,
+    messages_for_estimate,
+)
 
 # Honor VIBE_DATA_DIR (multi-tenant per-user HOME) so the agent loop writes run
 # artifacts under the tenant root, not the shared install dir. See core/paths.py.
@@ -75,12 +79,11 @@ TOKEN_THRESHOLD = int(os.getenv("TOKEN_THRESHOLD", "40000"))
 # budget instead of a fixed count.
 MICROCOMPACT_TRIGGER_RATIO = 0.5   # prune only when > TOKEN_THRESHOLD * ratio
 MICROCOMPACT_KEEP_BUDGET_RATIO = 0.25  # keep newest tool results up to this budget
-# V2 hysteresis. With a single trigger line, every iteration past it recomputed
-# the keep set and the newest results pushed one or two older ones out of the
-# budget — so the middle of the trajectory changed EVERY turn and the provider
-# prompt cache rebuilt from that diff point each time (batch E fixed the
-# unconditional per-turn prune, but reintroduced a slow one above the line).
-# Now: crossing the trigger arms the layer and cuts once, deeper; the layer
+# Hysteresis. With a single trigger line, every iteration past it would
+# recompute the keep set and the newest results push one or two older ones out
+# of the budget — the middle of the trajectory then changes EVERY turn and the
+# provider prompt cache rebuilds from that diff point each time.
+# Instead: crossing the trigger arms the layer and cuts once, deeper; the layer
 # stays armed (still cutting to the deep water mark) until the estimate falls
 # back below the release line, at which point the trajectory is left alone for
 # many turns and the cache stays hot. Book §2.7.3 "compact in batches near the
@@ -96,14 +99,14 @@ KEEP_RECENT = 3  # hard floor: newest N tool results are always kept intact
 # the live-price sources every cited number must trace back to). Layer 2/3
 # can still fold/summarize them when the context truly overflows.
 #
-# V2: the set itself now lives in ``src.agent.context_policy`` so Layer 2 obeys
-# it too (it used to fold the middle out of exactly these results). This name
+# The set itself lives in ``src.agent.context_policy`` so Layer 2 obeys it too
+# (otherwise it would fold the middle out of exactly these results). This name
 # is kept as an alias for existing call sites and tests.
 MICROCOMPACT_PROTECTED_TOOLS = PROTECTED_TOOLS
-# Re-exported for callers that knew this constant as a loop-module name before
-# V2 moved it (and the offload path that enforces it) into tool_result_store.
+# Re-exported for callers that know this constant as a loop-module name; it
+# (and the offload path that enforces it) lives in tool_result_store.
 __all_reexports__ = ("TOOL_RESULT_LIMIT",)
-# F1 (batch F): successful results from these tools are kept (raw) for the
+# Successful results from these tools are kept (raw) for the
 # zero-LLM finalization verification — the final answer's price claims are
 # cross-checked against what the run actually fetched (see src/agent/verify.py).
 VERIFY_GROUNDING_TOOLS = frozenset({"get_market_data", "get_realtime_quotes"})
@@ -114,60 +117,73 @@ STREAM_RETRY_DELAY_S = float(os.getenv("VT_STREAM_RETRY_DELAY_S", "2.0"))
 # In-place retries after the initial attempt (N+1 attempts total, exponential
 # backoff base×4^i capped at 60s). Same rationale as the swarm worker: upstream
 # proxies drop long opus streams in bursts; a single immediate retry lands
-# inside the same burst and kills the whole attempt (incident 2026-08-24).
+# inside the same burst and kills the whole attempt.
 STREAM_RETRIES = max(0, int(os.getenv("VT_STREAM_RETRIES", "3")))
 STREAM_RETRY_MAX_DELAY_S = 60.0
 TOOL_TIMEOUT_SECONDS = float(os.getenv("VIBE_TRADING_TOOL_TIMEOUT_SECONDS", "1800"))
-# F2 (batch F): write tools used to be "never killed" — the watchdog warned once
-# past the timeout and then waited forever, so one hung write tool ate the whole
-# attempt budget and defeated the FINALIZE_RESERVE partial-answer path. They now
-# get a grace window of this factor × the per-call (budget-capped) timeout:
+# Write tools are not "never killed": a watchdog that only warns and then waits
+# forever lets one hung write tool eat the whole attempt budget and defeat the
+# FINALIZE_RESERVE partial-answer path. They get a grace window of this factor × the per-call (budget-capped) timeout:
 # warn at 1×, abandon waiting at 2×. Abandoning marks the run degraded, returns
 # a structured timeout error to the model, and discards the late result via the
 # same queue mechanism the readonly path uses (the worker thread may still
 # finish its side effect in the background — that is announced in the error).
 #
-# V1: the base of that 1×/2× window is per-tool (``_tool_timeout``), not the
-# tenant-wide constant. Pinning it to TOOL_TIMEOUT_SECONDS made the watchdog
-# fire at 600s on a run_swarm whose own wait budget is 7200s, so the two-hour
-# swarm tier was unreachable and the ``wait_budget_exhausted`` salvage path
-# (which is what carries the run_id back) never executed.
+# The base of that 1×/2× window is per-tool (``_tool_timeout``), not the
+# tenant-wide constant: pinned to TOOL_TIMEOUT_SECONDS the watchdog would fire
+# at 600s on a run_swarm whose own wait budget is 7200s, making the two-hour
+# swarm tier unreachable and the ``wait_budget_exhausted`` salvage path (which
+# is what carries the run_id back) dead code.
 WRITE_TOOL_TIMEOUT_FACTOR = 2.0
-# Batch 3: when an attempt deadline is bound, force the final text answer once
+# When an attempt deadline is bound, force the final text answer once
 # less than this many seconds (or ~1.2 avg iterations) remain — a partial
 # answer beats the caller timing out on nothing.
 FINALIZE_RESERVE_S = float(os.getenv("VIBE_FINALIZE_RESERVE_S", "60"))
-# V1: seconds held back when clamping a tool timeout to the attempt budget.
-# Keep at least as much back as the forced-finalize path needs — the literal
-# 45.0 used before was 15s SHORT of FINALIZE_RESERVE_S's default, so abandoning
-# a tool could leave the loop with less time than the forced-finalize path
-# requires and the "a partial answer beats a timeout" guarantee became nominal.
+# Seconds held back when clamping a tool timeout to the attempt budget. Keep
+# at least as much back as the forced-finalize path needs — a reserve shorter
+# than FINALIZE_RESERVE_S lets abandoning a tool leave the loop with less time
+# than the forced-finalize path requires, and the "a partial answer beats a
+# timeout" guarantee becomes nominal.
 _TOOL_CAP_RESERVE_S = max(45.0, FINALIZE_RESERVE_S)
 # Minimum window a tool gets even on a nearly-spent budget, so a late call
-# still gets one quick shot instead of an instant failure (batch 3 semantics,
-# unchanged). Promoted from call-site literals to named constants in V1 so the
-# nesting/clamp regressions can scale them, and so the overshoot they permit
+# still gets one quick shot instead of an instant failure. Named constants so
+# the nesting/clamp regressions can scale them, and so the overshoot they permit
 # (up to floor + grace floor past the deadline) is visible in one place.
 _TOOL_CAP_FLOOR_S = 10.0
 _TOOL_GRACE_FLOOR_S = 5.0
 GOAL_MAX_CONTINUATIONS = int(os.getenv("VIBE_TRADING_GOAL_MAX_CONTINUATIONS", "3"))
-# V2: consecutive failures of the SAME (tool, args) pair before the call is
+# Consecutive failures of the SAME (tool, args) pair before the call is
 # refused outright. Keyed identically to the duplicate guard, which only ever
 # registered successes — so a dead upstream could burn 40+ iterations of LLM
 # spend before max_iterations stopped it.
 TOOL_CIRCUIT_FAILURE_LIMIT = max(
     1, int(os.getenv("VIBE_TOOL_CIRCUIT_FAILURE_LIMIT", "3"))
 )
-# V2: in-place retries for a stream that SUCCEEDS but returns neither text nor
+# In-place retries for a stream that SUCCEEDS but returns neither text nor
 # tool calls (relay truncation, upstream degraded empty turn). The transport
-# layer already retries; this degenerate provider response used to fail a
-# possibly hour-long attempt without a single retry.
+# layer only retries transport failures; without this a degenerate provider
+# response would fail a possibly hour-long attempt without a single retry.
 EMPTY_RESPONSE_RETRIES = max(0, int(os.getenv("VIBE_EMPTY_RESPONSE_RETRIES", "1")))
 _EMPTY_RESPONSE_NUDGE = (
     "[SYSTEM] Your previous turn returned no content and no tool calls. "
     "Respond now: either call a tool, or write your answer as text."
 )
 LLM_USAGE_ARTIFACT = "llm_usage.json"
+
+# A reply cut by the output-token ceiling (``finish_reason == "length"``,
+# Anthropic ``stop_reason == "max_tokens"``) is not a final answer: the loop
+# appends the partial text and asks the model to continue from where it
+# stopped, up to this many times per attempt; a still-truncated reply, or one
+# truncated on the last turn, is delivered with an explicit marker instead
+# of passing as complete.
+LENGTH_CONTINUATIONS = max(0, int(os.getenv("VIBE_LENGTH_CONTINUATIONS", "2")))
+_LENGTH_CONTINUE_NUDGE = (
+    "[SYSTEM] Your previous reply was cut off by the output length limit "
+    "(finish_reason=length). Continue EXACTLY from where it stopped: do not "
+    "repeat what you already wrote and do not restart the document. Be concise "
+    "in the remaining part."
+)
+OUTPUT_TRUNCATED_MARK = "\n\n（输出被截断）"
 
 # Layer 2: Context collapse thresholds
 COLLAPSE_THRESHOLD = int(TOKEN_THRESHOLD * 0.7)
@@ -289,6 +305,19 @@ def _redact_trace_result(result: str) -> str:
     return json.dumps(redact_payload(payload), ensure_ascii=False)
 
 
+def _best_effort(fn: Any, *args: Any, **kwargs: Any) -> None:
+    """Call ``fn`` and swallow any exception (debug-logged).
+
+    For the trace / state writes on a failure path: they run when the disk
+    may already be the problem, and a second exception there would replace
+    the ``failed`` result with a bare crash.
+    """
+    try:
+        fn(*args, **kwargs)
+    except Exception:  # noqa: BLE001 - failure-path bookkeeping never re-raises
+        logger.debug("best-effort call %s failed", getattr(fn, "__name__", fn), exc_info=True)
+
+
 def _new_run_stats() -> dict[str, Any]:
     """Per-run accumulator behind the ``attempt_stats`` summary event."""
     return {"llm_calls": 0, "llm_ms": 0, "compact_calls": 0, "tools": {}}
@@ -301,7 +330,7 @@ def _format_timeout(seconds: float) -> str:
     return f"{seconds:.0f}s"
 
 
-def estimate_tokens(messages: list) -> int:
+def estimate_tokens(messages: list, *, count_reasoning: bool = False) -> int:
     """Rough token count estimate, weighted by character class.
 
     ASCII ~4 chars/token, CJK ~0.6 token/char, other ~3 chars/token — see
@@ -311,18 +340,20 @@ def estimate_tokens(messages: list) -> int:
 
     Args:
         messages: Message list.
+        count_reasoning: Include assistant ``reasoning_content`` — only when
+            the provider sends it back upstream (``ChatLLM.sends_reasoning_content``).
 
     Returns:
         Estimated token count.
     """
-    return estimate_messages_tokens(messages)
+    return estimate_messages_tokens(messages, count_reasoning=count_reasoning)
 
 
 # Placeholder for pruned tool results. MUST tell the model the data was
 # dropped and can be re-fetched — the bare "[cleared]" marker plus the
-# name-level duplicate guard once dead-locked an attempt into retracting
-# REAL numbers as hallucinations (dea1222743ef, 2026-08-25: result pruned,
-# every re-fetch refused with "already succeeded").
+# name-level duplicate guard can dead-lock an attempt into retracting REAL
+# numbers as hallucinations (result pruned, every re-fetch refused with
+# "already succeeded").
 # Aliased from context_policy (the shared marker registry) so the duplicate
 # guard's "was this result pruned?" test and Layer 2's skip rule can never
 # disagree about what a cleared placeholder looks like.
@@ -347,6 +378,8 @@ def _microcompact(
     messages: list,
     token_threshold: int = TOKEN_THRESHOLD,
     state: dict | None = None,
+    *,
+    count_reasoning: bool = False,
 ) -> None:
     """Layer 1: prune old tool results — threshold-triggered, token-budget keep.
 
@@ -375,8 +408,9 @@ def _microcompact(
         state: Caller-owned dict carrying the armed flag across iterations.
             Omitted (None) reproduces the pre-V2 single-line behavior, so the
             function stays usable stateless.
+        count_reasoning: See :func:`estimate_tokens`.
     """
-    estimate = estimate_tokens(messages)
+    estimate = estimate_tokens(messages, count_reasoning=count_reasoning)
     keep_ratio = MICROCOMPACT_KEEP_BUDGET_RATIO
     if state is None:
         if estimate <= token_threshold * MICROCOMPACT_TRIGGER_RATIO:
@@ -420,11 +454,10 @@ def _microcompact(
             msg["content"] = _CLEARED_PLACEHOLDER
 
 
-# Dynamic status bar (E2). The system prompt used to embed a minute-level
-# timestamp and the WorkspaceMemory "## State" block — both changed between
-# turns, so the very first bytes of the context diverged every iteration and
-# the provider prompt cache never hit. That dynamic information now rides a
-# single ephemeral ``<agent_status>`` user message appended to the END of the
+# Dynamic status bar. A minute-level timestamp or the WorkspaceMemory "## State"
+# block embedded in the system prompt changes between turns, so the very first
+# bytes of the context diverge every iteration and the provider prompt cache
+# never hits. That dynamic information instead rides a single ephemeral ``<agent_status>`` user message appended to the END of the
 # trajectory each iteration (the previous one is removed first — "use and
 # discard"), together with any budget / wrap-up nudge lines. The system
 # prompt itself is byte-stable for the whole session.
@@ -477,11 +510,10 @@ def _context_collapse(messages: list) -> None:
     Preserves head + tail of large text, collapses the middle.
     Zero API cost — pure string operation.
 
-    V2: which messages may be folded, and how hard, comes from
+    Which messages may be folded, and how hard, comes from
     ``src.agent.context_policy`` — the single rule source Layers 1 and 3 also
-    read. Before that this loop folded anything over 2400 chars outside the
-    last six messages, which meant it cut the middle out of the grounding
-    results Layer 1 refuses to prune and out of the Layer 3 handoff summary.
+    read, so this layer never cuts the middle out of the grounding results
+    Layer 1 refuses to prune or out of the Layer 3 handoff summary.
 
     Args:
         messages: Message list (mutated in place).
@@ -677,7 +709,9 @@ def _select_summary_input(head: list[dict]) -> tuple[str, int]:
     """
     kept: list[dict] = []
     budget = SUMMARY_INPUT_TOKEN_BUDGET
-    for msg in reversed(head):
+    # The thinking transcript is not part of the conversation being
+    # summarised (and would eat the budget several times over).
+    for msg in reversed(messages_for_estimate(head)):
         try:
             blob = json.dumps(msg, default=str, ensure_ascii=False)
         except (TypeError, ValueError):
@@ -747,7 +781,7 @@ def tool_timeout_for(registry: Any, tool_name: str) -> float | None:
     Defaults to the tenant-wide ``TOOL_TIMEOUT_SECONDS``. A tool whose NORMAL
     runtime legitimately exceeds it declares ``timeout_seconds``
     (``run_swarm``: SWARM_TIMEOUT + margin). The declaration only RAISES the
-    base of the F2 1x-warn / 2x-abandon window, never lowers it, and the
+    base of the 1x-warn / 2x-abandon window, never lowers it, and the
     attempt budget still clamps the result via ``cap_timeout`` at the call
     site — so a hung tool can never outlive the caller's deadline regardless
     of what it declares.
@@ -814,12 +848,11 @@ def invoke_tool_guarded(
 ) -> tuple[str, int]:
     """Run one tool under the watchdog: thread + timeout + heartbeat + progress.
 
-    Extracted from ``AgentLoop._invoke_tool`` in V2 so the swarm worker runs
-    its tools through the SAME guard. The worker used to call
-    ``registry.execute`` inline, so a tool that hung inside an iteration
-    blocked forever — the worker only checked its deadline at iteration
-    boundaries, and the layer-level deadline in ``swarm/runtime.py`` then had
-    to wait ``layer_budget + 60s`` to notice.
+    Shared with the swarm worker so it runs its tools through the SAME guard:
+    a worker calling ``registry.execute`` inline would block forever on a tool
+    that hangs inside an iteration — it only checks its deadline at iteration
+    boundaries, and the layer-level deadline in ``swarm/runtime.py`` would
+    then need ``layer_budget + 60s`` to notice.
 
     Semantics are unchanged from the main loop: a readonly tool that overruns
     is abandoned immediately with a structured ``tool_timeout``; a write tool
@@ -839,8 +872,8 @@ def invoke_tool_guarded(
         cancel_event: Attempt-level cancel signal (defaults to the one bound
             in :mod:`src.core.cancel`). While set, the wait on the worker
             thread is abandoned within ``CANCEL_POLL_S`` and a structured
-            ``cancelled`` result is returned — a cancel no longer has to wait
-            for a 30-minute tool to come back on its own (P1 2026-09-04).
+            ``cancelled`` result is returned — a cancel does not have to wait
+            for a 30-minute tool to come back on its own.
 
     Returns:
         Tuple of (result_str, elapsed_ms).
@@ -1116,8 +1149,8 @@ class AgentLoop:
         self._event_callback = event_callback
         self.max_iterations = max_iterations
         # call_key -> the appended tool-result message dict. Keyed by
-        # (name, args) — a name-level guard once refused every follow-up
-        # get_market_data with different symbols (dea1222743ef). The message
+        # (name, args) — a name-level guard would refuse every follow-up
+        # get_market_data with different symbols. The message
         # ref lets the guard see whether _microcompact pruned the result:
         # a pruned result means the model no longer has the data, so an
         # identical re-fetch must be allowed through.
@@ -1127,11 +1160,11 @@ class AgentLoop:
         self._persistent_memory = persistent_memory
         self._run_iteration: int = 0
         self._stats: Dict[str, Any] = _new_run_stats()
-        # (tool_name, raw_result) pairs feeding the finalization verifier (F1).
+        # (tool_name, raw_result) pairs feeding the finalization verifier.
         self._grounding_results: List[tuple[str, str]] = []
-        # V2: Layer 1 hysteresis state (armed flag), carried across iterations.
+        # Layer 1 hysteresis state (armed flag), carried across iterations.
         self._microcompact_state: Dict[str, Any] = {}
-        # V2 circuit breaker: call_key -> consecutive failure count. Keyed the
+        # Circuit breaker: call_key -> consecutive failure count. Keyed the
         # same way as the duplicate guard, which only ever registered SUCCESSES
         # — so an identical failing call could repeat until the iteration cap.
         self._consecutive_failures: Dict[str, int] = {}
@@ -1166,14 +1199,19 @@ class AgentLoop:
         Returns:
             Execution result dict.
         """
-        # Reset per-run state (safe for reuse across multiple run() calls)
-        self._cancel_event.clear()
+        # The cancel token belongs to this attempt and is never reset here: a
+        # cancel that lands before run() starts (executor queue, registry
+        # build) must still take effect, so the first checkpoint below turns
+        # an already-set token into a "cancelled" terminal state instead of
+        # an orphaned loop nobody can reach any more.
+        if self._cancel_event.is_set():
+            logger.info("AgentLoop cancelled before start")
         # Expose the cancel signal to every tool thread (copy_context) so
         # long polls (swarm wait, tool watchdog) can stop between ticks.
         _cancel.bind_cancel_event(self._cancel_event)
         self._called_ok = {}
         self._session_id = session_id or ""
-        # V2: resume Layer 5 from the session's stored handoff summary instead
+        # Resume Layer 5 from the session's stored handoff summary instead
         # of restarting from zero. The next compaction then takes the iterative
         # update path, so decisions and constraints compressed away in an
         # earlier attempt are inherited rather than lost (no extra LLM call).
@@ -1193,55 +1231,72 @@ class AgentLoop:
         )
 
         state_store = RunStateStore()
-        RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        # Everything before the ReAct loop (run dir, request snapshot, prompt
+        # assembly, trace file) can fail on a full or read-only tenant disk.
+        # Such a failure must still end as a regular ``failed`` result with an
+        # attempt_stats frame — otherwise the session layer sees a bare
+        # exception, writes no receipt, and the router waits out the whole
+        # budget for an answer that will never come.
+        run_dir: Optional[Path] = None
+        trace: Optional[TraceWriter] = None
+        try:
+            RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
-        if self.memory.run_dir and Path(self.memory.run_dir).exists():
-            run_dir = Path(self.memory.run_dir)
-        else:
-            run_dir = state_store.create_run_dir(RUNS_DIR)
-            self.memory.run_dir = str(run_dir)
+            if self.memory.run_dir and Path(self.memory.run_dir).exists():
+                run_dir = Path(self.memory.run_dir)
+            else:
+                run_dir = state_store.create_run_dir(RUNS_DIR)
+                self.memory.run_dir = str(run_dir)
 
-        state_store.save_request(run_dir, user_message, {"session_id": session_id})
+            state_store.save_request(run_dir, user_message, {"session_id": session_id})
 
-        context = ContextBuilder(self.registry, self.memory,
-                                  persistent_memory=self._persistent_memory)
-        goal_context, active_goal_id = get_current_goal_context(session_id) if session_id else ("", None)
-        llm_user_message = user_message
-        if goal_context:
-            llm_user_message = (
-                f"{goal_context}\n\n"
-                f"<user-message>\n{user_message}\n</user-message>"
+            context = ContextBuilder(self.registry, self.memory,
+                                      persistent_memory=self._persistent_memory)
+            goal_context, active_goal_id = get_current_goal_context(session_id) if session_id else ("", None)
+            llm_user_message = user_message
+            if goal_context:
+                llm_user_message = (
+                    f"{goal_context}\n\n"
+                    f"<user-message>\n{user_message}\n</user-message>"
+                )
+            goal_store = None
+            goal_turn_accounted = False
+            messages = context.build_messages(llm_user_message, history)
+            react_trace: List[Dict[str, Any]] = []
+
+            trace_dir = SESSIONS_DIR / session_id if session_id else run_dir
+            trace = TraceWriter(trace_dir)
+            if self._run_iteration == 0 and trace.path.exists():
+                existing = TraceWriter.read(trace_dir)
+                self._run_iteration = max(
+                    (int(e.get("iter", 0)) for e in existing if "iter" in e),
+                    default=0,
+                )
+            trace.write_text_entry(
+                {"type": "start", "iter": self._run_iteration + 1},
+                field="prompt",
+                value=user_message,
+                offload_kind=f"start-{self._run_iteration + 1}",
             )
-        goal_store = None
-        goal_turn_accounted = False
-        messages = context.build_messages(llm_user_message, history)
-        react_trace: List[Dict[str, Any]] = []
-
-        trace_dir = SESSIONS_DIR / session_id if session_id else run_dir
-        trace = TraceWriter(trace_dir)
-        if self._run_iteration == 0 and trace.path.exists():
-            existing = TraceWriter.read(trace_dir)
-            self._run_iteration = max(
-                (int(e.get("iter", 0)) for e in existing if "iter" in e),
-                default=0,
+            trace.write_text_entry(
+                {"type": "message", "iter": self._run_iteration + 1, "role": "user"},
+                field="content",
+                value=user_message,
+                offload_kind=f"user-message-{self._run_iteration + 1}",
             )
-        trace.write_text_entry(
-            {"type": "start", "iter": self._run_iteration + 1},
-            field="prompt",
-            value=user_message,
-            offload_kind=f"start-{self._run_iteration + 1}",
-        )
-        trace.write_text_entry(
-            {"type": "message", "iter": self._run_iteration + 1, "role": "user"},
-            field="content",
-            value=user_message,
-            offload_kind=f"user-message-{self._run_iteration + 1}",
-        )
+        except Exception as exc:
+            return self._fail_before_loop(
+                exc, run_dir=run_dir, trace=trace, state_store=state_store, run_t0=run_t0
+            )
 
         iteration = 0
         final_content = ""
         empty_model_response_iter: int | None = None
         empty_response_retries = 0
+        length_continuations = 0
+        # Partial replies cut by the output ceiling, in order, awaiting the
+        # continuation that completes them.
+        truncated_parts: list[str] = []
         llm_usage_summary = _new_llm_usage_summary(self.llm)
         goal_continuations = 0
         goal_last_progress: tuple[int, int] | None = None
@@ -1270,14 +1325,19 @@ class AgentLoop:
                 # any compaction, so it never survives into summaries.
                 _remove_status_messages(messages)
 
+                # ``reasoning_content`` counts only when the channel sends it.
+                count_reasoning = bool(getattr(self.llm, "sends_reasoning_content", False))
+
                 # Layer 1: microcompact (threshold-triggered + armed hysteresis)
-                _microcompact(messages, state=self._microcompact_state)
+                _microcompact(
+                    messages, state=self._microcompact_state, count_reasoning=count_reasoning
+                )
 
                 # Layer 2: context collapse (fold long text, zero API cost)
-                tokens = estimate_tokens(messages)
+                tokens = estimate_tokens(messages, count_reasoning=count_reasoning)
                 if tokens > COLLAPSE_THRESHOLD:
                     _context_collapse(messages)
-                    tokens = estimate_tokens(messages)
+                    tokens = estimate_tokens(messages, count_reasoning=count_reasoning)
 
                 # Layer 3: auto_compact (token threshold exceeded)
                 if tokens > TOKEN_THRESHOLD:
@@ -1286,7 +1346,7 @@ class AgentLoop:
 
                 logger.info(f"ReAct iteration {iteration}/{self.max_iterations}")
 
-                # Per-iteration status bar (E2): time + State counters live at
+                # Per-iteration status bar: time + State counters live at
                 # the trajectory tail, keeping the system prompt byte-stable.
                 # Budget / wrap-up nudges fold into the same message and are
                 # recomputed while their condition holds (the bar is replaced
@@ -1348,6 +1408,21 @@ class AgentLoop:
                             "have, and prepare your final answer."
                         )
 
+                # The last iteration (or a deadline-driven early finalize) is
+                # a forced text turn: the tool definitions stay in the request
+                # and ``tool_choice=none`` tells the model not to call any (the
+                # Anthropic Messages API rejects a history with tool_use /
+                # tool_result blocks but no ``tools``); the [SYSTEM] line says
+                # what is expected of the turn.
+                is_last_iteration = (iteration == self.max_iterations) or force_final
+                if is_last_iteration and not force_final:
+                    nudge_lines.append(
+                        "[SYSTEM] This is the final turn and tool calls are disabled. "
+                        "Write your final answer now as plain text, based on the "
+                        "material you already gathered; state explicitly which "
+                        "parts are incomplete or unverified."
+                    )
+
                 messages.append(
                     _build_status_message(self.memory.to_summary(), nudge_lines)
                 )
@@ -1381,12 +1456,20 @@ class AgentLoop:
                         {"iter": current_iter, "chars": reasoning_chars},
                     )
 
-                # On the last iteration (or a deadline-driven early finalize),
-                # drop tool definitions to force text output.
-                is_last_iteration = (iteration == self.max_iterations) or force_final
-                tool_defs = None if is_last_iteration else self.registry.get_definitions()
+                tool_defs = self.registry.get_definitions()
+                tool_choice = TOOL_CHOICE_NONE if is_last_iteration else None
                 if is_last_iteration:
-                    trace.write({"type": "forced_text_only", "iter": current_iter})
+                    trace.write(
+                        {
+                            "type": "forced_text_only",
+                            "iter": current_iter,
+                            "mode": (
+                                "tool_choice_none"
+                                if getattr(self.llm, "supports_tool_choice_none", True)
+                                else "tools_omitted"
+                            ),
+                        }
+                    )
 
                 llm_t0 = _time.perf_counter()
                 # In-place recovery for transient mid-stream failures
@@ -1398,6 +1481,7 @@ class AgentLoop:
                 # remaining budget can't absorb the next backoff sleep. Deltas
                 # from a failed attempt are dropped so the trace does not
                 # contain duplicated thinking text.
+                response = None
                 for stream_attempt in range(1 + STREAM_RETRIES):
                     try:
                         self._stats["llm_calls"] += 1
@@ -1407,6 +1491,7 @@ class AgentLoop:
                             on_text_chunk=_on_text_chunk,
                             on_reasoning_chunk=_on_reasoning_chunk,
                             should_cancel=self._cancel_event.is_set,
+                            tool_choice=tool_choice,
                         )
                         break
                     except ProviderStreamError as exc:
@@ -1445,7 +1530,10 @@ class AgentLoop:
                         thinking_chunks.clear()
                         reasoning_chars = 0
                         last_reasoning_emit = None
-                        _time.sleep(delay)
+                        # A cancel during the backoff ends the run at the
+                        # check below instead of after the full sleep.
+                        if _cancel.sleep_unless_cancelled(delay, self._cancel_event):
+                            break
                 llm_elapsed_ms = int((_time.perf_counter() - llm_t0) * 1000)
                 self._stats["llm_ms"] += llm_elapsed_ms
                 # Persist the LLM call as a trace block (ts = end time) so the
@@ -1458,9 +1546,10 @@ class AgentLoop:
                 except Exception:  # noqa: BLE001 - trace must never break the run
                     logger.debug("llm_call trace write failed", exc_info=True)
 
-                # Cancelled mid-stream: discard this turn's partial response and
-                # end the run now, without executing any of its tool calls.
-                if self._cancel_event.is_set():
+                # Cancelled mid-stream (or during a retry backoff): discard
+                # this turn's partial response and end the run now, without
+                # executing any of its tool calls.
+                if self._cancel_event.is_set() or response is None:
                     break
 
                 usage = getattr(response, "usage_metadata", None)
@@ -1514,15 +1603,67 @@ class AgentLoop:
                     )
                     self._emit("thinking_done", {"iter": current_iter, "content": thinking_text[:500]})
 
+                # Duck-typed: LLM stand-ins may omit finish_reason.
+                finish_reason = getattr(response, "finish_reason", "stop")
+                if finish_reason == "length":
+                    truncated_payload = {
+                        "iter": current_iter,
+                        "chars": len(response.content or ""),
+                        "has_tool_calls": response.has_tool_calls,
+                    }
+                    trace.write({"type": "output_truncated", **truncated_payload})
+                    self._emit("output_truncated", truncated_payload)
+                    self._stats["output_truncations"] = (
+                        self._stats.get("output_truncations", 0) + 1
+                    )
+
                 if not response.has_tool_calls:
                     final_content = response.content or ""
+                    if (
+                        finish_reason == "length"
+                        and final_content
+                        and not is_last_iteration
+                        and length_continuations < LENGTH_CONTINUATIONS
+                    ):
+                        # Keep the partial reply in the trajectory and ask for
+                        # the rest; the continuation consumes a normal
+                        # iteration (never rewind the counters — the trace is
+                        # indexed by ``iter``).
+                        length_continuations += 1
+                        truncated_parts.append(final_content)
+                        trace.write_text_entry(
+                            {"type": "message", "iter": current_iter, "role": "assistant"},
+                            field="content",
+                            value=final_content,
+                            offload_kind=f"assistant-message-{current_iter}",
+                        )
+                        trace.write(
+                            {
+                                "type": "output_truncated_continue",
+                                "iter": current_iter,
+                                "attempt": length_continuations,
+                                "max_continuations": LENGTH_CONTINUATIONS,
+                            }
+                        )
+                        messages.append({"role": "assistant", "content": final_content})
+                        messages.append({"role": "user", "content": _LENGTH_CONTINUE_NUDGE})
+                        # Fallback answer should the run end without another
+                        # text turn: the partial, marked as such.
+                        final_content += OUTPUT_TRUNCATED_MARK
+                        continue
+                    if truncated_parts:
+                        # The continuation(s) complete the earlier partial text.
+                        final_content = "".join(truncated_parts) + final_content
+                        truncated_parts = []
+                    if finish_reason == "length" and final_content:
+                        final_content += OUTPUT_TRUNCATED_MARK
                     if not final_content:
                         empty_payload = {
                             "iter": current_iter,
                             "provider": os.getenv("LANGCHAIN_PROVIDER", "openai"),
                             "model": getattr(self.llm, "model_name", None) or os.getenv("LANGCHAIN_MODEL_NAME", ""),
                         }
-                        # V2: one in-place retry with an explicit nudge before
+                        # One in-place retry with an explicit nudge before
                         # writing off the attempt. The stream SUCCEEDED — this
                         # is a degraded provider turn, not a transport failure,
                         # so the STREAM_RETRIES path above never covered it.
@@ -1635,10 +1776,16 @@ class AgentLoop:
                     react_trace.append({"type": "answer", "content": final_content[:500]})
                     break
 
+                # A tool-calling turn after a length continuation restarts the
+                # model's own reasoning; the partial text stays in the
+                # trajectory for it to reuse, not as a prefix of the answer.
+                truncated_parts = []
                 assistant_message = context.format_assistant_tool_calls(
                     response.tool_calls,
                     content=response.content,
-                    reasoning_content=response.reasoning_content or thinking_text or None,
+                    # Only the channel's own reasoning field; the visible text
+                    # is already ``content`` and must not be mirrored here.
+                    reasoning_content=response.reasoning_content or None,
                 )
                 _attach_tool_call_thought_signatures(assistant_message, response.tool_calls)
                 messages.append(assistant_message)
@@ -1660,12 +1807,16 @@ class AgentLoop:
                 if isinstance(exc, ProviderStreamError)
                 else "agent_loop_error"
             )
-            trace.write({"type": "end", "iter": self._run_iteration, "status": "error", "reason": str(exc), "iterations": iteration})
+            _best_effort(
+                trace.write,
+                {"type": "end", "iter": self._run_iteration, "status": "error",
+                 "reason": str(exc), "iterations": iteration},
+            )
             self._emit_attempt_stats(
                 "error", iteration, run_t0, llm_usage_summary, trace, reason=str(exc)
             )
-            trace.close()
-            state_store.mark_failure(run_dir, str(exc))
+            _best_effort(trace.close)
+            _best_effort(state_store.mark_failure, run_dir, str(exc))
             return {
                 "status": "failed",
                 "error_code": error_code,
@@ -1678,9 +1829,9 @@ class AgentLoop:
                 "max_iterations": self.max_iterations,
             }
 
-        # V2 (P2-11): tidy the long-term memory index at run end when it nears
-        # its cap, instead of waiting for the model to act on the F7① "index is
-        # full" warning itself. Runs here, after the trajectory is finished, so
+        # Tidy the long-term memory index at run end when it nears its cap,
+        # instead of waiting for the model to act on the "index is full"
+        # warning itself. Runs here, after the trajectory is finished, so
         # the session-start snapshot frozen into the system prompt is never
         # churned mid-run. Best effort — it never affects the result.
         if self._persistent_memory is not None:
@@ -1781,12 +1932,13 @@ class AgentLoop:
         iterations: int,
         run_t0: float,
         llm_usage_summary: dict[str, Any] | None,
-        trace: TraceWriter,
+        trace: Optional[TraceWriter],
         reason: str | None = None,
     ) -> None:
         """Emit the per-attempt observability summary (SSE + trace).
 
-        One frame per attempt, at the very end, regardless of outcome. The
+        One frame per attempt, at the very end, regardless of outcome (``trace``
+        is ``None`` only when the run failed before its trace file existed). The
         multi-tenant router forwards it to laicai as a progress frame; laicai
         persists it into ``deep_engine_runs``. ``data_fetches`` / ``data_gaps``
         are reserved for the data-reliability batch and empty for now, so the
@@ -1826,8 +1978,8 @@ class AgentLoop:
         if self._stats.get("verify_warnings"):
             stats["verify_warnings"] = self._stats["verify_warnings"]
         # Degradation counters (only present when non-zero): L3 summary call
-        # failures and oversized-result offload failures. Both were counted
-        # into _stats but never emitted (P1 2026-09-04).
+        # failures and oversized-result offload failures; counted into _stats
+        # and emitted here.
         for counter in ("compact_failures", "offload_failures"):
             if self._stats.get(counter):
                 stats[counter] = int(self._stats[counter])
@@ -1849,11 +2001,50 @@ class AgentLoop:
                 stats["stream_retries"] = stream_retries
         if reason:
             stats["reason"] = str(reason)[:500]
-        try:
-            trace.write({"type": "attempt_stats", **stats})
-        except Exception:  # noqa: BLE001 - stats must never break the run
-            logger.debug("attempt_stats trace write failed", exc_info=True)
+        if trace is not None:
+            _best_effort(trace.write, {"type": "attempt_stats", **stats})
         self._emit("attempt_stats", stats)
+
+    def _fail_before_loop(
+        self,
+        exc: Exception,
+        *,
+        run_dir: Optional[Path],
+        trace: Optional[TraceWriter],
+        state_store: RunStateStore,
+        run_t0: float,
+    ) -> Dict[str, Any]:
+        """Terminal ``failed`` result for an exception raised before the loop.
+
+        Same envelope as a mid-loop failure (``status`` / ``reason`` /
+        ``error_code`` / ``run_id``) and the same ``attempt_stats`` frame, so
+        the session layer and the router treat both alike. Every write here
+        is best-effort: the usual cause is a disk that cannot be written to.
+        """
+        logger.exception("AgentLoop failed before the loop started: %s", exc)
+        reason = str(exc)
+        if trace is not None:
+            _best_effort(
+                trace.write,
+                {"type": "end", "iter": self._run_iteration, "status": "error",
+                 "reason": reason, "iterations": 0},
+            )
+        self._emit_attempt_stats("error", 0, run_t0, None, trace, reason=reason)
+        if trace is not None:
+            _best_effort(trace.close)
+        if run_dir is not None:
+            _best_effort(state_store.mark_failure, run_dir, reason)
+        return {
+            "status": "failed",
+            "error_code": "agent_loop_error",
+            "reason": reason,
+            "run_dir": str(run_dir) if run_dir is not None else None,
+            "run_id": run_dir.name if run_dir is not None else None,
+            "content": "",
+            "react_trace": [],
+            "iterations": 0,
+            "max_iterations": self.max_iterations,
+        }
 
     # -- Tool execution with read/write batching --------------------------------
 
@@ -2117,8 +2308,8 @@ class AgentLoop:
 
         Thin wrapper over :func:`invoke_tool_guarded`: resolves the per-tool
         timeout, clamps it to the attempt budget, and wires the loop's event
-        sink. The guard body is shared with the swarm worker (V2) so the two
-        can no longer drift on timeout / heartbeat / budget-clamp semantics.
+        sink. The guard body is shared with the swarm worker so the two
+        cannot drift on timeout / heartbeat / budget-clamp semantics.
 
         Args:
             tool_name: Tool name to execute.
@@ -2129,7 +2320,7 @@ class AgentLoop:
         """
         timeout = self._tool_timeout(tool_name)
         if timeout is not None:
-            # Never let a single tool outlive the attempt budget (batch 3):
+            # Never let a single tool outlive the attempt budget:
             # keep a reserve so the loop can still produce a final answer.
             timeout = _budget.cap_timeout(
                 timeout, reserve_s=_TOOL_CAP_RESERVE_S, floor_s=_TOOL_CAP_FLOOR_S
@@ -2155,7 +2346,7 @@ class AgentLoop:
         Defaults to the tenant-wide ``TOOL_TIMEOUT_SECONDS``. A tool whose
         NORMAL runtime legitimately exceeds it declares ``timeout_seconds``
         (``run_swarm``: SWARM_TIMEOUT + margin). The declaration only RAISES
-        the base of the F2 1×-warn / 2×-abandon window, never lowers it, and
+        the base of the 1×-warn / 2×-abandon window, never lowers it, and
         the attempt budget still clamps the result via ``cap_timeout`` at the
         call site — so a hung tool can never outlive the caller's deadline
         regardless of what it declares.
@@ -2203,7 +2394,7 @@ class AgentLoop:
         """
         self._update_memory(tc.name)
 
-        # P0 2026-09-04: scrub env-derived credential VALUES before the result
+        # Scrub env-derived credential VALUES before the result
         # reaches the trajectory, the trace or the grounding verifier. The
         # shell tools already scrub their own stdout; this covers every other
         # tool (read_file on a dumped .env, an MCP error echoing a header …).
@@ -2220,9 +2411,9 @@ class AgentLoop:
             tool_stats["errors"] += 1
 
         status = "ok" if success else "error"
-        # V2: oversized results go to disk and the model gets an EXPLICIT
+        # Oversized results go to disk and the model gets an EXPLICIT
         # preview envelope pointing at the file. The raw ``result`` is
-        # deliberately still what the success classifier, the F1 grounding
+        # deliberately still what the success classifier, the grounding
         # verifier and the trace consume — only the trajectory copy shrinks.
         payload, offload_failed = prepare_for_context(
             result,
@@ -2345,10 +2536,10 @@ class AgentLoop:
             prompt = _STRUCTURED_SUMMARY_PROMPT.format(focus_section=focus_section) + conv_text
 
         compact_t0 = _time.perf_counter()
-        # V2: compaction is a CORRECT mechanism — it must never be the thing
-        # that kills an otherwise healthy run. Before this guard, one provider
-        # hiccup on the summary call propagated to run()'s top-level except and
-        # failed the whole attempt. On failure we degrade to the zero-LLM
+        # Compaction is a CORRECT mechanism — it must never be the thing that
+        # kills an otherwise healthy run: without this guard one provider
+        # hiccup on the summary call would propagate to run()'s top-level
+        # except and fail the whole attempt. On failure we degrade to the zero-LLM
         # layers (L1/L2 already ran this iteration) and leave the trajectory
         # untouched; the next iteration retries compaction.
         try:
@@ -2373,7 +2564,7 @@ class AgentLoop:
             logger.warning("Auto compact produced an empty summary; skipping rebuild")
             return
         self._previous_summary = summary
-        # V2: persist the moment it exists, not at run end — the attempt that
+        # Persist the moment it exists, not at run end — the attempt that
         # times out or crashes is exactly the one whose summary the NEXT
         # attempt needs. See src/session/handoff.py.
         handoff.save(self._session_id, summary, attempt_iter=iteration)
@@ -2412,7 +2603,7 @@ class AgentLoop:
         # Fix orphaned tool pairs in the reconstructed message list
         _fix_tool_pairs(messages)
 
-        # P1 2026-09-04: the duplicate-call guard keys on the tool-result
+        # The duplicate-call guard keys on the tool-result
         # message OBJECT. Results compressed into the summary are gone from
         # the trajectory, so an identical re-fetch must be allowed again —
         # otherwise the model is told "use the result above" about data it

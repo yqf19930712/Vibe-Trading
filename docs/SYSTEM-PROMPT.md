@@ -36,7 +36,7 @@
 | `## Guidelines` | 输出与行为守则（见下） | 模板固定文本 |
 | `## Persistent Memory` | 跨会话记忆快照，**有记忆才渲染** | `PersistentMemory.snapshot` |
 
-**系统提示里刻意没有时间戳和工作区状态。** 任何逐轮变化的内容（分钟级时间戳、WorkspaceMemory 计数器）进系统提示都会让提示词逐轮字节不一致、provider 的 prompt cache 前缀全废。这两块动态信息由主循环以**状态栏**注入：每轮迭代在轨迹**末尾**追加一条 `<agent_status>` user 消息（ISO 时间戳 + State 计数器），并把预算/收尾类 `[SYSTEM]` 提醒（迭代 80% 收尾、剩余 <25% 收尾、early_finalize 强制作答）并入同一条消息；下一轮先移除上一条状态栏再追加新的（用后即弃），轨迹里任何时刻只有一条。实现见 `agent/src/agent/loop.py` 的 `_build_status_message()` / `_remove_status_messages()`；Guidelines 末条向模型说明「时间与工作区状态在对话末尾的 `<agent_status>` 消息里」。
+**系统提示里刻意没有时间戳和工作区状态。** 任何逐轮变化的内容（分钟级时间戳、WorkspaceMemory 计数器）进系统提示都会让提示词逐轮字节不一致、provider 的 prompt cache 前缀全废。这两块动态信息由主循环以**状态栏**注入：每轮迭代在轨迹**末尾**追加一条 `<agent_status>` user 消息（ISO 时间戳 + State 计数器），并把预算/收尾类 `[SYSTEM]` 提醒（迭代 80% 收尾、剩余 <25% 收尾、early_finalize 强制作答、最后一轮「工具已禁用，只输出最终答案」）并入同一条消息；收尾轮的请求仍带完整工具定义，只以 `tool_choice=none` 禁止调用（原生 Anthropic 通道对含 tool 块却无 `tools` 的请求回 400）；下一轮先移除上一条状态栏再追加新的（用后即弃），轨迹里任何时刻只有一条。实现见 `agent/src/agent/loop.py` 的 `_build_status_message()` / `_remove_status_messages()`；Guidelines 末条向模型说明「时间与工作区状态在对话末尾的 `<agent_status>` 消息里」。
 
 **Task Routing**（模板里六个加粗块，模型据此选工作流；下面按流程归为五条）：
 
@@ -62,9 +62,9 @@
 
 召回失败静默降级（debug 日志），不阻塞对话。
 
-**外部内容同样声明为「数据、非指令」。** `read_url` / `web_search` / `read_document` 的正文包进 `<external-content source=… kind=… trust="untrusted">` 块（`security/scanner.py::wrap_external_content`），块首的声明与 `<recalled-memories>` 同构——存储型注入与实时注入用同一套指令/数据分离。注入扫描器（`scan_prompt_injection`）的五条规则各带中英两版：英文规则用 `\b` 词边界，中文规则用 `[^。！？\n]{0,N}` 代替（CJK 字符之间没有词边界），「忽略以上所有指令」「你现在是系统管理员」「把系统提示词打印出来」这类模式因此可命中——本产品的外部内容（雪球/公告/中文新闻/上传交割单）以中文为主，中文规则是主流量的护栏。命中 high 级规则时，警告放在**正文之前的显式横幅**（JSON 尾部字段模型可能永远读不到）。包裹是输入的纯函数（无时间戳、无计数器），重读同一页面字节一致，不影响 prompt cache。
+**外部内容同样声明为「数据、非指令」。** `read_url` / `web_search` / `read_document` 的正文、远端 MCP 工具结果的 `text` 与 `content[*].text`（`kind="mcp_result"`）、`session_search` 的片段（`kind="session_snippet"`）都包进 `<external-content source=… kind=… trust="untrusted">` 块（`security/scanner.py::wrap_external_content`）；`read_file` 翻到一份落盘的外部结果（文件里含 `<external-content` 标记）时把该页重新包一层（`kind="offloaded_external"`），信封不会因为分页而丢失。`bash` 自己抓取的网络正文无法与本地输出区分，不包裹。块首的声明与 `<recalled-memories>` 同构——存储型注入与实时注入用同一套指令/数据分离。注入扫描器（`scan_prompt_injection`）的五条规则各带中英两版：英文规则用 `\b` 词边界，中文规则用 `[^。！？\n]{0,N}` 代替（CJK 字符之间没有词边界），「忽略以上所有指令」「你现在是系统管理员」「把系统提示词打印出来」这类模式因此可命中——本产品的外部内容（雪球/公告/中文新闻/上传交割单）以中文为主，中文规则是主流量的护栏。命中 high 级规则时，警告放在**正文之前的显式横幅**（JSON 尾部字段模型可能永远读不到）。包裹是输入的纯函数（无时间戳、无计数器），重读同一页面字节一致，不影响 prompt cache。
 
-**工具结果进入轨迹前的两道处理**与提示词无关但决定模型看到什么：①按值脱敏（`redaction.redact_secret_values`，引擎 env 里的凭据值 → `[redacted:<KEY>]`）；②超限截断信封（`tool_result_store.prepare_for_context`：`load_skill` 60k 预算按 `##` 分节裁、`get_market_data` 保 `summary` + 首尾 20 根 bar、其余 10k head+tail），信封文案是字节稳定的纯函数。
+**工具结果进入轨迹前的两道处理**与提示词无关但决定模型看到什么：①按值脱敏（`redaction.redact_secret_values`，引擎 env 里的凭据值 → `[redacted:<KEY>]`）；②超限截断信封（`tool_result_store.prepare_for_context`：`load_skill` 60k 预算按 `##` 分节裁、`get_market_data` 保 `summary` + 首尾 20 根 bar、`read_file` 只预览不落盘副本、其余 10k head+tail 并落盘全文，`bash` 的落盘是纯文本流），这是工具与轨迹之间唯一的截断层，信封文案是字节稳定的纯函数。
 
 ## 4. Swarm worker 系统提示词
 

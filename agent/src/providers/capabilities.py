@@ -24,6 +24,12 @@ class ProviderCapabilities:
             be normalized to ``""`` for strict providers.
         openrouter_reasoning_body: Whether ``extra_body.reasoning`` is a valid
             OpenRouter request option.
+        tool_choice_none: Whether the endpoint accepts ``tool_choice="none"``
+            (tools stay in the payload, the model is told not to call any).
+            A forced text turn on a provider without it falls back to
+            omitting the tools list instead — acceptable on OpenAI-compatible
+            endpoints, which do not validate ``tool`` messages against the
+            tools list the way the Anthropic Messages API does.
         default_headers: Provider-scoped headers passed to ChatOpenAI.
         native_adapter_package: Optional native adapter package to report.
     """
@@ -36,6 +42,7 @@ class ProviderCapabilities:
     gemini_thought_signatures: bool = False
     normalize_assistant_content: bool = False
     openrouter_reasoning_body: bool = False
+    tool_choice_none: bool = True
     default_headers: Mapping[str, str] = field(default_factory=dict)
     native_adapter_package: Optional[str] = None
 
@@ -70,13 +77,27 @@ _MOONSHOT_CAPABILITIES = ProviderCapabilities(
     default_headers={"User-Agent": _KIMI_USER_AGENT},
 )
 
-_ZHIPU_CAPABILITIES = ProviderCapabilities("zhipu", "ZHIPU_API_KEY", "ZHIPU_BASE_URL")
+# Zhipu's OpenAI-compatible endpoint documents ``tool_choice`` as "auto" only.
+_ZHIPU_CAPABILITIES = ProviderCapabilities(
+    "zhipu", "ZHIPU_API_KEY", "ZHIPU_BASE_URL", tool_choice_none=False
+)
+
+# Native Anthropic Messages channel (LANGCHAIN_PROVIDER=anthropic). Listed so
+# the tool_choice / reasoning lookups are uniform; its env vars are read by
+# ``llm._build_native_anthropic`` directly, never folded into OPENAI_*.
+_ANTHROPIC_CAPABILITIES = ProviderCapabilities(
+    "anthropic",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    native_adapter_package="langchain-anthropic",
+)
 
 _OPENAI_CODEX_CAPABILITIES = ProviderCapabilities("openai-codex", None, "OPENAI_CODEX_BASE_URL")
 
 
 _PROVIDERS: dict[str, ProviderCapabilities] = {
     "openai": ProviderCapabilities("openai", "OPENAI_API_KEY", "OPENAI_BASE_URL"),
+    "anthropic": _ANTHROPIC_CAPABILITIES,
     "openrouter": ProviderCapabilities(
         "openrouter",
         "OPENROUTER_API_KEY",

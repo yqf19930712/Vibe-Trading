@@ -12,9 +12,16 @@ from pydantic import ValidationError
 
 from src.config.paths import get_config_path, get_runtime_root
 from src.config.schema import AgentConfig, AgentConfigOverride, MCPServerConfig
+from src.config.tenant import tenant_safe_enabled
 
 logger = logging.getLogger(__name__)
 
+# Operator hatches: absolute paths to config files baked into the image (or
+# any other location the tenant cannot write). Under the tenant-safe profile
+# these are the ONLY on-disk configs honoured — ``~/.vibe-trading`` is the
+# tenant's writable bind-mount, and an ``agent.json`` there would let the
+# model's bash register a stdio MCP server the engine then spawns for it.
+_AGENT_CONFIG_ENV_VAR = "VIBE_TRADING_AGENT_CONFIG"
 _SWARM_AGENT_CONFIG_ENV_VAR = "VIBE_TRADING_SWARM_AGENT_CONFIG"
 _SWARM_AGENT_CONFIG_FILENAME = "swarm-agent.json"
 _MAIN_AGENT_FALLBACK_FILENAMES = ("agent.json", "agent.yaml", "agent.yml")
@@ -34,8 +41,16 @@ def load_agent_config(config_path: Path | None = None) -> AgentConfig:
 
     Returns:
         The validated agent config. Invalid or unreadable config files fall
-        back to ``AgentConfig()``.
+        back to ``AgentConfig()``. With no explicit path, the
+        ``VIBE_TRADING_AGENT_CONFIG`` env var wins over the
+        ``~/.vibe-trading`` lookup, and under the tenant-safe profile the
+        ``~/.vibe-trading`` lookup is skipped entirely (tenant-writable).
     """
+    if config_path is None:
+        config_path = _operator_agent_config_path()
+        if config_path is None and tenant_safe_enabled():
+            return AgentConfig()
+
     path = get_config_path(config_path)
 
     if not path.exists():
@@ -52,6 +67,12 @@ def load_agent_config(config_path: Path | None = None) -> AgentConfig:
         )
         logger.debug("Agent config load error details: %s", exc)
         return AgentConfig()
+
+
+def _operator_agent_config_path() -> Path | None:
+    """Return the ``VIBE_TRADING_AGENT_CONFIG`` path when the env var is set."""
+    env_value = os.environ.get(_AGENT_CONFIG_ENV_VAR, "").strip()
+    return Path(env_value).expanduser() if env_value else None
 
 
 def merge_agent_config_overrides(
@@ -163,6 +184,9 @@ def _resolve_swarm_agent_config_path(
        for CI / sandbox deployments where the runtime root is read-only.
        Returned even if the file does not yet exist; the caller logs &
        degrades gracefully so a misconfigured env var doesn't crash boot.
+       Under the tenant-safe profile (``VIBE_TRADING_TENANT_SAFE=1``) this
+       is the only step: the runtime root is the tenant's writable
+       bind-mount, so files there are never consulted.
     2. ``<runtime_root>/swarm-agent.json`` — the swarm-specific operator
        allowlist. Lets the swarm path use a *different* set of MCP servers
        from the main agent without duplicating non-MCP fields.
@@ -187,6 +211,8 @@ def _resolve_swarm_agent_config_path(
     env_value = os.environ.get(_SWARM_AGENT_CONFIG_ENV_VAR, "").strip()
     if env_value:
         return Path(env_value).expanduser()
+    if tenant_safe_enabled():
+        return None
 
     root = runtime_root if runtime_root is not None else get_runtime_root()
     swarm_specific = root / _SWARM_AGENT_CONFIG_FILENAME

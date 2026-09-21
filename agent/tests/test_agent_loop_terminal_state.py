@@ -46,6 +46,7 @@ class _StubLLMNoFinal:
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        tool_choice: str | None = None,
     ) -> _StubLLMResponse:
         return _StubLLMResponse()
 
@@ -63,6 +64,7 @@ class _StubLLMWithUsage:
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        tool_choice: str | None = None,
     ) -> _StubLLMResponse:
         response = _StubLLMResponse()
         response.content = "done"
@@ -90,6 +92,7 @@ class _StubLLMCancelMidStream:
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        tool_choice: str | None = None,
     ) -> _StubLLMResponse:
         # Set _cancelled on the bound agent so the next loop iteration check
         # picks it up.  We still need a valid response so the current
@@ -173,6 +176,7 @@ class _StubLLMCancelWithToolCalls:
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        tool_choice: str | None = None,
     ) -> _StubLLMResponse:
         self._agent_ref[0]._cancel_event.set()
         resp = _StubLLMResponse()
@@ -250,7 +254,12 @@ def test_usage_metadata_is_persisted_to_run_artifact(tmp_path: Path, monkeypatch
 
 
 class _StubLLMAlwaysToolCalls:
-    """LLM stub that returns tool calls until tools=None forces text."""
+    """LLM stub that returns tool calls until tool_choice="none" forces text.
+
+    Tool definitions are always passed (the Anthropic Messages API rejects a
+    history with tool blocks but no ``tools``); the forced text turn is the
+    one that carries ``tool_choice="none"``.
+    """
 
     def __init__(self) -> None:
         self._counter = 0
@@ -262,9 +271,11 @@ class _StubLLMAlwaysToolCalls:
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        tool_choice: str | None = None,
     ) -> _StubLLMResponse:
         resp = _StubLLMResponse()
-        if tools is not None:
+        assert tools is not None, "tool definitions must stay in every request"
+        if tool_choice != "none":
             self._counter += 1
             resp.has_tool_calls = True
             resp.tool_calls = [
@@ -280,7 +291,7 @@ class _StubLLMAlwaysToolCalls:
 
 
 class _StubLLMIgnoresForcedTextOnly:
-    """LLM stub that keeps returning tool calls even when tools=None."""
+    """LLM stub that keeps returning tool calls even under tool_choice="none"."""
 
     def stream_chat(
         self,
@@ -289,6 +300,7 @@ class _StubLLMIgnoresForcedTextOnly:
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        tool_choice: str | None = None,
     ) -> _StubLLMResponse:
         resp = _StubLLMResponse()
         resp.has_tool_calls = True
@@ -309,6 +321,7 @@ class _StubLLMStreamFailure:
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        tool_choice: str | None = None,
     ) -> _StubLLMResponse:
         raise ProviderStreamError(
             provider="deepseek",
@@ -348,7 +361,8 @@ def test_true_max_iterations_still_returns_max_iteration_reason(tmp_path: Path) 
 
 def test_force_text_only_on_last_iteration(tmp_path: Path) -> None:
     """When the LLM keeps calling tools, the last iteration forces text-only
-    output by passing tools=None, producing a final answer instead of failure."""
+    output with tool_choice="none" (tools still attached), producing a final
+    answer instead of failure."""
     agent = _build_agent(
         _StubLLMAlwaysToolCalls(), max_iter=5, tmp_run_dir=tmp_path / "run"
     )

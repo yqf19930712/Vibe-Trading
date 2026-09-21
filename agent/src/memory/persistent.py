@@ -10,17 +10,25 @@ Storage layout:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
+import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator, List, Optional
 
 from src.agent.frontmatter import parse_frontmatter as _parse_frontmatter
 from src.core.atomic_write import atomic_write_text
-from typing import List, Optional
+
+try:  # POSIX only; the in-process lock alone applies elsewhere.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +44,22 @@ class MemoryWriteError(RuntimeError):
 
 MEMORY_BASE = Path.home() / ".vibe-trading" / "memory"
 MAX_INDEX_LINES = 200
-# V2 (P2-11): once the index gets this long the engine runs one consolidation
-# pass on its own at run end, instead of waiting for the model to notice the
-# F7① "index is full" warning and call consolidate_memory itself. Past
+# Index order = eviction order: ``user`` entries (preferences, risk
+# tolerance — the notes that must stay in every system prompt) always come
+# first, then everything else newest-first, so the line cap drops the oldest
+# non-preference entry rather than whichever type sorts last by filename.
+INDEX_PRIORITY_TYPES = ("user",)
+# Soft expiry for non-``user`` entries: ``VIBE_MEMORY_TTL_DAYS`` (unset or
+# non-positive = never expire). An expired entry stays on disk and stays
+# findable by title / listing, but leaves the index snapshot and auto-recall.
+MEMORY_TTL_ENV = "VIBE_MEMORY_TTL_DAYS"
+# Cross-process lock file next to the index (flock); with the per-directory
+# in-process lock it serialises every read-modify-write of MEMORY.md, so two
+# attempts of one tenant cannot drop each other's index line.
+INDEX_LOCK_FILENAME = ".MEMORY.lock"
+# Once the index gets this long the engine runs one consolidation pass on its
+# own at run end, instead of waiting for the model to notice the "index is
+# full" warning and call consolidate_memory itself. Past
 # MAX_INDEX_LINES new entries stop appearing in the session-start snapshot
 # altogether, so the tidy-up has to happen BEFORE the cap, not at it.
 AUTO_CONSOLIDATE_INDEX_LINES = 180
@@ -94,7 +115,7 @@ def _tokenize(text: str) -> set[str]:
 
     ASCII words >= 3 chars + individual characters from non-Latin scripts
     listed in ``_NON_LATIN_SCRIPT_RANGES`` (CJK, Thai, Arabic, Hebrew,
-    Cyrillic), plus adjacent-pair 2-grams of those characters (F7④: single
+    Cyrillic), plus adjacent-pair 2-grams of those characters (single
     CJK chars are far too promiscuous — "分" matches half the corpus — so
     scoring weights 2-grams full and lone chars low). Underscores are
     treated as word boundaries so snake_case titles (e.g. ``mcp_wiring_test``)
@@ -118,11 +139,11 @@ def _tokenize(text: str) -> set[str]:
 
 
 #: Weight applied to lone non-Latin (e.g. single CJK) character tokens when
-#: scoring — they carry little signal on their own (F7④).
+#: scoring — they carry little signal on their own.
 SINGLE_CJK_WEIGHT = 0.3
 #: Recency bonus: score is multiplied by ``1 + RECENCY_WEIGHT * freshness``
 #: where freshness decays linearly from 1 (just modified) to 0 over
-#: ``RECENCY_HORIZON_DAYS`` (F7④).
+#: ``RECENCY_HORIZON_DAYS``.
 RECENCY_WEIGHT = 0.1
 RECENCY_HORIZON_DAYS = 30.0
 
@@ -191,6 +212,94 @@ def _coerce_str(value: object, default: str = "") -> str:
     return str(value)
 
 
+def memory_ttl_days() -> Optional[float]:
+    """Return the configured soft-expiry window in days, or None (no expiry)."""
+    raw = os.getenv(MEMORY_TTL_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        days = float(raw)
+    except ValueError:
+        logger.warning("%s=%r is not a number; memory expiry disabled", MEMORY_TTL_ENV, raw)
+        return None
+    return days if days > 0 else None
+
+
+class _DirLock:
+    """Re-entrant per-directory lock: threading.RLock + ``flock`` on a lock file.
+
+    The RLock serialises the attempts of one engine process (up to four run
+    concurrently); the file lock serialises against any other process on the
+    same kernel that edits the same memory directory. flock is not guaranteed
+    to cross a VM boundary: in the hosted deployment this directory is a host
+    mount into the MicroVM, so the lock holds inside the engine and among
+    host-side editors (cube-router ``/memory/delete``) respectively, not
+    between the two — cross-side races are tolerated because the index is
+    rebuilt from the entry files. The file lock is taken only at the
+    outermost acquisition so nested calls (``consolidate`` → ``_rebuild_index``)
+    do not deadlock. A lock file that cannot be opened (read-only volume) is
+    tolerated: the in-process lock still holds.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self._rlock = threading.RLock()
+        self._lock_path = directory / INDEX_LOCK_FILENAME
+        self._depth = 0
+        self._fd: Optional[int] = None
+
+    @contextlib.contextmanager
+    def held(self) -> Iterator[None]:
+        with self._rlock:
+            if self._depth == 0:
+                self._acquire_file()
+            self._depth += 1
+            try:
+                yield
+            finally:
+                self._depth -= 1
+                if self._depth == 0:
+                    self._release_file()
+
+    def _acquire_file(self) -> None:
+        if fcntl is None:
+            return
+        try:
+            fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        except OSError as exc:
+            logger.debug("memory lock file unavailable (%s); in-process lock only", exc)
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            os.close(fd)
+            logger.debug("memory flock failed (%s); in-process lock only", exc)
+            return
+        self._fd = fd
+
+    def _release_file(self) -> None:
+        fd, self._fd = self._fd, None
+        if fd is None or fcntl is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+_DIR_LOCKS: dict[str, _DirLock] = {}
+_DIR_LOCKS_GUARD = threading.Lock()
+
+
+def _dir_lock(directory: Path) -> _DirLock:
+    """Return the process-wide lock object for ``directory`` (one per path)."""
+    key = str(directory.resolve())
+    with _DIR_LOCKS_GUARD:
+        lock = _DIR_LOCKS.get(key)
+        if lock is None:
+            lock = _DIR_LOCKS[key] = _DirLock(directory)
+        return lock
+
+
 class PersistentMemory:
     """File-based persistent memory that survives across sessions.
 
@@ -212,20 +321,20 @@ class PersistentMemory:
         self._dir = memory_dir or MEMORY_BASE
         self._dir.mkdir(parents=True, exist_ok=True)
         self._index_path = self._dir / "MEMORY.md"
+        self._lock = _dir_lock(self._dir)
         self._snapshot: str = ""
-        # Whether the most recent add() landed inside the line-capped index
-        # (F7①). True until an add is actually dropped by the cap.
+        # Whether the most recent add() landed inside the line-capped index.
+        # True until an add is actually dropped by the cap.
         self.last_add_indexed: bool = True
         self._load_snapshot()
 
     def _load_snapshot(self) -> None:
         """Load index as frozen snapshot. Called once at init.
 
-        A corrupt index (half-written multibyte sequence, non-UTF-8 bytes) used
-        to raise ``UnicodeDecodeError`` straight out of ``PersistentMemory()``
-        and fail every attempt of the tenant until someone SSH'd in (P1
-        2026-09-04). The file is now set aside as ``MEMORY.md.corrupt-<ts>``
-        and the run continues from an empty snapshot; the entry files are
+        A corrupt index (half-written multibyte sequence, non-UTF-8 bytes) must
+        not raise ``UnicodeDecodeError`` out of ``PersistentMemory()`` — that
+        would fail every attempt of the tenant until someone SSH'd in. The
+        file is set aside as ``MEMORY.md.corrupt-<ts>`` and the run continues from an empty snapshot; the entry files are
         untouched, so ``consolidate()`` / ``_rebuild_index`` can regenerate
         the index from them.
         """
@@ -285,15 +394,34 @@ class PersistentMemory:
                 memory_type=_coerce_str(meta.get("type"), default="project"),
                 body=body[:MAX_ENTRY_CHARS],
                 modified_at=path.stat().st_mtime,
-                # F7③: optional fields — legacy entries simply have "".
+                # Optional fields — legacy entries simply have "".
                 created=_coerce_str(meta.get("created")),
                 source=_coerce_str(meta.get("source")),
             ))
         return entries
 
     def list_entries(self) -> List[MemoryEntry]:
-        """Return all persisted memory entries, filename-sorted."""
+        """Return all persisted memory entries, filename-sorted (expired ones included)."""
         return self._scan_entries()
+
+    @staticmethod
+    def is_expired(entry: MemoryEntry, now: Optional[float] = None) -> bool:
+        """Whether ``entry`` is past the soft-expiry window (never for ``user`` entries)."""
+        ttl = memory_ttl_days()
+        if ttl is None or entry.memory_type in INDEX_PRIORITY_TYPES:
+            return False
+        age_days = ((now if now is not None else time.time()) - entry.modified_at) / 86400.0
+        return age_days > ttl
+
+    def _live_entries(self) -> List[MemoryEntry]:
+        """Entries that take part in the index and auto-recall (unexpired)."""
+        now = time.time()
+        return [e for e in self._scan_entries() if not self.is_expired(e, now)]
+
+    @staticmethod
+    def _index_order(entry: MemoryEntry) -> tuple[int, float, str]:
+        priority = 0 if entry.memory_type in INDEX_PRIORITY_TYPES else 1
+        return (priority, -entry.modified_at, entry.path.name)
 
     def find(self, name: str) -> Optional[MemoryEntry]:
         """Resolve a memory by exact title, then by on-disk filename stem.
@@ -316,23 +444,28 @@ class PersistentMemory:
 
     def remove_entry(self, entry: MemoryEntry) -> bool:
         """Delete a resolved entry without re-scanning to find it again."""
-        try:
-            entry.path.unlink(missing_ok=True)
-        except OSError as exc:
-            logger.warning("Failed to remove memory entry %s: %s", entry.path, exc)
-            return False
-        self._rebuild_index()
+        with self._lock.held():
+            try:
+                entry.path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Failed to remove memory entry %s: %s", entry.path, exc)
+                return False
+            self._rebuild_index()
+        logger.info("memory entry removed: %s (%s)", entry.title, entry.path.name)
         return True
 
     def find_relevant(self, query: str, max_results: int = MAX_RESULTS) -> List[MemoryEntry]:
         """Keyword search across all memory entries.
 
-        Scoring (F7④): weighted token overlap — metadata hits × 2.0 + body
+        Scoring: weighted token overlap — metadata hits × 2.0 + body
         hits × 1.0, where non-Latin 2-grams and ASCII words weigh 1.0 and lone
         non-Latin chars weigh ``SINGLE_CJK_WEIGHT`` (they match half the corpus
         on their own). The result is then multiplied by a small recency bonus
         ``1 + RECENCY_WEIGHT × freshness`` (mtime-based, linear decay over
-        ``RECENCY_HORIZON_DAYS``) so newer memories win ties.
+        ``RECENCY_HORIZON_DAYS``) so newer memories win ties. Equal scores
+        are ordered by the frontmatter ``created`` timestamp (newest first),
+        then by file mtime; expired entries (see :data:`MEMORY_TTL_ENV`) are
+        not recalled.
 
         Args:
             query: Search query.
@@ -341,15 +474,13 @@ class PersistentMemory:
         Returns:
             Top-scoring memory entries.
         """
-        import time as _time
-
         query_tokens = _tokenize(query)
         if not query_tokens:
             return []
 
-        now = _time.time()
+        now = time.time()
         scored: list[tuple[float, MemoryEntry]] = []
-        for entry in self._scan_entries():
+        for entry in self._live_entries():
             meta_tokens = _tokenize(f"{entry.title} {entry.description}")
             body_tokens = _tokenize(entry.body)
             meta_hits = sum(_token_weight(t) for t in query_tokens & meta_tokens)
@@ -362,7 +493,7 @@ class PersistentMemory:
             score *= 1.0 + RECENCY_WEIGHT * freshness
             scored.append((score, entry))
 
-        scored.sort(key=lambda x: (-x[0], -x[1].modified_at))
+        scored.sort(key=lambda x: (x[0], x[1].created, x[1].modified_at), reverse=True)
         return [entry for _, entry in scored[:max_results]]
 
     def add(self, name: str, content: str, memory_type: str = "project",
@@ -377,7 +508,7 @@ class PersistentMemory:
                 ``MAX_ENTRY_CHARS`` with a visible marker.
             memory_type: One of user/feedback/project/reference.
             description: One-line description for retrieval scoring.
-            source: Optional provenance note (F7③) — which conversation /
+            source: Optional provenance note — which conversation /
                 tool / task produced this memory. Stored in frontmatter;
                 readers treat a missing field as "".
 
@@ -420,49 +551,49 @@ class PersistentMemory:
         # is computed against the user-visible content length.
         clean_content = _truncate_body(_sanitize_body(content))
 
-        # V2 (P2-7): same-name-same-type used to overwrite silently, so one
-        # bad update destroyed the previous body for good — the Mem0 write-time
-        # UPDATE failure mode. The old body is now folded into the tail of the
-        # new file under the same merge marker ``consolidate()`` uses, which
-        # costs nothing and keeps the history visible.
-        previous_body = self._read_body(path)
-        if previous_body:
-            clean_content = _truncate_body(
-                clean_content
-                + f"\n\n---\n[superseded body, kept from the previous version of "
-                f"'{safe_name}']\n{previous_body}"
-            )
+        # Same title + same type overwrites, but the previous body is folded
+        # into the tail of the new file under the merge marker
+        # ``consolidate()`` uses, so one bad update never destroys a note.
+        # A full tenant volume must not fail the attempt: writing memory is a
+        # nice-to-have, so the caller turns this into a structured tool error.
+        # The whole read-merge-write runs under the directory lock so a
+        # concurrent attempt cannot interleave with the body fold or the
+        # index rebuild.
+        with self._lock.held():
+            previous_body = self._read_body(path)
+            if previous_body:
+                clean_content = _truncate_body(
+                    clean_content
+                    + f"\n\n---\n[superseded body, kept from the previous version of "
+                    f"'{safe_name}']\n{previous_body}"
+                )
+            frontmatter = self._frontmatter(safe_name, safe_desc, memory_type, safe_source) + clean_content
+            try:
+                atomic_write_text(path, frontmatter)
+            except OSError as exc:
+                logger.warning("memory write failed for %s: %s", path.name, exc)
+                raise MemoryWriteError(
+                    f"memory store unavailable: {exc}"
+                ) from exc
+            try:
+                self.last_add_indexed = filename in self._rebuild_index()
+            except OSError as exc:  # noqa: BLE001 - entry exists; index is derived
+                logger.warning("memory index update failed for %s: %s", path.name, exc)
+                self.last_add_indexed = False
+        return path
 
-        # F7③: created timestamp always; source only when supplied. Readers
-        # (_scan_entries) treat both as optional so legacy entries are fine.
+    @staticmethod
+    def _frontmatter(name: str, description: str, memory_type: str, source: str) -> str:
+        """Render the YAML frontmatter block (``created`` always, ``source`` when given)."""
         created_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        source_line = f"source: {safe_source}\n" if safe_source else ""
-        frontmatter = (
-            f"---\nname: {safe_name}\n"
-            f"description: {safe_desc}\n"
+        source_line = f"source: {source}\n" if source else ""
+        return (
+            f"---\nname: {name}\n"
+            f"description: {description}\n"
             f"type: {memory_type}\n"
             f"created: {created_iso}\n"
             f"{source_line}---\n\n"
-            f"{clean_content}"
         )
-        # V2 (memory P1-3): a full tenant volume raised OSError straight out of
-        # here and killed the whole attempt. Writing memory is a nice-to-have;
-        # the caller turns this into a structured tool error instead.
-        try:
-            atomic_write_text(path, frontmatter)
-        except OSError as exc:
-            logger.warning("memory write failed for %s: %s", path.name, exc)
-            raise MemoryWriteError(
-                f"memory store unavailable: {exc}"
-            ) from exc
-        try:
-            self.last_add_indexed = self._update_index(
-                stripped_name, filename, description or stripped_name
-            )
-        except OSError as exc:  # noqa: BLE001 - entry exists; index is derived
-            logger.warning("memory index update failed for %s: %s", path.name, exc)
-            self.last_add_indexed = False
-        return path
 
     def _read_body(self, path: Path) -> str:
         """Return the body (frontmatter stripped) of an existing entry file.
@@ -489,44 +620,14 @@ class PersistentMemory:
         Returns:
             True if found and removed.
         """
-        for entry in self._scan_entries():
-            if entry.title == name:
-                entry.path.unlink(missing_ok=True)
-                self._rebuild_index()
-                return True
+        with self._lock.held():
+            for entry in self._scan_entries():
+                if entry.title == name:
+                    entry.path.unlink(missing_ok=True)
+                    self._rebuild_index()
+                    logger.info("memory entry removed: %s (%s)", entry.title, entry.path.name)
+                    return True
         return False
-
-    def _update_index(self, title: str, filename: str, description: str) -> bool:
-        """Append or update an entry in MEMORY.md.
-
-        Returns:
-            ``True`` when the entry's line landed inside the kept
-            ``MAX_INDEX_LINES`` window, ``False`` when the cap truncated it
-            away (F7① — the caller should warn: the entry file exists but it
-            will not appear in the session-start snapshot).
-        """
-        new_line = f"- [{title}]({filename}) — {description}"
-
-        included = True
-        if self._index_path.exists():
-            lines = self._index_path.read_text(encoding="utf-8").split("\n")
-            updated = False
-            for i, line in enumerate(lines):
-                if f"[{title}]" in line:
-                    lines[i] = new_line
-                    updated = True
-                    included = i < MAX_INDEX_LINES
-                    break
-            if not updated:
-                lines.append(new_line)
-                included = len(lines) <= MAX_INDEX_LINES
-            text = "\n".join(lines[:MAX_INDEX_LINES])
-        else:
-            text = new_line
-
-        # tmp + os.replace: a crash mid-write must not leave a truncated index.
-        atomic_write_text(self._index_path, text)
-        return included
 
     @property
     def index_full(self) -> bool:
@@ -565,7 +666,7 @@ class PersistentMemory:
             return None
 
     def consolidate(self) -> dict:
-        """Deduplicate entries sharing a title and rebuild the index (F7⑤).
+        """Deduplicate entries sharing a title and rebuild the index.
 
         Same-title entries can accumulate under different ``memory_type``
         prefixes (``project_x.md`` + ``user_x.md``) because the filename
@@ -577,6 +678,10 @@ class PersistentMemory:
             Stats dict: ``duplicates_merged`` (files removed), ``entries``
             (count after), ``index_lines``, ``index_full``.
         """
+        with self._lock.held():
+            return self._consolidate_locked()
+
+    def _consolidate_locked(self) -> dict:
         entries = self._scan_entries()
         by_title: dict[str, list[MemoryEntry]] = {}
         for entry in entries:
@@ -631,8 +736,16 @@ class PersistentMemory:
             "index_full": index_lines >= MAX_INDEX_LINES,
         }
 
-    def _rebuild_index(self) -> None:
-        """Rebuild MEMORY.md from all existing entry files."""
-        entries = self._scan_entries()
+    def _rebuild_index(self) -> set[str]:
+        """Rebuild MEMORY.md from the entry files; returns the filenames it lists.
+
+        Order (and therefore what the ``MAX_INDEX_LINES`` cap evicts): entries
+        of :data:`INDEX_PRIORITY_TYPES` first, then the rest newest-first;
+        expired entries are left out. This is the single index writer — every
+        add / remove / consolidate goes through it, so the snapshot never
+        depends on which of those ran last.
+        """
+        entries = sorted(self._live_entries(), key=self._index_order)[:MAX_INDEX_LINES]
         lines = [f"- [{e.title}]({e.path.name}) — {e.description}" for e in entries]
-        atomic_write_text(self._index_path, "\n".join(lines[:MAX_INDEX_LINES]))
+        atomic_write_text(self._index_path, "\n".join(lines))
+        return {e.path.name for e in entries}

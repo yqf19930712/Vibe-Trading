@@ -15,7 +15,14 @@ class EditFileTool(BaseTool):
     """Find and replace the first occurrence of a string in a workspace file."""
 
     name = "edit_file"
-    description = "Find and replace the first occurrence of old_text with new_text in a file."
+    description = (
+        "Find and replace the first occurrence of old_text with new_text in a "
+        "file under run_dir (path is relative to run_dir). old_text must match "
+        "exactly, whitespace included; if it occurs more than once only the FIRST "
+        "occurrence changes, so include enough surrounding lines to make it "
+        "unique. Returns {status:'ok', path}; status:'error' when the file is "
+        "missing, old_text is not found, or the path resolves outside run_dir."
+    )
     is_readonly = False
     parameters = {
         "type": "object",

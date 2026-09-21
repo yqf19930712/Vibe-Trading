@@ -1,11 +1,11 @@
 """Atomic text-file replace shared by the on-disk state writers.
 
-Extracted from ``session/handoff.py`` (review 2026-09-04, P1) so
-``memory/persistent.py`` — whose ``MEMORY.md`` index and entry files were
-written with a bare ``Path.write_text`` — uses the same tmp + ``os.replace``
+Used by ``session/handoff.py`` and ``memory/persistent.py`` (``MEMORY.md``
+index and entry files) so every writer shares one tmp + ``os.replace``
 pattern. A crash / full disk / concurrent reader mid-write then sees either
-the old file or the new one, never a truncated or half-encoded one (which is
-how a ``UnicodeDecodeError`` on the next ``PersistentMemory()`` was born).
+the old file or the new one, never a truncated or half-encoded one (a bare
+``Path.write_text`` can leave one behind, and the next ``PersistentMemory()``
+would then die with ``UnicodeDecodeError``).
 """
 
 from __future__ import annotations

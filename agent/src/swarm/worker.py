@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,10 +69,10 @@ def _stream_retry_delay_s() -> float:
 def _stream_retries() -> int:
     """Resolve the in-place stream retry count, robust to garbage.
 
-    Incident 2026-08-24: the upstream proxy dropped opus streams in bursts
-    (ReadTimeout / RemoteProtocolError) — a single immediate retry landed
-    inside the same burst and the whole task failed at iteration 10+,
-    discarding all progress. Multiple backoff retries ride out the burst
+    Upstream proxies drop long opus streams in bursts (ReadTimeout /
+    RemoteProtocolError) — a single immediate retry lands inside the same
+    burst and the whole task fails at iteration 10+, discarding all progress.
+    Multiple backoff retries ride out the burst
     without resetting the ReAct loop.
 
     Returns:
@@ -144,6 +145,8 @@ def _filter_skill_descriptions(loader: SkillsLoader, skill_names: list[str]) -> 
 def _estimate_tokens(
     messages: list[dict],
     response: object,
+    *,
+    count_reasoning: bool = False,
 ) -> tuple[int, int]:
     """Return token usage for a single LLM call, real if available.
 
@@ -179,10 +182,10 @@ def _estimate_tokens(
     # Fallback: provider didn't return usage_metadata. Estimate from
     # serialized message length and response content length using the
     # character-class weighted heuristic (ASCII /4, CJK ×0.6, other /3 — see
-    # src.core.token_estimate), so CJK-heavy prompts are no longer
-    # under-counted 2-3x.
+    # src.core.token_estimate), so CJK-heavy prompts are not under-counted
+    # 2-3x.
     try:
-        input_tokens = estimate_messages_tokens(messages)
+        input_tokens = estimate_messages_tokens(messages, count_reasoning=count_reasoning)
     except Exception:
         input_tokens = 0
 
@@ -258,7 +261,7 @@ def build_worker_prompt(
     # leave the worker with no guardrail and it cheerfully cites training-data
     # prices and sector weights. This block applies the rule unconditionally
     # — including to aggregator / synthesis agents that have no data tools
-    # and previously had no instruction against inventing numbers.
+    # and would otherwise have no instruction against inventing numbers.
     prompt_parts.append(
         "## Data Citation Discipline (HARD RULE)\n\n"
         "Every specific number you cite in your output — prices, percentages, "
@@ -319,6 +322,7 @@ def run_worker(
     include_shell_tools: bool = False,
     grounding_block: str = "",
     agent_config: AgentConfig | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> WorkerResult:
     """Execute a single worker task using a lightweight ReAct loop.
 
@@ -347,6 +351,9 @@ def run_worker(
             consumed by :func:`build_swarm_registry` to merge remote MCP
             tools with the local-tool pool before applying the agent's
             whitelist. ``None`` preserves the prior local-only behavior.
+        cancel_event: The run's cancel signal. Checked at the top of every
+            iteration and handed to the tool watchdog, so a cancelled run
+            stops within one tool poll instead of finishing the layer.
 
     Returns:
         WorkerResult with status, summary, artifacts, and iteration count.
@@ -424,29 +431,65 @@ def run_worker(
     # names. Same placeholder semantics — a bare "[cleared]" once made a
     # model retract real fetched numbers as hallucinations.
     #
-    # V2 also borrows the loop's tool watchdog (``invoke_tool_guarded``): the
-    # worker used to call ``registry.execute`` inline, so a tool hanging inside
-    # an iteration blocked forever — the worker only checks its own deadline at
+    # The worker also borrows the loop's tool watchdog (``invoke_tool_guarded``):
+    # calling ``registry.execute`` inline would block forever on a tool hanging
+    # inside an iteration — the worker only checks its own deadline at
     # iteration boundaries, and the layer deadline in runtime.py then needs
     # ``layer_budget + 60s`` to notice.
     from src.agent.loop import (
+        LENGTH_CONTINUATIONS,
+        OUTPUT_TRUNCATED_MARK,
+        _LENGTH_CONTINUE_NUDGE,
         _microcompact,
         invoke_tool_guarded,
         tool_is_readonly,
         tool_timeout_for,
     )
     from src.agent.tool_result_store import prepare_for_context
+    from src.core.cancel import sleep_unless_cancelled
+    from src.providers.chat import TOOL_CHOICE_NONE
 
     # Layer 1 hysteresis state, owned by this worker (see loop._microcompact).
     microcompact_state: dict[str, Any] = {}
+    # ``reasoning_content`` counts toward the context only on channels that
+    # send it back upstream.
+    count_reasoning = bool(getattr(llm, "sends_reasoning_content", False))
+    should_cancel = cancel_event.is_set if cancel_event is not None else None
+    length_continuations = 0
+    # Partial replies cut by the output ceiling, awaiting their continuation.
+    truncated_parts: list[str] = []
+
+    def _cancelled_result(at_iteration: int) -> WorkerResult:
+        summary = _best_summary(messages, last_assistant_content) or (
+            f"Worker cancelled after {at_iteration} iterations"
+        )
+        summary = _resolve_summary(artifact_dir, summary)
+        _emit(event_callback, "worker_cancelled", agent_id, task_id, {"iteration": at_iteration})
+        _write_summary(artifact_dir, summary)
+        _persist_messages(artifact_dir, messages)
+        return WorkerResult(
+            status="cancelled",
+            summary=summary,
+            artifact_paths=_collect_artifacts(artifact_dir),
+            iterations=at_iteration,
+            error="run cancelled",
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            llm_ms=total_llm_ms,
+            tool_ms=total_tool_ms,
+        )
 
     for iteration in range(max_iterations):
+        if cancel_event is not None and cancel_event.is_set():
+            return _cancelled_result(iteration)
+
         # Microcompact: prune old tool results only when the context estimate
         # crosses the worker's own token budget threshold.
         _microcompact(
             messages,
             token_threshold=_MAX_TOKEN_ESTIMATE,
             state=microcompact_state,
+            count_reasoning=count_reasoning,
         )
 
         # Check timeout
@@ -469,7 +512,7 @@ def run_worker(
             )
 
         # Check token estimate (CJK-weighted, see src.core.token_estimate)
-        token_estimate = estimate_messages_tokens(messages)
+        token_estimate = estimate_messages_tokens(messages, count_reasoning=count_reasoning)
         if token_estimate > _MAX_TOKEN_ESTIMATE:
             summary = last_assistant_content or f"Worker context too large (~{token_estimate} tokens, {iteration} iterations)"
             summary = _resolve_summary(artifact_dir, summary)
@@ -498,9 +541,22 @@ def run_worker(
                 ),
             })
 
-        # On last iteration, call LLM without tool definitions to force text output
+        # The last iteration is a forced text turn: the tool definitions stay
+        # in the request and ``tool_choice=none`` disables calling them (the
+        # Anthropic Messages API rejects a history with tool_use/tool_result
+        # blocks but no ``tools``).
         is_last_iteration = iteration == max_iterations - 1
-        tool_defs = None if is_last_iteration else registry.get_definitions()
+        tool_defs = registry.get_definitions()
+        tool_choice = TOOL_CHOICE_NONE if is_last_iteration else None
+        if is_last_iteration:
+            messages.append({
+                "role": "user",
+                "content": (
+                    "[SYSTEM] This is the final turn and tool calls are disabled. "
+                    "Output your final analysis summary now as plain text; state "
+                    "explicitly which parts are incomplete or unverified."
+                ),
+            })
 
         # Stream the LLM — moonshot/kimi non-streaming invoke is unreliable
         # (issue #42), and streaming also feeds dashboard live progress.
@@ -551,6 +607,8 @@ def run_worker(
                         tools=tool_defs,
                         timeout=remaining_timeout,
                         on_text_chunk=_on_text_chunk,
+                        should_cancel=should_cancel,
+                        tool_choice=tool_choice,
                     )
 
             # In-place recovery for transient stream failures (ReadTimeout,
@@ -599,7 +657,10 @@ def run_worker(
                     from src.core.fetch_stats import record_stream_retry
 
                     record_stream_retry("swarm")
-                    time.sleep(delay)
+                    # A cancel during the backoff ends the worker now instead
+                    # of after the full sleep plus one more LLM call.
+                    if sleep_unless_cancelled(delay, cancel_event):
+                        return _cancelled_result(iteration)
             llm_elapsed_ms = int((time.monotonic() - llm_t0) * 1000)
             total_llm_ms += llm_elapsed_ms
             # Event ts = LLM call end; elapsed lets the gantt draw the exact
@@ -626,7 +687,7 @@ def run_worker(
             )
 
         # Accumulate token counts
-        iter_in, iter_out = _estimate_tokens(messages, response)
+        iter_in, iter_out = _estimate_tokens(messages, response, count_reasoning=count_reasoning)
         total_input_tokens += iter_in
         total_output_tokens += iter_out
 
@@ -634,9 +695,32 @@ def run_worker(
         if response.content and len(response.content.strip()) > 20:
             last_assistant_content = response.content
 
-        # If no tool calls, this is the final response
+        # If no tool calls, this is the final response — unless the output
+        # ceiling cut it (finish_reason=length): then keep the partial text
+        # and ask for the rest, or deliver it with an explicit marker.
         if not response.has_tool_calls:
-            summary = response.content or last_assistant_content or "(no summary)"
+            content = response.content or ""
+            finish_reason = getattr(response, "finish_reason", "stop")
+            if finish_reason == "length" and content:
+                _emit(
+                    event_callback, "worker_output_truncated", agent_id, task_id,
+                    {"iteration": iteration, "chars": len(content),
+                     "continuation": length_continuations + 1
+                     if not is_last_iteration and length_continuations < LENGTH_CONTINUATIONS
+                     else None},
+                )
+                if not is_last_iteration and length_continuations < LENGTH_CONTINUATIONS:
+                    length_continuations += 1
+                    truncated_parts.append(content)
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({"role": "user", "content": _LENGTH_CONTINUE_NUDGE})
+                    continue
+            if truncated_parts:
+                content = "".join(truncated_parts) + content
+                truncated_parts = []
+            if finish_reason == "length" and content:
+                content += OUTPUT_TRUNCATED_MARK
+            summary = content or last_assistant_content or "(no summary)"
             summary = _resolve_summary(artifact_dir, summary)
             _write_summary(artifact_dir, summary)
             reason = _classify_deliverable(
@@ -671,6 +755,9 @@ def run_worker(
                 tool_ms=total_tool_ms,
             )
 
+        # A tool-calling turn after a length continuation restarts the
+        # model's own reasoning; the partial stays in the trajectory only.
+        truncated_parts = []
         # Append assistant message with tool calls
         messages.append(
             ContextBuilder.format_assistant_tool_calls(
@@ -692,7 +779,7 @@ def run_worker(
             tc_start = time.monotonic()
             args = {**tc.arguments, "run_dir": str(artifact_dir)}
 
-            # V2: the guard supplies the heartbeat (the events.jsonl tail keeps
+            # The guard supplies the heartbeat (the events.jsonl tail keeps
             # a fresh timestamp so the stale-run reaper can tell a hung tool
             # apart from a dead host), the hard per-tool timeout, and the
             # budget clamp — the same code path the main loop uses.
@@ -730,6 +817,7 @@ def run_worker(
                 readonly=tool_is_readonly(registry, tc.name),
                 timeout=tool_timeout,
                 emit=_guard_emit,
+                cancel_event=cancel_event,
             )
             is_error = _is_error_result(result)
             if tc.name != "load_skill" and not is_error:
@@ -738,14 +826,14 @@ def run_worker(
             total_tool_ms += int(tc_elapsed * 1000)
             _emit(
                 event_callback, "tool_result", agent_id, task_id,
-                # V2: was hardcoded "ok", so the swarm observability panel
-                # reported a 0% worker tool error rate no matter what.
+                # Real status (a hardcoded "ok" would make the swarm
+                # observability panel report a 0% worker tool error rate).
                 {"tool": tc.name, "elapsed_ms": int(tc_elapsed * 1000),
                  "status": "error" if is_error else "ok", "iteration": iteration,
                   "result_preview": _preview_tool_result(result),
                  **mcp_meta},
             )
-            # V2: oversized results are written to the worker's artifact dir
+            # Oversized results are written to the worker's artifact dir
             # and replaced by an explicit preview + on-disk pointer instead of
             # a silent [:10_000] cut (the worker has read_file).
             payload, _offload_failed = prepare_for_context(

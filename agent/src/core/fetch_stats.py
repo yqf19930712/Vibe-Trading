@@ -119,7 +119,7 @@ class FetchStatsCollector:
                 if output_tokens is not None:
                     entry["output_tokens"] = max(0, int(output_tokens))
                 if resumed:
-                    # V1: a run_id resume waits on an ALREADY-RUNNING run —
+                    # A run_id resume waits on an ALREADY-RUNNING run —
                     # without this flag the ops tab would read two entries for
                     # one run as two separate swarms.
                     entry["resumed"] = True

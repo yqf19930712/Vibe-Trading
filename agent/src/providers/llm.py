@@ -355,11 +355,46 @@ _ENV_CANDIDATES = [
 
 # Index-aligned with _ENV_CANDIDATES. CWE-209: never log the absolute
 # .env path (it leaks the OS username / home / CWD). The label names
-# which slot won - the entire P08 R1 signal - using compile-time
+# which slot won using compile-time
 # constants only.
 _ENV_LABELS = ("~/.vibe-trading/.env", "<AGENT_DIR>/.env", "<CWD>/.env")
 
 logger = logging.getLogger(__name__)
+
+# One output-token ceiling per model reply. The native Anthropic channel
+# always sends one (``VIBE_ANTHROPIC_MAX_TOKENS`` wins, then the shared
+# ``VIBE_MAX_OUTPUT_TOKENS``, then the default below). The OpenAI-compatible
+# channel sends a ceiling only when ``VIBE_MAX_OUTPUT_TOKENS`` is set:
+# ``ChatOpenAI`` renames ``max_tokens`` to ``max_completion_tokens`` in every
+# request (``_default_params`` and ``_get_request_payload``, so
+# ``model_kwargs={"max_tokens": …}`` is renamed too — langchain-openai 1.3
+# has no switch to keep the legacy name; only ``BaseChatOpenAI`` subclasses
+# such as ``ChatDeepSeek`` still send ``max_tokens``), and whether a given
+# compatible endpoint accepts that field is unknown until tried, so the
+# default is to send nothing and let the endpoint apply its own cap.
+# A truncated reply is continued by the loop (``finish_reason == "length"``).
+ANTHROPIC_MAX_OUTPUT_TOKENS_DEFAULT = 32000
+
+
+def max_output_tokens(channel: str) -> Optional[int]:
+    """Return the max output tokens for one reply on ``channel``.
+
+    Args:
+        channel: ``"anthropic"`` for the native Messages channel, anything
+            else for the OpenAI-compatible path.
+
+    Returns:
+        Positive token ceiling, or ``None`` when the OpenAI-compatible
+        channel should not send one (``VIBE_MAX_OUTPUT_TOKENS`` unset).
+    """
+    shared = os.getenv("VIBE_MAX_OUTPUT_TOKENS", "").strip()
+    if channel == "anthropic":
+        native = os.getenv("VIBE_ANTHROPIC_MAX_TOKENS", "").strip()
+        if native:
+            return int(native)
+        return int(shared) if shared else ANTHROPIC_MAX_OUTPUT_TOKENS_DEFAULT
+    return int(shared) if shared else None
+
 
 _dotenv_loaded: bool = False
 
@@ -470,6 +505,9 @@ def _build_native_deepseek(
         temperature=temperature,
         timeout=int(os.getenv("TIMEOUT_SECONDS", "120")),
         max_retries=int(os.getenv("MAX_RETRIES", "2")),
+        # None = no ceiling field in the request (ChatDeepSeek sends the
+        # legacy ``max_tokens`` name when one is set).
+        max_tokens=max_output_tokens("openai"),
         callbacks=callbacks,
         api_key=api_key or None,
         base_url=base_url or None,
@@ -503,7 +541,7 @@ def _ensure_dotenv() -> None:
             loaded = candidate
             break
     _dotenv_loaded = True
-    # P08 R1: one-time, behavior-preserving diagnostic so a stale or
+    # One-time, behavior-preserving diagnostic so a stale or
     # shadowed .env is observable instead of costing hours. The path is
     # redacted to a symbolic slot label and the API key is never logged.
     logger.info(
@@ -527,9 +565,9 @@ def _normalize_ollama_base_url(base_url: str) -> str:
 
 # Prompt-caching breakpoint marker (Anthropic native channel only). Applied
 # at request-payload level: system tail, tools tail, and the newest stable
-# message. Meaningful because the system prompt is now byte-stable across
-# iterations and microcompact no longer rewrites the trajectory middle every
-# turn (context-engineering batch E).
+# message. Meaningful because the system prompt is byte-stable across
+# iterations and microcompact does not rewrite the trajectory middle every
+# turn.
 _ANTHROPIC_CACHE_CONTROL = {"type": "ephemeral"}
 
 # Content-block types that accept cache_control (thinking blocks do not).
@@ -622,17 +660,18 @@ def _apply_anthropic_cache_breakpoints(payload: dict) -> None:
 def _build_native_anthropic(model: str, callbacks: Any = None) -> Any:
     """Build a native Anthropic Messages API client (LANGCHAIN_PROVIDER=anthropic).
 
-    Motivation (2026-08-26): the OpenAI-compat conversion path swallowed
-    Anthropic's SSE pings — long opus thinking left the stream byte-silent for
-    minutes and stateful middleboxes reaped the "idle" connection (clean
-    truncation incidents fc2710/5d3bea33). The native ``/v1/messages`` channel
+    Motivation: the OpenAI-compat conversion path swallows Anthropic's SSE
+    pings — long opus thinking leaves the stream byte-silent for minutes and
+    stateful middleboxes reap the "idle" connection as a clean truncation. The
+    native ``/v1/messages`` channel
     forwards pings end-to-end and has typed stream events, removing two
     protocol conversion layers.
 
     Config:
         ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY — credential (first wins).
         ANTHROPIC_BASE_URL — gateway origin, e.g. https://api-direct.laicai8.co
-        VIBE_ANTHROPIC_MAX_TOKENS — max output tokens (default 32000).
+        VIBE_ANTHROPIC_MAX_TOKENS / VIBE_MAX_OUTPUT_TOKENS — max output
+            tokens (see :func:`max_output_tokens`; default 32000).
         VIBE_ANTHROPIC_THINKING — "adaptive" (default for *-5 family models),
             or "off" to disable. Budget-based thinking is deliberately not
             wired: opus-5-family rejects it and BYOK models fall back to
@@ -707,7 +746,7 @@ def _build_native_anthropic(model: str, callbacks: Any = None) -> Any:
         )
     kwargs: dict[str, Any] = {
         "model": model,
-        "max_tokens": int(os.getenv("VIBE_ANTHROPIC_MAX_TOKENS", "32000")),
+        "max_tokens": max_output_tokens("anthropic"),
         "timeout": int(os.getenv("TIMEOUT_SECONDS", "120")),
         "max_retries": int(os.getenv("MAX_RETRIES", "2")),
         "api_key": api_key,
@@ -913,6 +952,9 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         "temperature": temperature_param,
         "timeout": int(os.getenv("TIMEOUT_SECONDS", "120")),
         "max_retries": int(os.getenv("MAX_RETRIES", "2")),
+        # None = no ceiling field in the request; a value goes out as
+        # ``max_completion_tokens`` (ChatOpenAI renames it, see max_output_tokens).
+        "max_tokens": max_output_tokens("openai"),
         "stream_usage": stream_usage,
         "callbacks": callbacks,
         "extra_body": {"reasoning": {"effort": effort}} if effort and caps.openrouter_reasoning_body else None,

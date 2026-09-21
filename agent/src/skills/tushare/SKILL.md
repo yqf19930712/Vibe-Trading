@@ -5,6 +5,8 @@ category: data-source
 ---
 # Tushare
 
+> **托管沙箱提示：** 在托管的多租户沙箱里，`bash` 子进程既没有数据源凭据（`TUSHARE_TOKEN` / `TICKFLOW_API_KEY` / `IFIND_MCP_TOKEN`），也不能直连境外站点。行情用 `get_market_data`，需要网页用 `read_url`；本 skill 里的脚本示例只在自托管、shell 里有 token 与网络的环境下有效。
+
 ## 概述
 
 tushare是一个财经数据接口包，拥有丰富的数据内容，如股票、基金、期货、数字货币等行情数据，公司财务、基金经理等基本面数据。该模块通过标准化API方式统一了数据资产的对外服务方式，以帮助有需要的技术用户更实时、简洁、轻量的使用相关数据。

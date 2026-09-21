@@ -7,10 +7,9 @@ that polls something for minutes (``run_swarm`` waiting on a committee, the
 watchdog waiting on any tool) can notice a user cancel between ticks instead
 of only at the next iteration boundary.
 
-Before this (review 2026-09-04, P1) ``cancel()`` only set a flag that the
-loop checked between iterations — a cancel issued while a 30-minute tool wait
-was in flight did nothing until the tool returned, so the router's "unanswered
-→ cancel" safety net could not actually stop the burn.
+A flag checked only between iterations is not enough: a cancel issued while a
+30-minute tool wait is in flight would do nothing until the tool returned, and
+the router's "unanswered → cancel" safety net could not actually stop the burn.
 """
 
 from __future__ import annotations

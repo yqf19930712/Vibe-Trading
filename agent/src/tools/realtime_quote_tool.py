@@ -1,8 +1,8 @@
 """Realtime quote tool backed by TickFlow (US equities).
 
-Before this tool the model had NO structured realtime channel and resorted to
-bash-curling Tencent's qt.gtimg.cn (which lacks recent IPOs — CBRS returned
-``pv_none_match`` in attempt dea1222743ef). TickFlow's ``/v1/quotes`` is
+Without a structured realtime channel the model resorts to bash-curling
+Tencent's qt.gtimg.cn (which lacks recent IPOs — e.g. CBRS returns
+``pv_none_match``). TickFlow's ``/v1/quotes`` is
 China-direct, structured, and covers the whole US board.
 
 Free-tier limits: 10 requests/min, 5 symbols per request — the tool batches

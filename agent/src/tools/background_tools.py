@@ -9,11 +9,24 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from src.agent.progress import emit_progress
 from src.agent.tools import BaseTool
+from src.tools import bash_tool
+from src.tools.bash_tool import _OUTPUT_HARD_CAP, _audit_command, cap_marker, run_capped
 from src.tools.redaction import redact_secret_values
 from src.tools.subprocess_env import _subprocess_env
 
 WORKDIR = Path(__file__).resolve().parents[2]
+_TIMEOUT_S = 300
+# Output is kept whole (bash's streaming hard cap kills the process past
+# 1M chars per stream and marks the kept prefix): ``check_background`` hands
+# it to the loop, whose single truncation layer (``agent.tool_result_store``)
+# previews it and offloads the full text for ``read_file`` paging — a second
+# clip here would leave that copy incomplete.
+# Finished tasks are evicted oldest-first past this many entries; running
+# ones are never dropped. Bounds the per-process table (the singleton lives
+# as long as the engine does) without losing a result before it is read.
+_MAX_TASKS = 50
 
 
 class BackgroundManager:
@@ -24,36 +37,68 @@ class BackgroundManager:
         self._notifications: List[dict] = []
         self._lock = threading.Lock()
 
-    def run(self, command: str) -> str:
+    def reset(self) -> None:
+        """Forget every task and pending notification (test isolation).
+
+        The manager is a process-wide singleton, so without this a task
+        started by one test surfaces as a ``<background-results>`` message in
+        an unrelated test's agent loop.
+        """
+        with self._lock:
+            self.tasks.clear()
+            self._notifications.clear()
+
+    def run(self, command: str, cwd: str | Path | None = None) -> str:
         """Start a background task and return its task_id.
 
         Args:
             command: Shell command to execute.
+            cwd: Working directory for the command; defaults to the engine
+                install directory.
 
         Returns:
             JSON string containing status and task_id.
         """
         task_id = uuid.uuid4().hex[:8]
-        self.tasks[task_id] = {"status": "running", "result": None, "command": command}
-        threading.Thread(target=self._execute, args=(task_id, command), daemon=True).start()
+        with self._lock:
+            self._evict_finished_locked()
+            self.tasks[task_id] = {"status": "running", "result": None, "command": command}
+        threading.Thread(target=self._execute, args=(task_id, command, cwd), daemon=True).start()
         return json.dumps({"status": "ok", "task_id": task_id, "message": f"Started: {command[:80]}"})
 
-    def _execute(self, task_id: str, command: str) -> None:
+    def _evict_finished_locked(self) -> None:
+        """Drop the oldest finished tasks while the table exceeds ``_MAX_TASKS``."""
+        if len(self.tasks) < _MAX_TASKS:
+            return
+        for tid in [t for t, entry in self.tasks.items() if entry["status"] != "running"]:
+            if len(self.tasks) < _MAX_TASKS:
+                break
+            self.tasks.pop(tid, None)
+
+    def _execute(self, task_id: str, command: str, cwd: str | Path | None) -> None:
         try:
-            # Allowlisted env only (P0 2026-09-04): never hand the engine's
-            # shared credentials to a shell subprocess.
-            r = subprocess.run(command, shell=True, cwd=WORKDIR, env=_subprocess_env(),
-                               capture_output=True, text=True, timeout=300,
-                               encoding="utf-8", errors="replace")
-            output = redact_secret_values((r.stdout + r.stderr).strip()[:50000])
+            # Allowlisted env only: never hand the engine's shared credentials
+            # to a shell subprocess.
+            r = run_capped(command, cwd=str(cwd or WORKDIR), env=_subprocess_env(), timeout_s=_TIMEOUT_S)
+            stdout = r.stdout + (cap_marker("stdout") if "stdout" in r.capped else "")
+            stderr = r.stderr + (cap_marker("stderr") if "stderr" in r.capped else "")
+            output = redact_secret_values((stdout + stderr).strip())
+            if r.capped:
+                output = (
+                    f"[output capped: {', '.join(r.capped)} exceeded "
+                    f"{bash_tool._OUTPUT_HARD_CAP} chars; process killed]\n" + output
+                )
             status = "completed"
         except subprocess.TimeoutExpired:
-            output, status = "Timeout (300s)", "timeout"
+            output, status = f"Timeout ({_TIMEOUT_S}s)", "timeout"
         except Exception as e:
             output, status = str(e), "error"
-        self.tasks[task_id]["status"] = status
-        self.tasks[task_id]["result"] = output or "(no output)"
         with self._lock:
+            entry = self.tasks.get(task_id)
+            if entry is None:  # table reset while the command ran
+                return
+            entry["status"] = status
+            entry["result"] = output or "(no output)"
             self._notifications.append({
                 "task_id": task_id, "status": status,
                 "command": command[:80], "result": (output or "")[:500],
@@ -86,26 +131,51 @@ def get_background_manager() -> BackgroundManager:
 
 class BackgroundRunTool(BaseTool):
     name = "background_run"
-    description = "Run command in background thread. Returns task_id immediately. Use for long-running operations (ML training, large data processing)."
+    description = (
+        "Run a shell command on a background thread and return a task_id "
+        "immediately. Use for long-running work (model training, bulk data "
+        "processing, large installs) that would exceed bash's timeout. The "
+        "command runs in the current run_dir (same working directory and same "
+        f"minimal no-credentials environment as bash), is killed after {_TIMEOUT_S}s, "
+        "and its combined stdout+stderr is kept whole (same "
+        f"{_OUTPUT_HARD_CAP // 1_000_000}M-character-per-stream cap as bash: past it "
+        "the process is killed and only the kept prefix is returned, marked). Poll "
+        "check_background(task_id=...) to get the status and output; a long "
+        "result comes back as a preview with its full text offloaded to a file "
+        "you can page with read_file, exactly like any other tool result."
+    )
     parameters = {"type": "object", "properties": {
         "command": {"type": "string", "description": "Shell command to run in background"},
     }, "required": ["command"]}
     is_readonly = False
 
     def execute(self, **kw: Any) -> str:
-        result = _BG.run(kw["command"])
+        command = str(kw["command"])
+        # Same working directory as bash: the loop injects run_dir into every
+        # tool call, so files the model just wrote are where it expects them.
+        cwd = kw.get("run_dir") or None
+        # Audit-only dangerous-pattern scan, shared with bash (never blocks).
+        audit_findings = _audit_command(command)
+        if audit_findings:
+            emit_progress(
+                stage="security_audit",
+                message=f"background_run command matched dangerous patterns: {', '.join(audit_findings)}",
+            )
+        payload = json.loads(_BG.run(command, cwd=cwd))
+        if audit_findings:
+            payload["security_audit"] = audit_findings
         # Surface the launch in attempt_stats: the actual work runs on a
         # detached thread, outside tool_ms and the budget clamp, and would
         # otherwise be invisible to observability.
         try:
             from src.core.fetch_stats import record_background
 
-            task_id = json.loads(result).get("task_id", "")
+            task_id = payload.get("task_id", "")
             if task_id:
-                record_background(task_id, kw["command"])
+                record_background(task_id, command)
         except Exception:
             pass
-        return result
+        return json.dumps(payload, ensure_ascii=False)
 
 
 class CheckBackgroundTool(BaseTool):
