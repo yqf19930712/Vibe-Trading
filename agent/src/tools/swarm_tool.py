@@ -12,7 +12,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from src.agent.tools import BaseTool
 
@@ -1142,6 +1142,7 @@ class SwarmTool(BaseTool):
         *,
         include_shell_tools: bool = False,
         event_callback: Any | None = None,
+        session_id: str = "",
     ) -> None:
         """Initialize the swarm launcher.
 
@@ -1149,9 +1150,12 @@ class SwarmTool(BaseTool):
             include_shell_tools: Whether worker registries may include shell
                 execution tools requested by presets.
             event_callback: Optional session event bridge used by the web chat.
+            session_id: Hosting session; runs waited on are registered to it
+                so a session-level cancel / delete can stop them.
         """
         self.include_shell_tools = include_shell_tools
         self._event_callback = event_callback
+        self._session_id = session_id
         # preset -> {"ts", "run_id", "salvage"} for the failure cooldown (F3).
         # Instance-scoped: one SwarmTool lives per session registry, so the
         # cooldown naturally covers "the same run/session".
@@ -1406,6 +1410,7 @@ class SwarmTool(BaseTool):
             run_tasks=run_tasks,
             record=_record,
             preset_score=preset_score,
+            cancel_run=getattr(runtime, "cancel_run", None),
         )
 
     def _wait_for_run(
@@ -1420,11 +1425,18 @@ class SwarmTool(BaseTool):
         record: Any,
         resumed: bool = False,
         preset_score: float | None = None,
+        cancel_run: Callable[[str], bool] | None = None,
     ) -> str:
         """Poll an in-flight swarm run until terminal state or wait budget.
 
         Shared by a fresh ``run_swarm`` call and a ``run_id`` resume so both
         paths produce byte-identical result envelopes and identical accounting.
+
+        Two ways out without a terminal state, deliberately different:
+        the wait budget running out leaves the run untouched (the model can
+        resume it by ``run_id``); an attempt-level cancel — router safety
+        net, session delete, account deletion — stops the run through
+        ``cancel_run``, because nothing will ever resume it.
 
         Args:
             store: SwarmStore used to load/reconcile the run.
@@ -1436,6 +1448,8 @@ class SwarmTool(BaseTool):
             record: ``_record``-shaped callable for per-attempt swarm stats.
             resumed: Whether this wait resumed an existing background run.
             preset_score: Routing confidence for the chosen preset (V1).
+            cancel_run: Signals the run to stop; called only on an
+                attempt-level cancel.
 
         Returns:
             JSON result string (terminal result, wait_budget_exhausted, or error).
@@ -1448,17 +1462,24 @@ class SwarmTool(BaseTool):
         # expires first and the salvage return below is reachable again.
         from src.core.budget import cap_timeout
         from src.core.cancel import sleep_unless_cancelled
+        from src.swarm.runtime import register_session_run
 
+        register_session_run(self._session_id, run_id)
         max_wait = cap_timeout(
             float(_MAX_WAIT_SECONDS), reserve_s=_WAIT_RESERVE_S, floor_s=_WAIT_FLOOR_S
         )
         t0 = time.monotonic()
         while time.monotonic() - t0 < max_wait:
-            # P1 2026-09-04: a user/router cancel used to be invisible here
-            # for the whole (up to two-hour) wait; the poll now wakes on the
-            # attempt's cancel event and hands the run back like a
-            # wait_budget_exhausted (run_id + partial state, run untouched).
+            # The poll wakes on the attempt's cancel event (a wait of up to
+            # two hours would otherwise hide a cancel) and stops the run
+            # with it: no caller resumes a run after its attempt is gone.
             if sleep_unless_cancelled(_POLL_INTERVAL_SECONDS):
+                run_cancelled = False
+                if cancel_run is not None:
+                    try:
+                        run_cancelled = bool(cancel_run(run_id))
+                    except Exception:  # noqa: BLE001 - never mask the cancel itself
+                        logger.warning("SwarmTool: cancel_run(%s) failed", run_id, exc_info=True)
                 loaded = store.load_run(run_id)
                 record("cancelled_wait", run_id, agents=run_agents, tasks=run_tasks)
                 return json.dumps(
@@ -1467,10 +1488,11 @@ class SwarmTool(BaseTool):
                         "error_code": "cancelled",
                         "run_id": run_id,
                         "run_status": loaded.status.value if loaded is not None else "unknown",
+                        "run_cancelled": run_cancelled,
                         "error": (
                             "Attempt cancelled while waiting on the swarm run; "
-                            "the run keeps its state on disk and can be resumed "
-                            "with this run_id."
+                            "the run was signalled to stop and its partial task "
+                            "outputs stay on disk."
                         ),
                     },
                     ensure_ascii=False,
@@ -1579,6 +1601,8 @@ class SwarmTool(BaseTool):
                 resumed=True, **extra,
             )
 
+        from src.swarm.runtime import cancel_run as _cancel_run
+
         logger.info("SwarmTool: resuming wait on run %s (preset=%s)", run_id, preset)
         return self._wait_for_run(
             store=store,
@@ -1592,6 +1616,7 @@ class SwarmTool(BaseTool):
             # The route was decided by the original call; a resume neither
             # re-routes nor re-scores.
             preset_score=_EXPLICIT_NAME_SCORE if preset else None,
+            cancel_run=_cancel_run,
         )
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -319,6 +320,7 @@ def run_worker(
     include_shell_tools: bool = False,
     grounding_block: str = "",
     agent_config: AgentConfig | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> WorkerResult:
     """Execute a single worker task using a lightweight ReAct loop.
 
@@ -347,6 +349,9 @@ def run_worker(
             consumed by :func:`build_swarm_registry` to merge remote MCP
             tools with the local-tool pool before applying the agent's
             whitelist. ``None`` preserves the prior local-only behavior.
+        cancel_event: The run's cancel signal. Checked at the top of every
+            iteration and handed to the tool watchdog, so a cancelled run
+            stops within one tool poll instead of finishing the layer.
 
     Returns:
         WorkerResult with status, summary, artifacts, and iteration count.
@@ -441,6 +446,26 @@ def run_worker(
     microcompact_state: dict[str, Any] = {}
 
     for iteration in range(max_iterations):
+        if cancel_event is not None and cancel_event.is_set():
+            summary = _best_summary(messages, last_assistant_content) or (
+                f"Worker cancelled after {iteration} iterations"
+            )
+            summary = _resolve_summary(artifact_dir, summary)
+            _emit(event_callback, "worker_cancelled", agent_id, task_id, {"iteration": iteration})
+            _write_summary(artifact_dir, summary)
+            _persist_messages(artifact_dir, messages)
+            return WorkerResult(
+                status="cancelled",
+                summary=summary,
+                artifact_paths=_collect_artifacts(artifact_dir),
+                iterations=iteration,
+                error="run cancelled",
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+                llm_ms=total_llm_ms,
+                tool_ms=total_tool_ms,
+            )
+
         # Microcompact: prune old tool results only when the context estimate
         # crosses the worker's own token budget threshold.
         _microcompact(
@@ -730,6 +755,7 @@ def run_worker(
                 readonly=tool_is_readonly(registry, tc.name),
                 timeout=tool_timeout,
                 emit=_guard_emit,
+                cancel_event=cancel_event,
             )
             is_error = _is_error_result(result)
             if tc.name != "load_skill" and not is_error:

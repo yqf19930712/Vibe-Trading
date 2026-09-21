@@ -371,17 +371,81 @@ def test_swarm_tool_format_result_preserves_running_status_on_budget_out():
     assert payload["run_id"] == "r-budget"
 
 
-def test_swarm_tool_no_longer_cancels_on_budget_out():
-    """Source-level guard: the SwarmTool wait loop must not call cancel_run
-    when its budget elapses — that used to throw away in-flight LLM work."""
-    import inspect
+def _cancel_probe_tool(monkeypatch, run_id: str):
+    """SwarmTool wired to a fake runtime that records cancel_run calls."""
     import src.tools.swarm_tool as swarm_tool
 
-    source = inspect.getsource(swarm_tool.SwarmTool.execute)
-    assert "cancel_run" not in source, (
-        "SwarmTool.execute must not cancel the run on budget exhaustion; "
-        "return partial state and let the agent decide."
-    )
+    run = _base_run(run_id)
+    run.status = RunStatus.running
+    cancelled: list[str] = []
+
+    class FakeStore:
+        def __init__(self, base_dir):
+            self.base_dir = base_dir
+
+        def load_run(self, rid):
+            return run if rid == run.id else None
+
+        def reconcile_run(self, loaded, write=False):
+            return loaded
+
+        def run_dir(self, rid):
+            return Path(self.base_dir) / rid
+
+    class FakeRuntime:
+        def __init__(self, store, max_workers=4, agent_config=None):
+            self._store = store
+
+        def start_run(self, preset, variables, live_callback=None, include_shell_tools=False):
+            return run
+
+        def cancel_run(self, rid):
+            cancelled.append(rid)
+            return True
+
+    monkeypatch.setattr(swarm_tool, "_match_preset", lambda prompt: "demo")
+    monkeypatch.setattr(swarm_tool, "_build_variables", lambda preset, prompt: {"goal": prompt})
+    monkeypatch.setattr("src.config.load_swarm_agent_config", lambda: None)
+    monkeypatch.setattr("src.swarm.store.SwarmStore", FakeStore)
+    monkeypatch.setattr("src.swarm.runtime.SwarmRuntime", FakeRuntime)
+    return swarm_tool, cancelled
+
+
+def test_swarm_tool_does_not_cancel_on_budget_out(monkeypatch):
+    """Wait budget elapsed → the run is left running for a later resume;
+    cancelling here used to throw away minutes of in-flight LLM work."""
+    swarm_tool, cancelled = _cancel_probe_tool(monkeypatch, "r-budget-keep")
+    monkeypatch.setattr(swarm_tool, "_MAX_WAIT_SECONDS", 0)
+
+    payload = json.loads(swarm_tool.SwarmTool().execute(prompt="analyze AAPL"))
+
+    assert payload["status"] == "running"
+    assert payload["wait_budget_exhausted"] is True
+    assert cancelled == []
+
+
+def test_swarm_tool_cancels_the_run_on_attempt_cancel(monkeypatch):
+    """Attempt-level cancel (router safety net / session delete) → the run
+    is signalled to stop: nothing will ever resume it."""
+    import threading
+
+    from src.core import cancel as _cancel
+
+    swarm_tool, cancelled = _cancel_probe_tool(monkeypatch, "r-attempt-cancel")
+    monkeypatch.setattr(swarm_tool, "_MAX_WAIT_SECONDS", 600)
+    monkeypatch.setattr(swarm_tool, "_POLL_INTERVAL_SECONDS", 0.05)
+    ev = threading.Event()
+    ev.set()
+    _cancel.bind_cancel_event(ev)
+    try:
+        payload = json.loads(swarm_tool.SwarmTool().execute(prompt="analyze AAPL"))
+    finally:
+        _cancel.bind_cancel_event(None)
+
+    assert payload["error_code"] == "cancelled"
+    assert payload["run_id"] == "r-attempt-cancel"
+    assert payload["run_cancelled"] is True
+    assert cancelled == ["r-attempt-cancel"]
 
 
 def test_run_swarm_first_progress_frame_carries_run_id(tmp_path, monkeypatch):

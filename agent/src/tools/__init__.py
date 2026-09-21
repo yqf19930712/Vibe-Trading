@@ -178,7 +178,13 @@ def build_registry(
             elif cls in goal_tool_classes:
                 registry.register(cls(default_session_id=session_id, event_callback=event_callback))
             elif cls is SwarmTool:
-                registry.register(cls(include_shell_tools=include_shell_tools, event_callback=event_callback))
+                registry.register(
+                    cls(
+                        include_shell_tools=include_shell_tools,
+                        event_callback=event_callback,
+                        session_id=session_id or "",
+                    )
+                )
             else:
                 registry.register(cls())
         except Exception as exc:
