@@ -289,6 +289,19 @@ def _redact_trace_result(result: str) -> str:
     return json.dumps(redact_payload(payload), ensure_ascii=False)
 
 
+def _best_effort(fn: Any, *args: Any, **kwargs: Any) -> None:
+    """Call ``fn`` and swallow any exception (debug-logged).
+
+    For the trace / state writes on a failure path: they run when the disk
+    may already be the problem, and a second exception there would replace
+    the ``failed`` result with a bare crash.
+    """
+    try:
+        fn(*args, **kwargs)
+    except Exception:  # noqa: BLE001 - failure-path bookkeeping never re-raises
+        logger.debug("best-effort call %s failed", getattr(fn, "__name__", fn), exc_info=True)
+
+
 def _new_run_stats() -> dict[str, Any]:
     """Per-run accumulator behind the ``attempt_stats`` summary event."""
     return {"llm_calls": 0, "llm_ms": 0, "compact_calls": 0, "tools": {}}
@@ -1166,8 +1179,13 @@ class AgentLoop:
         Returns:
             Execution result dict.
         """
-        # Reset per-run state (safe for reuse across multiple run() calls)
-        self._cancel_event.clear()
+        # The cancel token belongs to this attempt and is never reset here: a
+        # cancel that lands before run() starts (executor queue, registry
+        # build) must still take effect, so the first checkpoint below turns
+        # an already-set token into a "cancelled" terminal state instead of
+        # an orphaned loop nobody can reach any more.
+        if self._cancel_event.is_set():
+            logger.info("AgentLoop cancelled before start")
         # Expose the cancel signal to every tool thread (copy_context) so
         # long polls (swarm wait, tool watchdog) can stop between ticks.
         _cancel.bind_cancel_event(self._cancel_event)
@@ -1193,50 +1211,63 @@ class AgentLoop:
         )
 
         state_store = RunStateStore()
-        RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        # Everything before the ReAct loop (run dir, request snapshot, prompt
+        # assembly, trace file) can fail on a full or read-only tenant disk.
+        # Such a failure must still end as a regular ``failed`` result with an
+        # attempt_stats frame — otherwise the session layer sees a bare
+        # exception, writes no receipt, and the router waits out the whole
+        # budget for an answer that will never come.
+        run_dir: Optional[Path] = None
+        trace: Optional[TraceWriter] = None
+        try:
+            RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
-        if self.memory.run_dir and Path(self.memory.run_dir).exists():
-            run_dir = Path(self.memory.run_dir)
-        else:
-            run_dir = state_store.create_run_dir(RUNS_DIR)
-            self.memory.run_dir = str(run_dir)
+            if self.memory.run_dir and Path(self.memory.run_dir).exists():
+                run_dir = Path(self.memory.run_dir)
+            else:
+                run_dir = state_store.create_run_dir(RUNS_DIR)
+                self.memory.run_dir = str(run_dir)
 
-        state_store.save_request(run_dir, user_message, {"session_id": session_id})
+            state_store.save_request(run_dir, user_message, {"session_id": session_id})
 
-        context = ContextBuilder(self.registry, self.memory,
-                                  persistent_memory=self._persistent_memory)
-        goal_context, active_goal_id = get_current_goal_context(session_id) if session_id else ("", None)
-        llm_user_message = user_message
-        if goal_context:
-            llm_user_message = (
-                f"{goal_context}\n\n"
-                f"<user-message>\n{user_message}\n</user-message>"
+            context = ContextBuilder(self.registry, self.memory,
+                                      persistent_memory=self._persistent_memory)
+            goal_context, active_goal_id = get_current_goal_context(session_id) if session_id else ("", None)
+            llm_user_message = user_message
+            if goal_context:
+                llm_user_message = (
+                    f"{goal_context}\n\n"
+                    f"<user-message>\n{user_message}\n</user-message>"
+                )
+            goal_store = None
+            goal_turn_accounted = False
+            messages = context.build_messages(llm_user_message, history)
+            react_trace: List[Dict[str, Any]] = []
+
+            trace_dir = SESSIONS_DIR / session_id if session_id else run_dir
+            trace = TraceWriter(trace_dir)
+            if self._run_iteration == 0 and trace.path.exists():
+                existing = TraceWriter.read(trace_dir)
+                self._run_iteration = max(
+                    (int(e.get("iter", 0)) for e in existing if "iter" in e),
+                    default=0,
+                )
+            trace.write_text_entry(
+                {"type": "start", "iter": self._run_iteration + 1},
+                field="prompt",
+                value=user_message,
+                offload_kind=f"start-{self._run_iteration + 1}",
             )
-        goal_store = None
-        goal_turn_accounted = False
-        messages = context.build_messages(llm_user_message, history)
-        react_trace: List[Dict[str, Any]] = []
-
-        trace_dir = SESSIONS_DIR / session_id if session_id else run_dir
-        trace = TraceWriter(trace_dir)
-        if self._run_iteration == 0 and trace.path.exists():
-            existing = TraceWriter.read(trace_dir)
-            self._run_iteration = max(
-                (int(e.get("iter", 0)) for e in existing if "iter" in e),
-                default=0,
+            trace.write_text_entry(
+                {"type": "message", "iter": self._run_iteration + 1, "role": "user"},
+                field="content",
+                value=user_message,
+                offload_kind=f"user-message-{self._run_iteration + 1}",
             )
-        trace.write_text_entry(
-            {"type": "start", "iter": self._run_iteration + 1},
-            field="prompt",
-            value=user_message,
-            offload_kind=f"start-{self._run_iteration + 1}",
-        )
-        trace.write_text_entry(
-            {"type": "message", "iter": self._run_iteration + 1, "role": "user"},
-            field="content",
-            value=user_message,
-            offload_kind=f"user-message-{self._run_iteration + 1}",
-        )
+        except Exception as exc:
+            return self._fail_before_loop(
+                exc, run_dir=run_dir, trace=trace, state_store=state_store, run_t0=run_t0
+            )
 
         iteration = 0
         final_content = ""
@@ -1660,12 +1691,16 @@ class AgentLoop:
                 if isinstance(exc, ProviderStreamError)
                 else "agent_loop_error"
             )
-            trace.write({"type": "end", "iter": self._run_iteration, "status": "error", "reason": str(exc), "iterations": iteration})
+            _best_effort(
+                trace.write,
+                {"type": "end", "iter": self._run_iteration, "status": "error",
+                 "reason": str(exc), "iterations": iteration},
+            )
             self._emit_attempt_stats(
                 "error", iteration, run_t0, llm_usage_summary, trace, reason=str(exc)
             )
-            trace.close()
-            state_store.mark_failure(run_dir, str(exc))
+            _best_effort(trace.close)
+            _best_effort(state_store.mark_failure, run_dir, str(exc))
             return {
                 "status": "failed",
                 "error_code": error_code,
@@ -1781,12 +1816,13 @@ class AgentLoop:
         iterations: int,
         run_t0: float,
         llm_usage_summary: dict[str, Any] | None,
-        trace: TraceWriter,
+        trace: Optional[TraceWriter],
         reason: str | None = None,
     ) -> None:
         """Emit the per-attempt observability summary (SSE + trace).
 
-        One frame per attempt, at the very end, regardless of outcome. The
+        One frame per attempt, at the very end, regardless of outcome (``trace``
+        is ``None`` only when the run failed before its trace file existed). The
         multi-tenant router forwards it to laicai as a progress frame; laicai
         persists it into ``deep_engine_runs``. ``data_fetches`` / ``data_gaps``
         are reserved for the data-reliability batch and empty for now, so the
@@ -1849,11 +1885,50 @@ class AgentLoop:
                 stats["stream_retries"] = stream_retries
         if reason:
             stats["reason"] = str(reason)[:500]
-        try:
-            trace.write({"type": "attempt_stats", **stats})
-        except Exception:  # noqa: BLE001 - stats must never break the run
-            logger.debug("attempt_stats trace write failed", exc_info=True)
+        if trace is not None:
+            _best_effort(trace.write, {"type": "attempt_stats", **stats})
         self._emit("attempt_stats", stats)
+
+    def _fail_before_loop(
+        self,
+        exc: Exception,
+        *,
+        run_dir: Optional[Path],
+        trace: Optional[TraceWriter],
+        state_store: RunStateStore,
+        run_t0: float,
+    ) -> Dict[str, Any]:
+        """Terminal ``failed`` result for an exception raised before the loop.
+
+        Same envelope as a mid-loop failure (``status`` / ``reason`` /
+        ``error_code`` / ``run_id``) and the same ``attempt_stats`` frame, so
+        the session layer and the router treat both alike. Every write here
+        is best-effort: the usual cause is a disk that cannot be written to.
+        """
+        logger.exception("AgentLoop failed before the loop started: %s", exc)
+        reason = str(exc)
+        if trace is not None:
+            _best_effort(
+                trace.write,
+                {"type": "end", "iter": self._run_iteration, "status": "error",
+                 "reason": reason, "iterations": 0},
+            )
+        self._emit_attempt_stats("error", 0, run_t0, None, trace, reason=reason)
+        if trace is not None:
+            _best_effort(trace.close)
+        if run_dir is not None:
+            _best_effort(state_store.mark_failure, run_dir, reason)
+        return {
+            "status": "failed",
+            "error_code": "agent_loop_error",
+            "reason": reason,
+            "run_dir": str(run_dir) if run_dir is not None else None,
+            "run_id": run_dir.name if run_dir is not None else None,
+            "content": "",
+            "react_trace": [],
+            "iterations": 0,
+            "max_iterations": self.max_iterations,
+        }
 
     # -- Tool execution with read/write batching --------------------------------
 

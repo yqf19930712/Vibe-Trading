@@ -21,9 +21,16 @@ from pydantic import BaseModel, ConfigDict, model_validator, field_validator
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
 except ImportError:
-    pass
+    load_dotenv = None
+
+if load_dotenv is not None:
+    # A tenant engine's Runner subprocess starts from a whitelisted env; a
+    # .env on the tenant disk must not pour credentials back into it.
+    from src.config.tenant import tenant_safe_enabled
+
+    if not tenant_safe_enabled():
+        load_dotenv()
 
 from backtest.loaders.registry import (
     FALLBACK_CHAINS,
