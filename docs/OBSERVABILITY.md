@@ -58,7 +58,7 @@ flowchart LR
 | router `ask_log.jsonl` | `attempt_id` | `POST /sessions/<sid>/messages` 返回值 |
 | laicai `deep_engine_runs` | `attempt_id` 列 | 终帧 `stats.router.attempt_id` |
 
-线程传播机制：contextvars 不会自动进入线程池/新线程，所以三处显式用 `contextvars.copy_context()`：`service.py` 的两个 `run_in_executor` 调用、`loop.py` 的工具 worker 线程与并行工具池。每个 Context 只能同时 enter 一次，并行工具是**每个提交单独 copy**。
+线程传播机制：contextvars 不会自动进入线程池/新线程，所以三个模块共六处显式用 `contextvars.copy_context()`：`session/service.py` 的两个 `run_in_executor` 调用（attempt 主体与取消/删除路径）、`agent/loop.py` 的工具 worker 线程（`invoke_tool_guarded`）与并行工具池（每次 `pool.submit`）、`swarm/runtime.py` 的 run 线程 spawn 与层内 executor 的每次 worker 提交（没有这两跳，swarm worker 里的 `fetch_stats` / skill 记账全是 no-op，`test_swarm_fetch_stats_propagation.py` 分别钉住）。每个 Context 只能同时 enter 一次，并行工具与 swarm worker 都是**每个提交单独 copy**。
 
 ## 3. 引擎侧观测
 
@@ -171,7 +171,7 @@ laicai timeoutS（默认 900s）
 1. **收尾提示**（剩余 < 25% 总预算，**每轮**）：从跌破 25% 起，每次迭代都把 `[SYSTEM] Less than 25% of the time budget remains (~Ns)…` 并入该轮的 `<agent_status>` 状态栏（状态栏用后即弃，所以轨迹里始终只有一条），引导模型收敛、不再开新调查线。独立于「迭代数 80% 收尾提示」——后者按迭代计数，迭代慢时开火太晚。
 2. **强制收敛 early_finalize**（剩余 < max(`VIBE_FINALIZE_RESERVE_S`=60s, 1.2×平均迭代耗时)）：本轮按「最后一轮」处理——工具定义保留、以 `tool_choice=none` 禁止调用来强制出文本，并注入提示要求**基于已有材料立即作答、明确标注未完成/未验证部分**。trace/事件只在首次触发时写一次，提示行随状态栏持续到 run 结束。宁可给部分答案，不让调用方超时拿到空文案。
 
-router 侧的 `max(60, …)` 下限意味着引擎拿到的 `deadline_s` 永远不少于 60s，哪怕调用方预算已在排队/冷启中耗尽——此时引擎立刻进入 early_finalize 分支，用这 60s 出一段部分答案。
+router 侧的 `max(60, …)` 下限意味着引擎拿到的 `deadline_s` 永远不少于 60s，哪怕调用方预算已在排队/冷启中耗尽。注意 early_finalize 的判定从**第 2 轮**起才生效（`loop.py` 的 `iteration > 1`——需要先有一轮的平均耗时）：第 1 轮照常跑工具，只是工具窗被 `cap_timeout` 钳到 `_TOOL_CAP_FLOOR_S`=10s 地板；第 2 轮才强制收敛、用剩下的时间出一段部分答案。
 
 配套钳制：
 
@@ -223,7 +223,7 @@ router 侧的 `max(60, …)` 下限意味着引擎拿到的 `deadline_s` 永远�
 
 ## 6. 出境代理（白名单 egress）
 
-阿里云北京沙箱出境被墙：web_search 的境外引擎直连 `ConnectError`、美股/雅虎数据退化。**明文 HTTP 代理直连境外不可行**——CONNECT 行明文过境会被按域名关键字重置（实测 duckduckgo 0.13s 秒断、未封锁的 yahoo 可通）。方案是把加密隧道端点放进沙箱：
+阿里云北京沙箱出境被墙：web_search 的境外引擎直连 `ConnectError`、美股/雅虎数据退化。**明文 HTTP 代理直连境外不可行**——CONNECT 行明文过境会被按域名关键字重置（实测 duckduckgo 0.13s 秒断、未封锁的 yahoo 可通）。方案是把加密隧道端点放进沙箱（沙箱网络策略对全部 RFC1918 `denyOut`，guest 够不到宿主上的端点，见 PRODUCT_DESIGN §6）：
 
 ```mermaid
 flowchart LR

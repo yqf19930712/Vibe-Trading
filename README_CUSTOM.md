@@ -6,24 +6,27 @@
 - 多租户架构与协议契约见 [PRODUCT_DESIGN.md](PRODUCT_DESIGN.md)；观测/预算/数据可靠性/出境代理见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)。
 - swarm 多智能体团队的 29 个 preset 清单与来财AI 触发策略见 [docs/SWARM-PRESETS.md](docs/SWARM-PRESETS.md)。
 - 方案演进、评审记录与已退役的 v1 进程版见 [docs/HISTORY.md](docs/HISTORY.md)。
+- **fork 的文档约定**：上游 `AGENT_CONTRIBUTOR_GUIDE.md` 的 Documentation Rules（用户可见改动要更新 `README.md` / `CHANGELOG.md`）对本 fork **不适用**——fork 只维护现状文档（本文、[PRODUCT_DESIGN.md](PRODUCT_DESIGN.md)、`docs/*.md`）并把变更叙事记进 [docs/HISTORY.md](docs/HISTORY.md)；`README.md` / `CHANGELOG.md` / 该指南本身保持上游原样便于合并。
 
 ## 仓库结构
 
 | 路径 | 说明 |
 |---|---|
 | `agent/` | 上游引擎本体（`api_server.py` HTTP API、`src/` agent/工具/回测、`cli/`）。含少量本 fork 维护的差异，见下节 |
+| `agent/mcp_server.py` | 上游的 MCP 插件**服务端**（`pyproject` 入口 `vibe-trading-mcp`）：把引擎工具暴露给 Claude Desktop / Cursor 等外部 MCP 客户端，与进程内工具面（`src/tools/build_registry`，即生产面）互相独立；生产拓扑不使用它。`src/tools/mcp.py` 是相反方向——引擎消费外部 MCP server 的客户端适配器。两个面已漂移：MCP 面 36 个工具里 `analyze_options` / `pattern_recognition` 对应进程内的 `options_pricing` / `pattern`；进程内的 `alpha_bench`/`alpha_compare`/`alpha_zoo`、`edit_file`、`remember`/`consolidate_memory`/`session_search`、`save_skill`/`patch_skill`/`delete_skill`/`skill_file`、假设库四件套、`compact`、`get_realtime_quotes`、shell 类以及 `trading_place_order`/`trading_cancel_order`/`propose_mandate_profiles` 不在 MCP 面；MCP 面独有的是 run / swarm 管理类（`list_runs`/`get_run_result`/`retry_run`/`get_swarm_status`/`list_swarm_presets`/`reap_stale_runs`/`list_skills`）。stdio 模式默认开 shell 工具且不读 `VIBE_TRADING_TENANT_SAFE`。本 fork 不维护它 |
 | `ops/cube-router/` | **现行生产编排器**：FastAPI 单文件，对 laicai 暴露 `/ask`，按租户创建/复用 CubeSandbox MicroVM |
 | `ops/cube-engine/` | 沙箱引擎镜像：`Dockerfile`（python:3.12-slim + 本仓库源码）+ `launcher.py`（guest 内进程管理器，模板探针目标） |
 | `ops/vibe-router/` | 已退役的 v1 进程版编排器（同机多进程隔离），源码与 runbook 保留存档，沿革见 [docs/HISTORY.md](docs/HISTORY.md) |
 | `frontend/` | 上游 React Web UI。生产不使用（镜像里放空 `frontend/dist` 占位） |
 | `wiki/` `scripts/` `tools/` | 上游站点与 CI 杂项，与多租户层无关 |
 | `CHANGELOG.md` | 上游发布记录（保持原样便于合并）；本 fork 的变更叙事记在 [docs/HISTORY.md](docs/HISTORY.md) |
+| `AGENT_CONTRIBUTOR_GUIDE.md` | 上游贡献指南（保持原样）；其 Documentation Rules 在本 fork 内由文首「fork 的文档约定」覆盖 |
 
 ## 与上游的差异（`agent/` 内）
 
 均为可长期携带的通用化改动，跟随上游合并时需保留：
 
-- **单一数据根 `_data_root()`**（`agent/api_server.py`）：`runs/` `sessions/` `uploads/` 目录可被 `VIBE_DATA_DIR` 重定向；`VIBE_MULTITENANT=1` 而缺 `VIBE_DATA_DIR` 时启动即报错（fail-loud，杜绝租户状态静默写进共享安装目录）。
+- **单一数据根 `data_root()`**（`agent/src/core/paths.py`；`api_server._data_root()` 只是它的别名，`swarm_runs_root()` 等一切 run/session/upload 路径都从它派生）：`runs/` `sessions/` `uploads/` 目录可被 `VIBE_DATA_DIR` 重定向；`VIBE_MULTITENANT=1` 而缺 `VIBE_DATA_DIR` 时启动即报错（fail-loud，杜绝租户状态静默写进共享安装目录）。
 - **租户安全档位**（`agent/src/tools/__init__.py`）：`VIBE_TRADING_TENANT_SAFE=1` 时 `build_registry` 排除 `trading_*` 前缀全部工具与 `propose_mandate_profiles`（动钱红线）；shell 类工具另由上游的 `VIBE_TRADING_ENABLE_SHELL_TOOLS=1` 门控制。
 - **LLM 兼容性**（`agent/src/providers/llm.py`）：模型名含 `opus-4-7` / `opus-4-8` / `opus-5` / `sonnet-5` / `fable` / `mythos` 时省略 `temperature` 字段（这些模型拒绝该参数；名单可经 `LANGCHAIN_NO_TEMPERATURE_MODELS` 追加，见下文「换模型」节）；流式默认带 `stream_options.include_usage`（`LANGCHAIN_STREAM_USAGE=0` 可关），否则 `llm_usage` 事件恒空。
 - **Anthropic 原生通道**（`agent/src/providers/llm.py` `_build_native_anthropic`）：`LANGCHAIN_PROVIDER=anthropic` 时走原生 `/v1/messages` API（`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` + `ANTHROPIC_BASE_URL`），SSE ping 端到端透传、去掉两层协议转换——治 OpenAI-compat 路径吞 ping 导致长思考流被中间设备静默掐断的问题；生产内置模型即此通道。单次回复的输出 token 上限两通道各有默认（原生 32000 / OpenAI 兼容 8192，后者是 deepseek-chat、qwen 等兼容端点都接受的最宽值——上限过大是 400 硬错，过小只是截断，而截断会被主循环续写），`VIBE_MAX_OUTPUT_TOKENS` 同时覆盖两通道，`VIBE_ANTHROPIC_MAX_TOKENS` 只覆盖原生通道且优先。**收尾轮保留工具定义**：最后一轮 / early_finalize 以 `tool_choice=none`（原生通道 `{"type":"none"}`，OpenAI 兼容通道 `"none"`）禁止调用而不是摘掉 `tools`——Anthropic Messages API 对含 tool_use/tool_result 块却无 `tools` 的请求回 400；`providers/capabilities.py` 的 `tool_choice_none=False`（目前 zhipu/glm）表示该端点不支持 `none`，退回省略 `tools` 的旧行为。
@@ -128,6 +131,8 @@ systemctl daemon-reload && systemctl enable --now cube-router
 | 租户档位覆盖 | | `engine_env()` 会给每个租户注入默认档位：`VIBE_MAX_ITERATIONS=50`、`VIBE_TRADING_DATA_CACHE=1`、`VIBE_TRADING_TOOL_TIMEOUT_SECONDS=300`、`SWARM_TIMEOUT`（派生自 `VIBE_SWARM_ASK_TIMEOUT_S`）、`TIMEOUT_SECONDS=300`（LLM 流式读超时）、`VIBE_TRADING_SEARCH_BACKENDS=auto`、`VIBE_TRADING_ALLOWED_FILE_ROOTS=/tmp`——在 router.env 里设同名变量即可整体覆盖。输出上限 / 续写次数 / thinking 模式（`VIBE_MAX_OUTPUT_TOKENS`、`VIBE_ANTHROPIC_MAX_TOKENS`、`VIBE_LENGTH_CONTINUATIONS`、`VIBE_ANTHROPIC_THINKING`）走上一行的转发规则，引擎默认值见 docs/OBSERVABILITY.md §9 |
 
 laicai 侧只需在 `web.env` 配 `VIBE_ROUTER_URL=http://<宿主机>:8990` + `VIBE_ROUTER_TOKEN`。
+
+**引擎 env 的四个前缀**（不做统一——改名会波及生产 `router.env` 与镜像）：`VIBE_TRADING_*` 是上游引擎自己的开关（工具超时、shell 门、搜索后端、文件根…）；`VIBE_*` 是本 fork 新增的引擎 / router 旋钮（`VIBE_MAX_ITERATIONS`、`VIBE_FINALIZE_RESERVE_S`、`VIBE_ANTHROPIC_*`、`VIBE_DATA_DIR`，router 侧的 `VIBE_ROUTER_*` / `VIBE_CUBE_*` 等）；`VT_*`（主循环 `src/agent/loop.py`：`VT_HEARTBEAT_INTERVAL_S` / `VT_REASONING_DELTA_MIN_INTERVAL_S` / `VT_STREAM_RETRIES` / `VT_STREAM_RETRY_DELAY_S`）与 `SWARM_*`（swarm worker 与 `run_swarm`：`SWARM_TIMEOUT` / `SWARM_MAX_WORKERS` / `SWARM_WORKER_MAX_ITER` / `SWARM_WORKER_TIMEOUT` / `SWARM_HEARTBEAT_INTERVAL_S` / `SWARM_STREAM_RETRIES` / `SWARM_STREAM_RETRY_DELAY_S` / `SWARM_GROUNDING_MAX_SYMBOLS`）是上游这两个模块各自既有的前缀，fork 加的流重试旋钮沿用了所在模块的前缀——所以同一「流重试」策略在主循环与 worker 里要各配一遍。除 `SWARM_TIMEOUT`（router 派生下发）外，`VT_*` / `SWARM_*` 都不在上表的转发名单里，要改只能改镜像默认值。
 
 ### 4. 更新操作
 

@@ -179,6 +179,21 @@ Minor / 补充：m1 冷启动 5–15s（重 import + CJK 字体下载 + matplotl
 
 **部署。** v8 镜像走既有 runbook（`/root/vibe-build` 构建 → 本机 registry → `tpl create-from-image` → 改 `VIBE_CUBE_TEMPLATE_ID` → restart cube-router），冒烟租户验证新模板 13.4s 冷启动出答案；存量租户下次调用自动换新模板，数据在宿主 bind-mount 不动。laicai 侧同日 `deploy:vps` 上线（014de12）。
 
+## 2026-08-25 → 08-27：美/港股国内直连备源、read_url 走代理、原生 Anthropic 通道、迭代上限回 50、/obs/prompt 与模板清扫
+
+三天里两条线并行：08-24 那次深度调用的复盘（run #7–#10）暴露的数据链与冷启动问题，和 router 侧的运维端点。
+
+- **美/港股国内直连备源**（08-25，`aee8bf5` ifind、`e9d9a86` tickflow、`531414e`/`499db26` 链序、`8568cfc`）：新增 `backtest/loaders/ifind_loader.py`（同花顺 iFinD MCP，`IFIND_MCP_TOKEN`）与 `tickflow_loader.py`（api.tickflow.org，`TICKFLOW_API_KEY`），us_equity 链改为 tickflow→ifind→yfinance→akshare、hk_equity 链 ifind→tickflow→yfinance→tencent→futu→akshare——yfinance 依赖隧道且被 Yahoo 限频，降为兜底。复盘发现 `_SOURCE_PATTERNS` 的 primary 判定仍指 yfinance（attempt `f9b0c0cdcded` 主查询照旧走 Yahoo），改为与链首对齐；裸美股 ticker 与 Yahoo 特殊符号（`GC=F` / `^TNX` / `DX-Y.NYB`）此前落到 a_share 默认链，run #7/#8 因此 9 个标的全部 gap，加了三条模式行。`data-routing` 决策树与两个独立 skill 同日补齐（`0254652`、`2ad7acc`）。
+- **冷启动双故障根修**（08-25，`aae5b93`、`b11e87b`）：loader 注册表的冷启动竞态（空注册表被锁存）改为加锁 + 空表不锁存并重试；launcher 的出境隧道从「只在 /health 时拉」改为常驻 keeper 线程自愈——冷启时 ssh 在 guest 网络就绪前死掉，整个 run 的代理调用全部 ECONNREFUSED（attempt `88e080ef0a46`）。
+- **read_url 走出境代理 + 连接快败**（08-25，`093d9d2`、`acdfd66`）：`r.jina.ai` 直连不可达时 30s 连接死等在单次调用里烧掉 90s，改为连接 5s / 读 30s 并经 `VIBE_TRADING_EGRESS_PROXY`；Jina 对阿里云 AS20473 禁匿名（401），加 `JINA_API_KEY`。同一提交让 router 优雅退出时取消在飞 attempt（run #9 一次部署重启后孤儿 attempt 烧了 27 分钟）。
+- **观测补齐**（08-25，`646af63`、`5c8ec45`、`9ce9833` 等）：swarm worker 的 token 用量并入 `llm_usage` 事件（run #8 主循环只记 21k 输出 token，两个 swarm run 实际烧掉数十万）、租户锁等待计时（run #9 有 93 分钟静默锁等待被读成巨大的 first_progress）、任务真实完成时间戳、`llm_call` 留痕、`stream_retries` 计数；观测预览不再钝器脱敏 `content` 字段（它把 skill 全文 / 文件写入 / 报告一律遮掉，deep-trace 页无法排障）。
+- **主循环两处死锁修复**（08-26，`77de03d`、`1c80b58`）：去重护栏改按 (工具, 参数) 键并在结果被 microcompact 清掉后放行——attempt `dea1222743ef` 里名字级护栏拒绝了所有后续 `get_market_data`，模型被逼着把真实数据「撤回」成臆测；工具参数按 schema 无损强转——attempt `052d98f52286` 的 OpenAI 兼容通道把 `max_rows` 发成 `"0"`、数组参数发成 JSON 字符串，工具深处 TypeError 连烧四次重试。同日 `get_realtime_quotes`（`6b22846`，TickFlow 快照；此前模型 bash-curl 腾讯行情站，CBRS 这类新股返回 `pv_none_match`）与 `check_available` 改 classmethod（`68d6346`）。
+- **租户迭代上限 25→50**（08-26，`befbf80`，运营决策）：25 把 swarm 意图的 run 饿死——采集阶段就吃掉约 20 轮（attempt `c5810ef14c1e`）；改回 50，硬停止交给 wall-clock deadline。两次同日提交又被 revert：截断的工具调用参数视为断流重试（`9c9eba8`/`296c8fa`）、swarm 请求采集硬上限（`f22d0b0`/`9a88cad`）。
+- **Anthropic 原生 `/v1/messages` 通道**（08-26，`8a42f25`、`a303fec`）：OpenAI-compat 转换路径吞掉 SSE ping，长思考期间流字节级静默数分钟，中间设备把「空闲」连接掐断成干净截断（attempt `fc2710…`/`5d3bea33…`）；`LANGCHAIN_PROVIDER=anthropic` 走原生通道端到端透传 ping，去掉两层协议转换；`ChatAnthropicCompat` 垫片兼容中继的序列化字段。
+- **router 运维端点与自愈**（08-27）：模板切换启动清扫 `_sweep_stale_templates`（`f023941`，销毁旧模板实例并删旧模板，`VIBE_SWEEP_STALE_TEMPLATES` 可关）；半删除沙箱自愈（`7254de3`：resume 报成功但 VM 没起来、cubelet 回收任务后 CubeAPI 记录残留报 500 `NotFoundAtCubelet`，视同 404 弃建重建）；`/obs/prompt` 只读端点回传 attempt 完整输入（`7c99065`）；`/memory` 端点列出/物理删除租户长期记忆（`1194407`，laicai 记忆页）；资源表标注生产容量 4/4 + 2G swap（`875b373`）。
+
+代码里原先以「2026-08-25 复盘 run #7/#10」「2026-08-26: iterations back to 50 (operator decision)」「attempt xxxx」形式留下的这些叙事，2026-09-21 起统一搬到本节，注释只留规则与一句原因。
+
 ## 2026-08-28：上下文工程三件套——microcompact 阈值化、状态栏外移、prompt caching 接通
 
 **背景。** 对照《深入理解 AI Agent》§2.3/§2.7 做的引擎评审发现三处反模式叠加，导致 prompt cache 命中率趋零、CJK 会话压缩时机全错：①L1 microcompact 每轮**无条件**把倒数第 4 条之前的工具结果换成占位符——教科书级滑动窗口反模式，模型被迫反复重拉刚被丢掉的数据（dea1222743ef 事故正源于此），且每轮改写轨迹中部使缓存前缀必然失效；②系统提示里嵌着分钟级时间戳和 WorkspaceMemory State 块，逐轮字节不一致，缓存从第一个 diff 字节起全废；③native Anthropic 通道全程没设 `cache_control`，就算前缀稳定也没在用缓存。另有 token 估算 `len//4` 按英文假设，中文低估 2-3 倍。
@@ -364,3 +379,14 @@ Minor / 补充：m1 冷启动 5–15s（重 import + CJK 字体下载 + matplotl
 - **顺带（V3 发现）** `background_tools.py` 去掉 50k 自裁，改用 bash 同一 `_cap_output` 百万字符内存护栏，输出完整交给 `tool_result_store` 单层截断，description 同步；`BackgroundManager.reset()` + `tests/conftest.py` autouse fixture 每个用例前后重置进程级单例（`_execute` 对已被重置的任务表不再写回），治 `test_agent_goal_context` 与 `test_credential_boundary` 的后台任务通知串扰。
 - 测试 `tests/test_review4_memory_sessions.py`（20 例：engine 删除只删本会话 runs、`runs_for_session` 跳 symlink/坏 JSON、req.json 预览/长度/哈希无全文、offline 删除后 `search()` 绑定目录即删行、启动对账清 FTS + goal 行、无孤儿时 noop、user 领先/最旧非 user 被挤出/三条路径同序、TTL 默认关/软过期/非法值、四线程并发 add 不丢行、锁可重入、`created` 次序键、遗留条目排后、forget 审计事件、后台单例隔离三例）；`test_memory_lifecycle.py` 的 index-full 用例改为 200 个真实条目并断言淘汰对象；`test_router_security.py` 新增转发 env（含 `LANGCHAIN_STREAM_USAGE=0`、BYOK 仍剔除内置 Anthropic 凭据）、offline 删除删 runs（不动他人 runs / 会话目录已不在仍删 / symlinked run 不跟）、`/memory/delete` 审计行。
 
+## 2026-09-21 四轮评审整改 V5：注释与文档收口——代码注释去批次号 / 事故日期 / attempt id，HISTORY 补 08-25→27，现状文档补三条约束与 mcp_server 定位
+
+四轮评审（vt-5-docs、vt-1-harness、vt-4-tools 的 P2）指出：fork 触及的代码里 100+ 处注释带评审批次号（F1/V2/E2/P08 R1…）、事故日期与 attempt id，脱离 HISTORY 无法解码；HISTORY 从 08-24 跳到 08-28，那三天的叙事只活在代码注释里；`tools/__init__.py` / `core/paths.py` 仍说「vibe-router 注入 / cgroup 兜底」；`api_server._data_root()` 与 `core.paths.data_root()` 两份真源、README_CUSTOM 指的是错的那份；OBSERVABILITY §2 的 copy_context 计数（3 实为 6）、§4「立刻进入 early_finalize」（实为第 2 轮起）、SKILLS.md「27 个超 10k」（实测 24）；`mcp_server.py` 定位与 `patch_skill` / `save_skill` 的永久遮蔽未入文档、未向模型披露；HISTORY 里三条当前约束（denyOut RFC1918、测试矩阵、回顾历史缺口）现状文档没有；上游 AGENT_CONTRIBUTOR_GUIDE 的文档规则与 fork 约定冲突无说明。本批：
+
+- **注释清洗**：33 个文件 139 处替换（只动注释与 docstring，AST 去 docstring 后逐文件比对不变；`api_server.py` 是唯一逻辑改动）：纯叙事删掉，守卫型改成「规则 + 一句原因」并去掉批次号 / 日期 / attempt id；顺手改正 `swarm_tool.py` 的「12-agent preset」为 6（最宽的 `technical_analysis_panel` 是 6 agents）。保留未动：正常英语的 `no longer`（如「tenants that no longer exist」）、字符串字面量（`remember` 的告警文案、preset 关键词「组合复盘」）、两个 router 测试文件的模块 docstring（测试夹具）。
+- **单一数据根**：`api_server._data_root()` 改为 `src.core.paths.data_root()` 的别名（两者语义逐字相同：`VIBE_DATA_DIR` 展开，否则 `agent/` 安装目录）；`tools/__init__.py` 与 `core/paths.py` 的注释改为 cube-router / launcher `/boot` 注入、MicroVM 规格兜底的现状；README_CUSTOM「与上游的差异」第一条改指 `src/core/paths.py`。
+- **env 前缀**：README_CUSTOM env 表后补「四个前缀的来源与归属」——`VIBE_TRADING_*` 上游开关、`VIBE_*` fork 旋钮、`VT_*` / `SWARM_*` 是上游 loop.py / swarm 各自既有前缀（fork 的流重试旋钮沿用所在模块前缀），且除 `SWARM_TIMEOUT` 外都不在转发名单里；不改名（影响生产 env）。`service.py` 的「router hands laicai tenants 25」改为现状；OBSERVABILITY §4 的 early_finalize 触发时机改为「第 1 轮照常跑（工具窗钳到 10s 地板）、第 2 轮起判定」。
+- **docs**：OBSERVABILITY §2 改为「三个模块六处 copy_context」并逐处列出（含 swarm runtime 两跳与回归测试）；§6 补「沙箱 denyOut RFC1918 所以隧道端点必须在 guest」一句。SKILLS.md 「27 个」改「24 个（按 load_skill 返回文本计，字节计 25）」，游离文件 `agent/skills/ashare-mootdx` 注明是上游原样文件、不动不登记；§3 表写明 `patch_skill` 永久遮蔽连模板升级也带不回、`save_skill` 同名顶替内置。`patch_skill` / `save_skill` / `delete_skill` 的 description 各加一句披露；`write_file` / `edit_file` / `backtest` / `factor_analysis` / `options_pricing` 的 description 补「何时用 / 返回什么 / 何时报错」（只改文案，参数面不动；`edit_file` 只改第一处的语义写进描述，不改行为）。README_CUSTOM 仓库结构表加 `agent/mcp_server.py`（上游 MCP 服务端、生产不用、与进程内工具面的漂移清单）与 `AGENT_CONTRIBUTOR_GUIDE.md` 两行，文首加「fork 的文档约定」覆盖上游 Documentation Rules。
+- **HISTORY / PRODUCT_DESIGN**：本文补 08-25→08-27 节（从 git log 与被删注释整理）；PD §6 补沙箱到宿主 `denyOut` RFC1918 的约束、§8 补「回顾历史」功能缺口、新增附录 A 测试矩阵（本文 §6 原文保留）。
+- **`ops/vibe-router/`**：README 顶部加「Frozen — not maintained」；本分支未碰过该目录，无需回退。
+- 验证：全量 pytest 与 router 测试见提交说明；`uvx ruff check` 改动文件告警数与基线相同（10，均为既有）。

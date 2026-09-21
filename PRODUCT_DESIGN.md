@@ -13,6 +13,7 @@
 7. [会话连续性](#7-会话连续性)
 8. [与 laicai 的对接](#8-与-laicai-的对接)
 9. [观测、预算与出境代理（概要）](#9-观测预算与出境代理概要)
+10. [附录 A：测试矩阵（验收基线）](#附录-a测试矩阵验收基线)
 
 ## 1. 系统定位与拓扑
 
@@ -281,6 +282,7 @@ flowchart LR
 - 数据面：cube-proxy host 路由 `http://<port>-<sandboxID>.<SANDBOX_DOMAIN>`，依赖宿主 split-DNS，仅宿主机内可解析——沙箱端口对外无直接暴露。
 - 对外仅 `:8990`（cube-router）：Bearer token + 云安全组白名单（仅 laicai web 主机 IP）双闸。WebUI `:12088` 同样须安全组限源。
 - 沙箱出网：当前全量放行（CubeEgress 白名单未启用）；风险面 = 沙箱内引擎的联网工具，比宿主机出网低一级，但可进一步收紧。
+- 沙箱到宿主：沙箱网络策略 `denyOut` 封了全部 RFC1918，guest 回连不了宿主内网 IP（含宿主上的任何监听端口）。这是出境隧道端点必须放进 guest（launcher 在沙箱内起 ssh）而不能放在宿主的根本原因，也排除了「让引擎把数据回传宿主」一类方案——宿主读写租户数据只走 bind-mount 直读。
 
 ## 7. 会话连续性
 
@@ -297,6 +299,8 @@ flowchart LR
 
 laicai 侧的桥接实现（触发词门控、NDJSON 消费、进度事件透传、会话绑定、用量记账、`deep_engine_runs` 落库与 admin 观测面板）见主仓库 `app/src/server/vibe-trading.ts` 与 laicai 侧文档，此处不复述。
 
+**已知缺口——「来财AI 回顾历史」在功能层未闭环**：`session_search` 在租户档位在册，但引擎对「上次 / 之前那次分析」类问题倾向现场重算，laicai 外层模型也不主动把回顾类问题转交引擎；跨线程的回顾目前只靠长期记忆召回（§7）。
+
 ## 9. 观测、预算与出境代理（概要）
 
 详细技术文档见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)，此处只列骨架：
@@ -306,3 +310,16 @@ laicai 侧的桥接实现（触发词门控、NDJSON 消费、进度事件透传
 - **预算体系**：`deadline_s` 沿 laicai timeoutS → router（`max(60, 预算 − 已耗 − 10)`）→ messages API → AgentLoop 单向传递；剩余 <25% 起**每轮**随状态栏注入收尾提示，剩余不足一轮（`max(60s, 1.2×平均迭代)`）强制出文本（`early_finalize`，明标未完成部分；工具定义保留、`tool_choice=none` 禁止调用，Anthropic 原生通道对「有 tool 块却无 tools」的请求回 400）；输出被 `max_tokens` 截断（`finish_reason=length`）时续写而不是当作完整答案，续不完则末尾附「（输出被截断）」；单工具/swarm/取数链的内部超时都被剩余预算钳制（`core/budget.py` 的 `cap_timeout`）；router 对未答请求兜底 cancel，引擎侧取消事件（`core/cancel.py`）穿透工具等待与 swarm 轮询，在途工具 ≤1s 内被放弃。
 - **数据可靠性**：主源异常**或单标的空结果**都会沿 `FALLBACK_CHAINS` 逐源降级（总预算 120s），耗尽才返回 `_gaps` 明细（限频标注 `rate_limited`）；tushare 进程内节流 + 重试；`socket.setdefaulttimeout` 兜底无超时 SDK；loader 缓存对租户默认开启；每次 loader 调用经 `core/fetch_stats.py` 计入 attempt_stats 的 `data_fetches`/`data_gaps`。
 - **出境代理**：沙箱内 SSH 隧道（launcher 管理）→ B 服务器 loopback tinyproxy（域名白名单 FilterDefaultDeny）；三个消费方走 `VIBE_TRADING_EGRESS_PROXY`——`web_search`、`read_url`（上游 `r.jina.ai`，须在白名单内）与 yfinance loader，国内源与 LLM 上游直连。
+## 附录 A：测试矩阵（验收基线）
+
+设计定稿时确立、v1 生产验收执行通过、v2 切流复验核心项（过程见 [docs/HISTORY.md](docs/HISTORY.md) §6）。动隔离 / 连续性 / 容量相关代码时按此回归：
+
+| 类别 | 用例 |
+|---|---|
+| 隔离 | A `remember` 的内容 B 召不回/搜不到；A 的 uploads/shadow/sessions.db/goals/swarm 产物 B 不可见 |
+| 工具档位 | tenant-safe 下工具列表无 `trading_*`/`propose_mandate_profiles` |
+| 跨租户 session 拒绝 | B 用 A 的 `vibe_session_id` 发消息 → 404/拒绝，不串答 |
+| 连续性 | 同线程两轮答案不同；跨线程长期记忆本人可召回；`vibe_session_id` 失效 → 透明新建并回传新 id |
+| 资源 | 并发超限排队不 OOM；`VIBE_MAX_INSTANCES` 含 booting 实例不被越过；在途长任务不被 reaper 误杀（refcount / lock） |
+| 故障 | 沙箱被杀 → 下次自动重建；router 重启 → 不泄漏（state.json 重挂）、用户数据不丢 |
+| 注销 | `/forget` 后宿主数据目录删除、沙箱删除，失败返回 `{ok:false}` 供 laicai 重试 |

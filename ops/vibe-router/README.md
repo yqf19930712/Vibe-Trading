@@ -4,6 +4,10 @@
 > `ops/cube-router` on CubeSandbox MicroVMs. Kept as archive — see
 > `../../docs/HISTORY.md` for the v1 record and `../../PRODUCT_DESIGN.md` for the
 > current architecture.
+>
+> **Frozen — not maintained.** Do not mirror cube-router changes here
+> (`FORWARD_ENV`, data-source keys, endpoints …); `ops/cube-router` is the only
+> place those live. The source is kept solely as a rollback reference.
 
 Multi-tenant orchestrator for Vibe-Trading.
 This is the **production runbook** for standing it up on the VPS. Every step that

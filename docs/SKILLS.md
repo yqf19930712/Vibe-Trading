@@ -21,7 +21,7 @@
 
 每个 skill 是一个目录，`SKILL.md` 必须存在，frontmatter 携带 `name` / `description` / `category`；正文是完整方法论文档。可选子目录：`references/`、`templates/`、`examples/`、`assets/`，通过 `Skill.load_support_file()` 按需读取。
 
-> 注意：`agent/skills/`（`src` 外层）不在默认加载路径——`SkillsLoader` 的默认 `skills_dir` 解析为 `agent/src/skills/`。当前 `agent/skills/ashare-mootdx` 只有 references、无 SKILL.md，属于游离文件，引擎不会加载它。
+> 注意：`agent/skills/`（`src` 外层）不在默认加载路径——`SkillsLoader` 的默认 `skills_dir` 解析为 `agent/src/skills/`。`agent/skills/ashare-mootdx/references/a_mootdx_fetcher.py` 是**上游原样文件**（上游 tip 同样只有 references、无 SKILL.md），引擎不加载它、内置 `mootdx` skill 也不引用它；本 fork 不动上游文件，故原样保留，不登记进清单。
 
 ## 2. 渐进式披露
 
@@ -29,7 +29,7 @@
 
 - **摘要注入**：`get_descriptions()` 按 category 分组渲染（顺序 `data-source → strategy → analysis → asset-class → crypto → flow → tool → 其余按字母`），每个 skill 一行 `- name: description`。
 - **全文加载**：模型调 `load_skill(name)` 工具（`agent/src/tools/load_skill_tool.py`）→ `SkillsLoader.get_body()` 取 SKILL.md 正文，工具返回 **Markdown 原文**，首行 `# skill: <name>`（不是 JSON，也没有 `<skill>` 包裹——单行 JSON 落盘后 `read_file` 按行翻页永远翻不到被裁掉的部分）。未命中时回退到用户目录磁盘查找（覆盖会话中途新建的 skill），仍未命中则返回 `{"status":"error","error":"Error: Unknown skill '…'. Available: …"}` JSON 信封（主循环与 swarm worker 的错误分类器都按该信封判失败）。`get_content()`（`<skill name="…">` XML 包裹）只剩 `mcp_server.py` 的 MCP 工具在用。
-- **长 skill 的截断规则**（`agent/src/agent/tool_result_store.py`）：`load_skill` 豁免通用的 10k 字符上限，预算 `SKILL_RESULT_LIMIT=60000`（79 个内置 skill 里 27 个超 10k，`tushare` 约 100k）。超预算时**按 `##` 小节裁**、绝不裁在句中：保留能装下的连续前缀小节，信封列出每个被省略小节的标题与起始行号、全文落盘路径（`run_dir/tool-results/<iter>-load_skill-<callid8>.md`）与 `read_file(offset, limit)` 续读提示；围栏代码块里的 `##` 不算分节点。落盘失败时改指向内置的 `<name>/SKILL.md`（行号偏移 frontmatter）。
+- **长 skill 的截断规则**（`agent/src/agent/tool_result_store.py`）：`load_skill` 豁免通用的 10k 字符上限，预算 `SKILL_RESULT_LIMIT=60000`（79 个内置 skill 里 24 个超 10k——按 `load_skill` 返回文本计，即 `# skill: <name>` 头 + 正文的字符数；按 UTF-8 字节计是 25 个。`tushare` 约 100k）。超预算时**按 `##` 小节裁**、绝不裁在句中：保留能装下的连续前缀小节，信封列出每个被省略小节的标题与起始行号、全文落盘路径（`run_dir/tool-results/<iter>-load_skill-<callid8>.md`）与 `read_file(offset, limit)` 续读提示；围栏代码块里的 `##` 不算分节点。落盘失败时改指向内置的 `<name>/SKILL.md`（行号偏移 frontmatter）。
 - **主 Agent 的行为约束**：Guidelines 要求「任务开始前先 load 相关 skill」；Shadow Account 流更是硬规则——不先 `load_skill("shadow-account")` 不许碰 `shadow_*` 工具。
 
 ## 3. 自进化：skill 的增删改
@@ -38,8 +38,8 @@
 
 | 工具 | 行为 | 关键语义 |
 |---|---|---|
-| `save_skill` | 新建/整体覆盖用户 skill | name 清洗为 `[a-z0-9-]` slug；content 缺 frontmatter 时自动补（category 默认 `user`）；description 要求新 skill 正文含 Related 段、链接 ≥2 个相关已有 skill |
-| `patch_skill` | 对现有 skill 做精确查找替换（1 次） | **copy-on-write**：目标是内置 skill 时先整份复制到用户目录再打补丁——此后用户版永久覆盖内置版 |
+| `save_skill` | 新建/整体覆盖用户 skill | name 清洗为 `[a-z0-9-]` slug；content 缺 frontmatter 时自动补（category 默认 `user`）；description 要求新 skill 正文含 Related 段、链接 ≥2 个相关已有 skill。加载器按 frontmatter `name`（缺省为目录名）索引且用户目录先加载：content 自带的 `name:` 与某个内置 skill 同名时，即静默顶替该内置 skill 的摘要与正文（description 已向模型披露） |
+| `patch_skill` | 对现有 skill 做精确查找替换（1 次） | **copy-on-write**：目标是内置 skill 时先整份复制到用户目录再打补丁——此后用户版永久覆盖内置版，**模板升级也带不回**：后续镜像里对该内置 skill 的修订对这个租户不可见；副本没有版本标记，排查时只能看租户目录 `skills/user/` 下有没有同名目录（description 已向模型披露） |
 | `delete_skill` | 整目录删除 | 仅限用户 skill，内置不可删；删除被 patch 出来的用户副本即回退到内置版 |
 | `skill_file` | 辅助文件管理（write / remove / list） | 仅限 `references/` `templates/` `examples/` `assets/` 四个子目录，skill 须已存在 |
 
