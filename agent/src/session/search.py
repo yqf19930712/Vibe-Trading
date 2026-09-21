@@ -72,7 +72,29 @@ class SessionSearchIndex:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
+        # Session store root, once bound: rows whose directory is gone are
+        # dropped at search time instead of being returned as dead links.
+        self._store_base_dir: Optional[Path] = None
         self._init_db()
+
+    def bind_store(self, store_base_dir: Path) -> None:
+        """Tie the index to the file-based session store it mirrors.
+
+        The host may delete a session directory while the engine is not
+        running (router offline delete); the rows for it then have no
+        session behind them. Once bound, :meth:`search` skips and deletes
+        such rows and :meth:`reconcile_with_store` sweeps them in bulk.
+
+        Args:
+            store_base_dir: Root directory of the SessionStore.
+        """
+        self._store_base_dir = store_base_dir
+
+    def _session_dir_exists(self, session_id: str) -> bool:
+        """Whether the bound store still has ``session_id`` (True when unbound)."""
+        if self._store_base_dir is None:
+            return True
+        return (self._store_base_dir / session_id).is_dir()
 
     def _get_conn(self) -> sqlite3.Connection:
         """Get or create the SQLite connection (WAL mode)."""
@@ -246,9 +268,13 @@ class SessionSearchIndex:
             return []
 
         seen: dict[str, SearchMatch] = {}
+        orphans: set[str] = set()
         for row in cursor.fetchall():
             sid = row[0]
-            if sid in seen:
+            if sid in seen or sid in orphans:
+                continue
+            if not self._session_dir_exists(sid):
+                orphans.add(sid)
                 continue
             seen[sid] = SearchMatch(
                 session_id=row[0],
@@ -261,7 +287,44 @@ class SessionSearchIndex:
             if len(seen) >= max_sessions:
                 break
 
+        for sid in orphans:
+            try:
+                self.delete_session(sid)
+            except sqlite3.Error as exc:
+                logger.warning("orphan session %s not dropped from index: %s", sid, exc)
+
         return list(seen.values())
+
+    def list_session_ids(self) -> List[str]:
+        """Return every session id that has a row in ``sessions`` or ``messages``."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT id FROM sessions UNION SELECT DISTINCT session_id FROM messages"
+        ).fetchall()
+        return [str(r[0]) for r in rows if r[0]]
+
+    def reconcile_with_store(self) -> List[str]:
+        """Drop the rows of every session whose directory no longer exists.
+
+        Requires :meth:`bind_store`; a no-op (empty list) when unbound. Run
+        once at engine start so sessions deleted from the host while the
+        engine was down stop being searchable.
+
+        Returns:
+            The session ids that were removed from the index.
+        """
+        if self._store_base_dir is None:
+            return []
+        removed: List[str] = []
+        for sid in self.list_session_ids():
+            if self._session_dir_exists(sid):
+                continue
+            try:
+                self.delete_session(sid)
+                removed.append(sid)
+            except sqlite3.Error as exc:
+                logger.warning("orphan session %s not dropped from index: %s", sid, exc)
+        return removed
 
     def delete_session(self, session_id: str) -> int:
         """Drop one session's rows (messages + session record).

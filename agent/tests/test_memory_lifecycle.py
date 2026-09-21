@@ -87,15 +87,37 @@ class TestRetrieval:
 
 class TestIndexFullWarning:
     def _fill_index(self, pm: PersistentMemory) -> None:
-        lines = [f"- [pad{i}](project_pad{i}.md) — pad" for i in range(MAX_INDEX_LINES)]
-        (pm._dir / "MEMORY.md").write_text("\n".join(lines), encoding="utf-8")
+        """MAX_INDEX_LINES real project entries, each older than the previous."""
+        base = time.time() - 10 * 86400
+        for i in range(MAX_INDEX_LINES):
+            path = pm._dir / f"project_pad{i}.md"
+            path.write_text(
+                f"---\nname: pad{i}\ndescription: pad\ntype: project\n---\n\npad body {i}",
+                encoding="utf-8",
+            )
+            os.utime(path, (base - i, base - i))
+        pm._rebuild_index()
 
-    def test_add_past_cap_sets_flag(self, tmp_path) -> None:
+    def test_add_past_cap_evicts_the_oldest_non_user_entry(self, tmp_path) -> None:
+        """The cap drops the oldest non-user line, not the entry just saved."""
         pm = PersistentMemory(memory_dir=tmp_path)
         self._fill_index(pm)
-        pm.add("overflow-entry", "will not fit the index", "project")
-        assert pm.last_add_indexed is False
+        pm.add("overflow-entry", "newest note", "project")
+        index = (tmp_path / "MEMORY.md").read_text(encoding="utf-8")
+        assert pm.last_add_indexed is True
         assert pm.index_full is True
+        assert "[overflow-entry]" in index
+        assert f"[pad{MAX_INDEX_LINES - 1}]" not in index  # the oldest pad
+        assert "[pad0]" in index
+        assert (tmp_path / f"project_pad{MAX_INDEX_LINES - 1}.md").exists()
+
+    def test_add_is_left_out_only_when_the_cap_is_all_user_entries(self, tmp_path) -> None:
+        pm = PersistentMemory(memory_dir=tmp_path)
+        for i in range(MAX_INDEX_LINES):
+            pm.add(f"pref{i}", "user preference", "user")
+        pm.add("overflow-project", "a project note", "project")
+        assert pm.last_add_indexed is False
+        assert "[overflow-project]" not in (tmp_path / "MEMORY.md").read_text(encoding="utf-8")
 
     def test_remember_save_carries_warning(self, tmp_path) -> None:
         pm = PersistentMemory(memory_dir=tmp_path)

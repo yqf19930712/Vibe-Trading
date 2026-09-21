@@ -1817,6 +1817,10 @@ def _get_session_service():
         event_bus=event_bus,
         runs_dir=RUNS_DIR,
     )
+    # Sessions deleted from the host while the engine was down leave their
+    # sessions.db rows behind; sweep them before the first search can
+    # surface a deleted conversation.
+    _session_service.reconcile_orphans(goal_store=_get_goal_store())
     return _session_service
 
 

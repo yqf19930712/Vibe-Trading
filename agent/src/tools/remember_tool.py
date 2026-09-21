@@ -32,10 +32,13 @@ class RememberTool(BaseTool):
         "new entry so nothing is lost). When an entry relates to memories you "
         "already have, end its content with a 'Related' section linking at "
         "least 2 of them by title — isolated append-only notes decay into "
-        "disconnected islands and stop being findable. The index tops out at "
-        f"{MAX_INDEX_LINES} lines; past that, new entries are stored but "
-        "no longer appear in the session-start snapshot — consolidate or "
-        "forget stale entries when warned."
+        "disconnected islands and stop being findable. Prefer updating an "
+        "existing entry (same title) over saving a near-duplicate under a "
+        f"new title. The index tops out at {MAX_INDEX_LINES} lines: user-type "
+        "entries are always listed first; past the cap the OLDEST non-user "
+        "entries drop out of the session-start snapshot (their files remain "
+        "and recall still finds them) — consolidate or forget stale entries "
+        "when warned."
     )
     is_readonly = False
     parameters = {
@@ -137,9 +140,11 @@ class RememberTool(BaseTool):
             "message": f"Saved: {title}",
             "path": str(path),
         }
-        # F7①: index-cap warning — the entry file exists, but it will not be
-        # in the session-start snapshot. Surface it to the model AND emit an
-        # observability event.
+        # Index-cap warning: at the cap the index keeps user-type entries and
+        # the newest of the rest, so a save usually lands but pushes the
+        # oldest non-user entry out of the session-start snapshot — or, when
+        # the cap is all user entries, the new entry itself stays out. Either
+        # way the model should tidy up; also emitted as an observability event.
         if not getattr(self._memory, "last_add_indexed", True):
             warning = (
                 f"Memory index is full ({MAX_INDEX_LINES} lines): this entry was "
@@ -147,6 +152,17 @@ class RememberTool(BaseTool):
                 "Run consolidate_memory to merge duplicates, or forget stale "
                 "entries to make room."
             )
+        elif getattr(self._memory, "index_full", False):
+            warning = (
+                f"Memory index is full ({MAX_INDEX_LINES} lines): this entry was "
+                "saved and indexed, but the oldest non-user entries no longer "
+                "appear in the always-on session snapshot (their files remain "
+                "and recall still finds them). Run consolidate_memory to merge "
+                "duplicates, or forget stale entries to make room."
+            )
+        else:
+            warning = ""
+        if warning:
             payload["warning"] = warning
             emit_progress(stage="memory_index_full", message=warning)
         return json.dumps(payload, ensure_ascii=False)
@@ -168,6 +184,10 @@ class RememberTool(BaseTool):
             return json.dumps({"status": "error", "error": "title required"})
         removed = self._memory.remove(title)
         msg = f"Removed: {title}" if removed else f"Not found: {title}"
+        if removed:
+            # Audit trail: the deletion lands in the attempt's trace / SSE
+            # stream so "who removed which memory, when" can be answered.
+            emit_progress(stage="memory_forgotten", message=f"memory entry removed: {title}")
         return json.dumps({"status": "ok" if removed else "not_found", "message": msg})
 
 

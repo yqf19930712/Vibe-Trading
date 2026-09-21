@@ -11,13 +11,16 @@ from typing import Any, Dict, List, Optional
 
 from src.agent.progress import emit_progress
 from src.agent.tools import BaseTool
-from src.tools.bash_tool import _audit_command
+from src.tools.bash_tool import _OUTPUT_HARD_CAP, _audit_command, _cap_output
 from src.tools.redaction import redact_secret_values
 from src.tools.subprocess_env import _subprocess_env
 
 WORKDIR = Path(__file__).resolve().parents[2]
 _TIMEOUT_S = 300
-_OUTPUT_LIMIT = 50_000
+# Output is kept whole (up to bash's memory hard cap, marked when it fires):
+# ``check_background`` hands it to the loop, whose single truncation layer
+# (``agent.tool_result_store``) previews it and offloads the full text for
+# ``read_file`` paging — a second clip here would leave that copy incomplete.
 # Finished tasks are evicted oldest-first past this many entries; running
 # ones are never dropped. Bounds the per-process table (the singleton lives
 # as long as the engine does) without losing a result before it is read.
@@ -31,6 +34,17 @@ class BackgroundManager:
         self.tasks: Dict[str, dict] = {}
         self._notifications: List[dict] = []
         self._lock = threading.Lock()
+
+    def reset(self) -> None:
+        """Forget every task and pending notification (test isolation).
+
+        The manager is a process-wide singleton, so without this a task
+        started by one test surfaces as a ``<background-results>`` message in
+        an unrelated test's agent loop.
+        """
+        with self._lock:
+            self.tasks.clear()
+            self._notifications.clear()
 
     def run(self, command: str, cwd: str | Path | None = None) -> str:
         """Start a background task and return its task_id.
@@ -66,15 +80,20 @@ class BackgroundManager:
             r = subprocess.run(command, shell=True, cwd=str(cwd or WORKDIR), env=_subprocess_env(),
                                capture_output=True, text=True, timeout=_TIMEOUT_S,
                                encoding="utf-8", errors="replace")
-            output = redact_secret_values((r.stdout + r.stderr).strip()[:_OUTPUT_LIMIT])
+            output = redact_secret_values(
+                (_cap_output(r.stdout, "stdout") + _cap_output(r.stderr, "stderr")).strip()
+            )
             status = "completed"
         except subprocess.TimeoutExpired:
             output, status = f"Timeout ({_TIMEOUT_S}s)", "timeout"
         except Exception as e:
             output, status = str(e), "error"
-        self.tasks[task_id]["status"] = status
-        self.tasks[task_id]["result"] = output or "(no output)"
         with self._lock:
+            entry = self.tasks.get(task_id)
+            if entry is None:  # table reset while the command ran
+                return
+            entry["status"] = status
+            entry["result"] = output or "(no output)"
             self._notifications.append({
                 "task_id": task_id, "status": status,
                 "command": command[:80], "result": (output or "")[:500],
@@ -113,10 +132,11 @@ class BackgroundRunTool(BaseTool):
         "processing, large installs) that would exceed bash's timeout. The "
         "command runs in the current run_dir (same working directory and same "
         f"minimal no-credentials environment as bash), is killed after {_TIMEOUT_S}s, "
-        f"and its combined stdout+stderr is kept up to {_OUTPUT_LIMIT // 1000}k "
-        "characters. Poll check_background(task_id=...) to get the status and "
-        "output; write large results to files under run_dir and read them back "
-        "with read_file."
+        "and its combined stdout+stderr is kept whole (same "
+        f"{_OUTPUT_HARD_CAP // 1_000_000}M-character memory guard as bash). Poll "
+        "check_background(task_id=...) to get the status and output; a long "
+        "result comes back as a preview with its full text offloaded to a file "
+        "you can page with read_file, exactly like any other tool result."
     )
     parameters = {"type": "object", "properties": {
         "command": {"type": "string", "description": "Shell command to run in background"},
