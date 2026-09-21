@@ -110,7 +110,8 @@ AgentLoop 在 **attempt 结束时**（成功/失败/取消/异常四条路径都
   "reason": "…",            // 仅失败/取消时，截断 500 字符
   "verify_warnings": [...], // 可选：收口轻校验的警告（非空才出现）
   "compact_failures": 1,    // 可选：L3 摘要 LLM 调用失败次数（非零才出现）
-  "offload_failures": 0     // 可选：工具结果落盘失败次数（非零才出现）
+  "offload_failures": 0,    // 可选：工具结果落盘失败次数（非零才出现）
+  "output_truncations": 1   // 可选：finish_reason=length（输出被 max_tokens 截断）的轮数（非零才出现）
 }
 ```
 
@@ -121,6 +122,8 @@ AgentLoop 在 **attempt 结束时**（成功/失败/取消/异常四条路径都
 在上游既有类型（start/message/thinking/tool_call/tool_result/compact/end…）之上新增：
 
 - `early_finalize`：`{iter, remaining_s, avg_iter_s}` —— deadline 驱动的强制收敛触发点；
+- `forced_text_only`：`{iter, mode}` —— 收尾轮（最后一轮或 early_finalize）；`mode=tool_choice_none` 表示工具定义仍在请求里、以 `tool_choice=none` 禁止调用，`tools_omitted` 表示该 provider 不支持 `none`（`capabilities.tool_choice_none=False`）而退回省略 `tools`；
+- `output_truncated`：`{iter, chars, has_tool_calls}` —— 该轮回复被输出 token 上限截断（`finish_reason=length` / `stop_reason=max_tokens`）；随后要么 `output_truncated_continue`：`{iter, attempt, max_continuations}`（截断正文留在轨迹、追加续写提示再跑一轮，占正常迭代），要么答案末尾带「（输出被截断）」标记（最后一轮或续写次数用尽）；同名 SSE 事件 `output_truncated`；swarm worker 侧对应 `worker_output_truncated`；
 - `attempt_stats`：同 §3.2 全量字段，方便离线只读 trace 即可拿到汇总；
 - `tool_circuit_open`：`{iter, tool, consecutive_failures}` —— 同一 (工具, 参数) 连续失败达 `VIBE_TOOL_CIRCUIT_FAILURE_LIMIT`（默认 3）后该调用被拒。重复调用守卫只登记**成功**调用，所以这是「同一个坏调用烧掉多少迭代」的唯一信号；
 - `empty_model_response_retry`：`{iter, attempt, max_retries, provider, model}` —— 流成功返回但既无 content 也无 tool_calls 时的就地重试（附一条 nudge，消耗一个正常迭代）。仍为空才写终态 `empty_model_response`；
@@ -166,7 +169,7 @@ laicai timeoutS（默认 900s）
 循环内两级升级（`loop.py`）：
 
 1. **收尾提示**（剩余 < 25% 总预算，**每轮**）：从跌破 25% 起，每次迭代都把 `[SYSTEM] Less than 25% of the time budget remains (~Ns)…` 并入该轮的 `<agent_status>` 状态栏（状态栏用后即弃，所以轨迹里始终只有一条），引导模型收敛、不再开新调查线。独立于「迭代数 80% 收尾提示」——后者按迭代计数，迭代慢时开火太晚。
-2. **强制收敛 early_finalize**（剩余 < max(`VIBE_FINALIZE_RESERVE_S`=60s, 1.2×平均迭代耗时)）：本轮按「最后一轮」处理——丢弃工具定义强制出文本，并注入提示要求**基于已有材料立即作答、明确标注未完成/未验证部分**。trace/事件只在首次触发时写一次，提示行随状态栏持续到 run 结束。宁可给部分答案，不让调用方超时拿到空文案。
+2. **强制收敛 early_finalize**（剩余 < max(`VIBE_FINALIZE_RESERVE_S`=60s, 1.2×平均迭代耗时)）：本轮按「最后一轮」处理——工具定义保留、以 `tool_choice=none` 禁止调用来强制出文本，并注入提示要求**基于已有材料立即作答、明确标注未完成/未验证部分**。trace/事件只在首次触发时写一次，提示行随状态栏持续到 run 结束。宁可给部分答案，不让调用方超时拿到空文案。
 
 router 侧的 `max(60, …)` 下限意味着引擎拿到的 `deadline_s` 永远不少于 60s，哪怕调用方预算已在排队/冷启中耗尽——此时引擎立刻进入 early_finalize 分支，用这 60s 出一段部分答案。
 
@@ -215,7 +218,7 @@ router 侧的 `max(60, …)` 下限意味着引擎拿到的 `deadline_s` 永远�
 - **默认 `max_rows=120`**（半个交易年的日线），一个标的的默认调用落在 10k 字符的轨迹预算之内（`TOOL_RESULT_LIMIT`），不再每次落盘。更长区间按等步长降采样（末根 bar 钉住），`truncated=true`；`max_rows=0` 取全量（必然落盘）。
 - **参数 schema**：`source` 是 enum，`auto` + `backtest.loaders.registry.VALID_SOURCES` 里注册的全部 loader 名（动态取，registry 导入失败才回退到静态清单）；`interval` 是 enum `1m/5m/15m/30m/1H/4H/1D/1W/1M`（`1D` 全源支持，分钟/小时线 okx/ccxt/tushare/mootdx/futu/yfinance，周/月线 mootdx/futu/akshare）。
 - **超 10k 的结构化预览**：不是盲切字符——每个标的保留 `summary` + 首尾各 20 根 bar（`MARKET_DATA_EDGE_ROWS`；多标的仍超限时收缩到首尾 5 根，再超才退回通用 head+tail 信封），`rows_omitted` 记中段丢弃数，预览本身是合法 JSON，并明说「中段 bar 不是数据源缺失」。全量落盘 `run_dir/tool-results/<iter>-get_market_data-<callid8>.json`，**每根 bar 一行**，`read_file(offset, limit)` 按行翻页即按 bar 翻页、`grep -n <日期>` 直接定位。
-- 其他工具的单行 JSON 结果落盘前按 `indent=1` 重排成多行（否则 `read_file` 的行翻页永远只有一行）；`load_skill` 的落盘是 `.md` 原文（见 SKILLS.md §2）。信封里的翻页提示只指向 `read_file` 与 bash `grep -n`（引擎没有 `grep_file` 工具）。
+- 其他工具的单行 JSON 结果落盘前按 `indent=1` 重排成多行（否则 `read_file` 的行翻页永远只有一行）；`load_skill` 的落盘是 `.md` 原文（见 SKILLS.md §2）；`bash` 的落盘是纯文本流（stdout，stderr 接在 `--- stderr ---` 行之后，文件名 `<iter>-bash-<callid>.txt`），工具本身整段返回、不再另裁另存（只剩 100 万字符的内存护栏）；`read_file` 默认一页 200 行，超限结果只做 head+tail 预览、**不落盘副本**，预览指回源文件的 offset/limit。信封里的翻页提示只指向 `read_file` 与 bash `grep -n`（引擎没有 `grep_file` 工具）。
 - grounding 校验器（`verify.extract_reference_prices`）与结构化截断共用 `market_data.table_rows()` 读表，旧的 record 列表形状仍可解析。
 
 ## 6. 出境代理（白名单 egress）
@@ -311,6 +314,9 @@ laicai 侧实现在主仓库（桥接 `app/src/server/vibe-trading.ts`、落库 
 | `VIBE_BASH_TIMEOUT_S` | 120 | bash 单命令超时（另被剩余预算钳制）；长任务应走 `background_run` |
 | `VIBE_TOOL_CIRCUIT_FAILURE_LIMIT` | 3 | 同一 (工具, 参数) 连续失败几次后熔断该调用；命中写 `tool_circuit_open` |
 | `VIBE_EMPTY_RESPONSE_RETRIES` | 1 | 流成功但返回空 turn 时的就地重试次数（0 = 一次即判败） |
+| `VIBE_LENGTH_CONTINUATIONS` | 2 | `finish_reason=length` 的续写次数（占正常迭代）；用尽或已是最后一轮则答案末尾附「（输出被截断）」 |
+| `VIBE_MAX_OUTPUT_TOKENS` | 无 | 单次回复输出 token 上限，两通道共用；不设则原生 Anthropic 通道 32000、OpenAI 兼容通道 8192（兼容端点都接受的最宽值：过大是 400 硬错，过小只是可续写的截断）。router 不下发 |
+| `VIBE_ANTHROPIC_MAX_TOKENS` | 无 | 只覆盖原生 Anthropic 通道的上限，优先于 `VIBE_MAX_OUTPUT_TOKENS`。router 不下发 |
 | `TIMEOUT_SECONDS` | 120（**300**） | LLM 流式读超时（httpx）。opus 级长上下文的思考停顿可超 120s，300 能熬过停顿而真死的上游仍在一个 worker 迭代内失败 |
 | `VIBE_TRADING_FETCH_BUDGET_S` | 120 | market_data 单次调用含降级链的总预算 |
 | `VIBE_SOCKET_TIMEOUT_S` | 30 | 阻塞 socket 默认超时兜底 |
