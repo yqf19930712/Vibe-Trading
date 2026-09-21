@@ -100,7 +100,16 @@ class FactorAnalysisTool(BaseTool):
     """Factor analysis tool: compute IC/IR and layered NAV."""
 
     name = "factor_analysis"
-    description = "Factor analysis: compute IC/IR/layered NAV. Input factor CSV and return CSV, output analysis report."
+    description = (
+        "Factor analysis: compute IC/IR and quantile-group (layered) NAV from a "
+        "factor CSV and a forward-return CSV (both index=date, columns=codes, "
+        "same shape), writing ic_series.csv / ic_summary.json / group_equity.csv "
+        "to output_dir. Use it once the factor values have been computed and "
+        "saved. Returns {status:'ok', ic_mean, ic_std, ir, ic_positive_ratio, "
+        "ic_count, n_groups, long_short_spread, group_final_equity, output_dir, "
+        "files}; status:'error' when a CSV is unreadable/empty or fewer than 5 "
+        "assets share a date (IC needs a cross-section)."
+    )
     parameters = {
         "type": "object",
         "properties": {

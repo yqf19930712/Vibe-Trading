@@ -117,8 +117,8 @@ class RememberTool(BaseTool):
                 title, content, memory_type, description=title, source=source
             )
         except MemoryWriteError as exc:
-            # V2: a full tenant volume used to raise OSError straight out of
-            # add() and take the whole attempt down with it. Losing one memory
+            # A full tenant volume raises OSError out of add(); that must not
+            # take the whole attempt down with it. Losing one memory
             # write must not lose the answer, so it becomes a structured tool
             # error the model can route around.
             emit_progress(stage="memory_write_failed", message=str(exc))

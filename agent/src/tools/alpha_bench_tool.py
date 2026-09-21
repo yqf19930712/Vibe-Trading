@@ -50,7 +50,7 @@ _SP500_CONSTITUENT_SOURCE_DATE = "2026-05-17"
 # allows ~200 calls/min; 4 workers stays well under that with a 300-name list.
 _CSI300_FETCH_WORKERS = 4
 
-# V1: alpha_bench's own overall budget. Fetching ~300 (csi300) or ~500 (sp500)
+# alpha_bench's own overall budget. Fetching ~300 (csi300) or ~500 (sp500)
 # names at 4 workers with up to 3 backoff retries each, then computing IC for
 # every alpha in a zoo, runs for many minutes on a cold cache — a normal
 # runtime that comfortably exceeds the tenant-wide tool timeout, which is why
@@ -706,7 +706,7 @@ def _default_output_dir() -> Path:
 
 def run_alpha_bench(**kwargs: Any) -> dict[str, Any]:
     """Run the bench and return a parsed envelope (dict, not JSON string)."""
-    # V1: own wall-clock budget, additionally clamped by the attempt's
+    # Own wall-clock budget, additionally clamped by the attempt's
     # remaining budget so the bench can never outlive its caller.
     from src.core.budget import cap_timeout
 
@@ -788,7 +788,7 @@ def run_alpha_bench(**kwargs: Any) -> dict[str, Any]:
     failures: list[dict[str, str]] = []
     not_run: list[str] = []
     for idx, aid in enumerate(alpha_ids):
-        # V1: stop STARTING alphas once the budget is spent. The reserve keeps
+        # Stop STARTING alphas once the budget is spent. The reserve keeps
         # enough time to render and write the report, so the caller gets the
         # partial IC table instead of nothing.
         if _budget_left() <= 0.0:

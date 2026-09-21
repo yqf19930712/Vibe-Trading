@@ -17,8 +17,8 @@ from src.security.scanner import with_security_warnings, wrap_external_content
 logger = logging.getLogger(__name__)
 
 _JINA_PREFIX = "https://r.jina.ai/"
-# (connect, read)：r.jina.ai 直连不可达时 30s 死等曾在单次调用里烧掉 90s
-# （2026-08-25 复盘 run #7/#10）——连接 5s 快败；读仍给 30s。
+# (connect, read)：连接 5s 快败、读 30s——r.jina.ai 不可达时 30s 的连接死等会在
+# 单次调用里烧掉 90s。
 _TIMEOUT = (5, 30)
 
 
@@ -136,10 +136,10 @@ def read_url(url: str, no_cache: bool = False) -> str:
         if _CACHED_MARKER in resp.text:
             result["cached"] = True
         result = with_security_warnings(result, fields=("content",))
-        # V2: declare the page body as untrusted DATA, mirroring what the
-        # recalled-memories block already does for stored content. Without
-        # this the page text sat bare in the trajectory while the scanner's
-        # verdict lived in a JSON field the model reads last, if at all.
+        # Declare the page body as untrusted DATA, mirroring what the
+        # recalled-memories block does for stored content. Otherwise the page
+        # text sits bare in the trajectory while the scanner's verdict lives
+        # in a JSON field the model reads last, if at all.
         result["content"] = wrap_external_content(
             result["content"],
             source=target_url,

@@ -37,7 +37,7 @@ FINAL_REPORT_CAP = 20_000
 # conclusion and the pointer is all that is left.
 MIN_SUMMARY_PREVIEW_CHARS = 250
 # How much of the payload the task-summary block may claim before the previews
-# start shrinking (a 12-agent preset at 800 chars each would otherwise spend
+# start shrinking (a 6-agent preset at 800 chars each would otherwise spend
 # the entire allowance on summaries and leave nothing for the final report).
 TASKS_BLOCK_TARGET_CHARS = 4_800
 # Fixed JSON scaffolding each serialized task costs at indent=2 (ids, status,
@@ -58,11 +58,11 @@ _WAIT_FLOOR_S = 60.0
 # the raw value on both sides and the two would otherwise expire in a dead heat.
 _LOOP_WATCHDOG_MARGIN_S = 120.0
 
-# F3 (batch F): code-level enforcement of the "salvage, don't re-run" rule the
-# system prompt only stated as prose. After a preset FAILS, an identical-preset
+# Code-level enforcement of the "salvage, don't re-run" rule the system prompt
+# states as prose. After a preset FAILS, an identical-preset
 # re-run within this window is refused with a structured rejection carrying the
 # failed run's completed-worker products — a systemic upstream issue would kill
-# the re-run too, burning tens of minutes for nothing (incident 2026-08-24).
+# the re-run too, burning tens of minutes for nothing.
 _FAILURE_COOLDOWN_SECONDS = 30 * 60
 # Caps for the salvage payload embedded in the rejection (keeps it prompt-sized).
 _SALVAGE_REPORT_MAX_CHARS = 4000
@@ -367,13 +367,11 @@ _PRESET_KEYWORDS: list[tuple[str, list[str], float]] = [
         ],
         0.9,
     ),
-    # V1: the four presets below shipped as YAML but had no keyword row, so
-    # they were unreachable — ``_PRESET_NAMES`` was derived from THIS table, so
-    # even an explicit ``preset_name="crypto_trading_desk"`` came back as
-    # "Unknown preset", and prose naming them silently scored onto a neighbour
-    # (「preset 用 macro_rates_fx_desk」 routed to macro_strategy_forum on the
-    # bare word "macro"). Their boosts sit ABOVE those neighbours because each
-    # is the more specific desk for its phrases.
+    # Every preset YAML needs a keyword row here: without one, prose naming
+    # the preset silently scores onto a neighbour (「preset 用 macro_rates_fx_desk」
+    # would route to macro_strategy_forum on the bare word "macro"). The four
+    # desks below have their boosts ABOVE those neighbours because each is the
+    # more specific desk for its phrases.
     (
         "macro_rates_fx_desk",
         [
@@ -467,13 +465,13 @@ _REVIEW_PERIOD_PATTERNS: list[tuple[str, list[str]]] = [
     ("quarterly", [r"\bquarter(?:ly)?\b", r"\bq[1-4]\b"]),
 ]
 
-# V1: the pattern tables below close a class of silent bugs where a variable
-# was hard-coded in ``_build_variables`` — commodity_research_team analysed
-# GOLD whatever the user asked about, crypto_research_lab always looked at
-# "BTC, ETH, SOL", derivatives always took a NEUTRAL view, factor research
-# always benched VALUE, the event desk always scanned "all types" and fund
-# selection always screened EQUITY funds. Each now reads the prompt first and
-# falls back to the old constant only when nothing matches; the presets that
+# The pattern tables below keep ``_build_variables`` from hard-coding a
+# variable — a constant subject means commodity_research_team analyses GOLD
+# whatever the user asked about, crypto_research_lab always looks at
+# "BTC, ETH, SOL", derivatives always take a NEUTRAL view, factor research
+# always benches VALUE, the event desk always scans "all types" and fund
+# selection always screens EQUITY funds. Each reads the prompt first and
+# falls back to the constant only when nothing matches; the presets that
 # most depended on it additionally receive ``{goal}`` (the user's own words)
 # so a miss degrades to "here is what was actually asked" rather than a
 # confidently wrong subject.
@@ -1055,9 +1053,9 @@ def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
         "sector_rotation_team": {"market": market, "goal": g},
         "portfolio_review_board": {"portfolio": g, "review_period": _extract_review_period(prompt), "goal": g},
         "ml_quant_lab": {"market": market, "target_variable": _extract_target_variable(prompt), "goal": g},
-        # V1: the four presets below had YAMLs but no builder row, so even once
-        # reachable they would have fallen through to the {market, goal}
-        # default and left their own template variables unsubstituted.
+        # Every preset needs its own builder row: one that falls through to the
+        # {market, goal} default leaves its own template variables
+        # unsubstituted.
         "macro_rates_fx_desk": {"goal": g, "timeframe": _extract_timeframe(prompt, "quarterly")},
         "earnings_research_desk": {"target": g},
         "global_equities_desk": {"goal": g, "risk_tolerance": risk},
@@ -1223,9 +1221,9 @@ class SwarmTool(BaseTool):
         """Report swarm worker token totals through the same ``llm_usage``
         event channel the main loop uses. Without this the caller's billing /
         daily-quota accounting only ever saw main-loop usage — swarm-heavy
-        attempts under-reported by orders of magnitude (incident 2026-08-25:
-        run #8 recorded 21k output tokens while its two swarm runs burned
-        hundreds of thousands)."""
+        attempts would under-report by orders of magnitude (an attempt
+        recording 21k output tokens while its two swarm runs burn hundreds
+        of thousands)."""
         tin = int(getattr(run_obj, "total_input_tokens", 0) or 0)
         tout = int(getattr(run_obj, "total_output_tokens", 0) or 0)
         if tin <= 0 and tout <= 0:
@@ -1260,7 +1258,7 @@ class SwarmTool(BaseTool):
         Returns:
             JSON string with status, preset, variables, final_report, tasks, token_usage.
         """
-        # V1: resume takes precedence — a caller holding a run_id wants MORE
+        # Resume takes precedence — a caller holding a run_id wants MORE
         # waiting on that run, never a second run.
         resume_run_id = str(kwargs.get("run_id") or "").strip()
         if resume_run_id:
@@ -1454,12 +1452,12 @@ class SwarmTool(BaseTool):
         Returns:
             JSON result string (terminal result, wait_budget_exhausted, or error).
         """
-        # Cap the wait by the attempt's remaining wall-clock budget (batch 3):
-        # a swarm wait must never outlive the caller's own deadline — keep a
-        # reserve so the main loop can still turn partial results into an answer.
-        # V1: the loop's own watchdog now sits OUTSIDE this (see
-        # ``SwarmTool.timeout_seconds``), so this is the wait that actually
-        # expires first and the salvage return below is reachable again.
+        # Cap the wait by the attempt's remaining wall-clock budget: a swarm
+        # wait must never outlive the caller's own deadline — keep a reserve so
+        # the main loop can still turn partial results into an answer. The
+        # loop's own watchdog sits OUTSIDE this (see ``SwarmTool.timeout_seconds``),
+        # so this is the wait that expires first and the salvage return below
+        # is reachable.
         from src.core.budget import cap_timeout
         from src.core.cancel import sleep_unless_cancelled
         from src.swarm.runtime import register_session_run
@@ -1527,8 +1525,8 @@ class SwarmTool(BaseTool):
         # Wait budget elapsed but the run is still in flight. Do NOT cancel —
         # the daemon thread keeps working and the agent can decide to wait
         # more (re-invoke with the returned run_id) or hand off partial state
-        # to the user. Cancelling here used to throw away minutes of LLM cost
-        # whenever a preset legitimately ran past the budget.
+        # to the user. Cancelling here would throw away minutes of LLM cost
+        # whenever a preset legitimately runs past the budget.
         loaded = store.load_run(run_id)
         if loaded is not None:
             record(
@@ -1631,12 +1629,11 @@ def _format_result(
 ) -> str:
     """Format a SwarmRun into a JSON result string.
 
-    V2 budget: this payload is what the main loop injects back into its
-    trajectory, and it used to be ``final_report`` plus EVERY task's whole
-    report.md. A multi-worker preset routinely produced tens of KB, which the
-    loop then clipped at 10k characters — mid-JSON, so the model received an
-    unparseable document with the later tasks silently gone. Each summary is
-    now an 800-character preview with a ``report_path`` pointer and the final
+    Budget: this payload is what the main loop injects back into its
+    trajectory. ``final_report`` plus EVERY task's whole report.md would run
+    to tens of KB for a multi-worker preset, and the loop's 10k clip would
+    then land mid-JSON — an unparseable document with the later tasks silently
+    gone. Each summary is therefore an 800-character preview with a ``report_path`` pointer and the final
     report is capped, so the return is natively valid JSON well under the
     limit. The full text is on disk and the model has ``read_file`` (book
     §2.7.6: isolate, then return conclusions plus a pointer).
@@ -1701,10 +1698,10 @@ def _format_result(
         "run_id": run.id,
         "preset": preset,
         "auto_variables": variables,
-        # V1: routing confidence next to the variables it produced. 99.0 = the
+        # Routing confidence next to the variables it produced. 99.0 = the
         # preset was named outright; a low positive score = a weak keyword
         # match; 0.0 = nothing matched and this is the equity_research_team
-        # fallback. Previously indistinguishable from a confident route.
+        # fallback (otherwise indistinguishable from a confident route).
         "preset_score": preset_score,
         # Filled in below, once everything else has been measured.
         "final_report": "",

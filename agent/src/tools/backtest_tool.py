@@ -78,7 +78,15 @@ class BacktestTool(BaseTool):
     """Backtest execution tool."""
 
     name = "backtest"
-    description = "Run backtest: validate config.json + signal_engine.py, invoke built-in engine."
+    description = (
+        "Run backtest: validate config.json + code/signal_engine.py in run_dir "
+        "and invoke the built-in engine in a time-limited subprocess. Call it "
+        "after write_file has produced both files (config.json needs a 'source' "
+        "field). Returns {status, exit_code, stdout, stderr (tails), artifacts: "
+        "{name: path}, run_dir}; status:'error' when a file is missing or "
+        "invalid, or the engine exits non-zero — read stderr and fix the "
+        "strategy before retrying."
+    )
     parameters = {
         "type": "object",
         "properties": {

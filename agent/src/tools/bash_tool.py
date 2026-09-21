@@ -22,9 +22,8 @@ from src.tools.subprocess_env import _subprocess_env
 _OUTPUT_HARD_CAP = 1_000_000
 _HARD_CAP_HEAD = 800_000
 _HARD_CAP_TAIL = 200_000
-# V1: was a bare hard-coded 120 with no way to tune it and no relationship to
-# the tenant's own budget. Now configurable, and clamped per call by the
-# attempt's remaining budget (``_effective_timeout``) so bash always returns
+# Configurable (a bare hard-coded value has no relationship to the tenant's
+# own budget), and clamped per call by the attempt's remaining budget (``_effective_timeout``) so bash always returns
 # its own actionable "use background_run" error BEFORE the loop's write-tool
 # watchdog abandons the call with a generic one.
 _DEFAULT_TIMEOUT = float(os.getenv("VIBE_BASH_TIMEOUT_S", "120"))
@@ -151,7 +150,7 @@ class BashTool(BaseTool):
                 command,
                 shell=True,
                 cwd=cwd,
-                # Allowlisted env only (P0 2026-09-04): the engine process
+                # Allowlisted env only: the engine process
                 # env carries tenant-shared LLM/data-source credentials.
                 env=_subprocess_env(),
                 stdout=subprocess.PIPE,

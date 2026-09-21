@@ -355,7 +355,7 @@ _ENV_CANDIDATES = [
 
 # Index-aligned with _ENV_CANDIDATES. CWE-209: never log the absolute
 # .env path (it leaks the OS username / home / CWD). The label names
-# which slot won - the entire P08 R1 signal - using compile-time
+# which slot won using compile-time
 # constants only.
 _ENV_LABELS = ("~/.vibe-trading/.env", "<AGENT_DIR>/.env", "<CWD>/.env")
 
@@ -535,7 +535,7 @@ def _ensure_dotenv() -> None:
             loaded = candidate
             break
     _dotenv_loaded = True
-    # P08 R1: one-time, behavior-preserving diagnostic so a stale or
+    # One-time, behavior-preserving diagnostic so a stale or
     # shadowed .env is observable instead of costing hours. The path is
     # redacted to a symbolic slot label and the API key is never logged.
     logger.info(
@@ -559,9 +559,9 @@ def _normalize_ollama_base_url(base_url: str) -> str:
 
 # Prompt-caching breakpoint marker (Anthropic native channel only). Applied
 # at request-payload level: system tail, tools tail, and the newest stable
-# message. Meaningful because the system prompt is now byte-stable across
-# iterations and microcompact no longer rewrites the trajectory middle every
-# turn (context-engineering batch E).
+# message. Meaningful because the system prompt is byte-stable across
+# iterations and microcompact does not rewrite the trajectory middle every
+# turn.
 _ANTHROPIC_CACHE_CONTROL = {"type": "ephemeral"}
 
 # Content-block types that accept cache_control (thinking blocks do not).
@@ -654,10 +654,10 @@ def _apply_anthropic_cache_breakpoints(payload: dict) -> None:
 def _build_native_anthropic(model: str, callbacks: Any = None) -> Any:
     """Build a native Anthropic Messages API client (LANGCHAIN_PROVIDER=anthropic).
 
-    Motivation (2026-08-26): the OpenAI-compat conversion path swallowed
-    Anthropic's SSE pings — long opus thinking left the stream byte-silent for
-    minutes and stateful middleboxes reaped the "idle" connection (clean
-    truncation incidents fc2710/5d3bea33). The native ``/v1/messages`` channel
+    Motivation: the OpenAI-compat conversion path swallows Anthropic's SSE
+    pings — long opus thinking leaves the stream byte-silent for minutes and
+    stateful middleboxes reap the "idle" connection as a clean truncation. The
+    native ``/v1/messages`` channel
     forwards pings end-to-end and has typed stream events, removing two
     protocol conversion layers.
 

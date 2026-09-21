@@ -212,7 +212,7 @@ class ContextBuilder:
                 if recalls:
                     lines = [f"- **{r.title}** ({r.memory_type}): {r.body[:500]}" for r in recalls]
                     recall_block = "\n".join(lines)
-                    # F7②: recalled bodies are DATA (possibly distilled from
+                    # Recalled bodies are DATA (possibly distilled from
                     # external content) — declare them non-instructional so an
                     # injected imperative inside a stored memory does not read
                     # as a directive.
@@ -238,7 +238,7 @@ class ContextBuilder:
         The full description + per-parameter schema of every tool is already
         sent to the API in the ``tools`` payload on every call — repeating it
         here duplicated thousands of tokens in the system prompt for zero
-        information gain (E5). The prompt only needs a compact index: tool
+        information gain. The prompt only needs a compact index: tool
         name + first sentence of its description.
         """
         lines = []

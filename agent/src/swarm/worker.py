@@ -69,10 +69,10 @@ def _stream_retry_delay_s() -> float:
 def _stream_retries() -> int:
     """Resolve the in-place stream retry count, robust to garbage.
 
-    Incident 2026-08-24: the upstream proxy dropped opus streams in bursts
-    (ReadTimeout / RemoteProtocolError) — a single immediate retry landed
-    inside the same burst and the whole task failed at iteration 10+,
-    discarding all progress. Multiple backoff retries ride out the burst
+    Upstream proxies drop long opus streams in bursts (ReadTimeout /
+    RemoteProtocolError) — a single immediate retry lands inside the same
+    burst and the whole task fails at iteration 10+, discarding all progress.
+    Multiple backoff retries ride out the burst
     without resetting the ReAct loop.
 
     Returns:
@@ -182,8 +182,8 @@ def _estimate_tokens(
     # Fallback: provider didn't return usage_metadata. Estimate from
     # serialized message length and response content length using the
     # character-class weighted heuristic (ASCII /4, CJK ×0.6, other /3 — see
-    # src.core.token_estimate), so CJK-heavy prompts are no longer
-    # under-counted 2-3x.
+    # src.core.token_estimate), so CJK-heavy prompts are not under-counted
+    # 2-3x.
     try:
         input_tokens = estimate_messages_tokens(messages, count_reasoning=count_reasoning)
     except Exception:
@@ -261,7 +261,7 @@ def build_worker_prompt(
     # leave the worker with no guardrail and it cheerfully cites training-data
     # prices and sector weights. This block applies the rule unconditionally
     # — including to aggregator / synthesis agents that have no data tools
-    # and previously had no instruction against inventing numbers.
+    # and would otherwise have no instruction against inventing numbers.
     prompt_parts.append(
         "## Data Citation Discipline (HARD RULE)\n\n"
         "Every specific number you cite in your output — prices, percentages, "
@@ -431,9 +431,9 @@ def run_worker(
     # names. Same placeholder semantics — a bare "[cleared]" once made a
     # model retract real fetched numbers as hallucinations.
     #
-    # V2 also borrows the loop's tool watchdog (``invoke_tool_guarded``): the
-    # worker used to call ``registry.execute`` inline, so a tool hanging inside
-    # an iteration blocked forever — the worker only checks its own deadline at
+    # The worker also borrows the loop's tool watchdog (``invoke_tool_guarded``):
+    # calling ``registry.execute`` inline would block forever on a tool hanging
+    # inside an iteration — the worker only checks its own deadline at
     # iteration boundaries, and the layer deadline in runtime.py then needs
     # ``layer_budget + 60s`` to notice.
     from src.agent.loop import (
@@ -779,7 +779,7 @@ def run_worker(
             tc_start = time.monotonic()
             args = {**tc.arguments, "run_dir": str(artifact_dir)}
 
-            # V2: the guard supplies the heartbeat (the events.jsonl tail keeps
+            # The guard supplies the heartbeat (the events.jsonl tail keeps
             # a fresh timestamp so the stale-run reaper can tell a hung tool
             # apart from a dead host), the hard per-tool timeout, and the
             # budget clamp — the same code path the main loop uses.
@@ -826,14 +826,14 @@ def run_worker(
             total_tool_ms += int(tc_elapsed * 1000)
             _emit(
                 event_callback, "tool_result", agent_id, task_id,
-                # V2: was hardcoded "ok", so the swarm observability panel
-                # reported a 0% worker tool error rate no matter what.
+                # Real status (a hardcoded "ok" would make the swarm
+                # observability panel report a 0% worker tool error rate).
                 {"tool": tc.name, "elapsed_ms": int(tc_elapsed * 1000),
                  "status": "error" if is_error else "ok", "iteration": iteration,
                   "result_preview": _preview_tool_result(result),
                  **mcp_meta},
             )
-            # V2: oversized results are written to the worker's artifact dir
+            # Oversized results are written to the worker's artifact dir
             # and replaced by an explicit preview + on-disk pointer instead of
             # a silent [:10_000] cut (the worker has read_file).
             payload, _offload_failed = prepare_for_context(

@@ -79,12 +79,11 @@ TOKEN_THRESHOLD = int(os.getenv("TOKEN_THRESHOLD", "40000"))
 # budget instead of a fixed count.
 MICROCOMPACT_TRIGGER_RATIO = 0.5   # prune only when > TOKEN_THRESHOLD * ratio
 MICROCOMPACT_KEEP_BUDGET_RATIO = 0.25  # keep newest tool results up to this budget
-# V2 hysteresis. With a single trigger line, every iteration past it recomputed
-# the keep set and the newest results pushed one or two older ones out of the
-# budget — so the middle of the trajectory changed EVERY turn and the provider
-# prompt cache rebuilt from that diff point each time (batch E fixed the
-# unconditional per-turn prune, but reintroduced a slow one above the line).
-# Now: crossing the trigger arms the layer and cuts once, deeper; the layer
+# Hysteresis. With a single trigger line, every iteration past it would
+# recompute the keep set and the newest results push one or two older ones out
+# of the budget — the middle of the trajectory then changes EVERY turn and the
+# provider prompt cache rebuilds from that diff point each time.
+# Instead: crossing the trigger arms the layer and cuts once, deeper; the layer
 # stays armed (still cutting to the deep water mark) until the estimate falls
 # back below the release line, at which point the trajectory is left alone for
 # many turns and the cache stays hot. Book §2.7.3 "compact in batches near the
@@ -100,14 +99,14 @@ KEEP_RECENT = 3  # hard floor: newest N tool results are always kept intact
 # the live-price sources every cited number must trace back to). Layer 2/3
 # can still fold/summarize them when the context truly overflows.
 #
-# V2: the set itself now lives in ``src.agent.context_policy`` so Layer 2 obeys
-# it too (it used to fold the middle out of exactly these results). This name
+# The set itself lives in ``src.agent.context_policy`` so Layer 2 obeys it too
+# (otherwise it would fold the middle out of exactly these results). This name
 # is kept as an alias for existing call sites and tests.
 MICROCOMPACT_PROTECTED_TOOLS = PROTECTED_TOOLS
-# Re-exported for callers that knew this constant as a loop-module name before
-# V2 moved it (and the offload path that enforces it) into tool_result_store.
+# Re-exported for callers that know this constant as a loop-module name; it
+# (and the offload path that enforces it) lives in tool_result_store.
 __all_reexports__ = ("TOOL_RESULT_LIMIT",)
-# F1 (batch F): successful results from these tools are kept (raw) for the
+# Successful results from these tools are kept (raw) for the
 # zero-LLM finalization verification — the final answer's price claims are
 # cross-checked against what the run actually fetched (see src/agent/verify.py).
 VERIFY_GROUNDING_TOOLS = frozenset({"get_market_data", "get_realtime_quotes"})
@@ -118,54 +117,52 @@ STREAM_RETRY_DELAY_S = float(os.getenv("VT_STREAM_RETRY_DELAY_S", "2.0"))
 # In-place retries after the initial attempt (N+1 attempts total, exponential
 # backoff base×4^i capped at 60s). Same rationale as the swarm worker: upstream
 # proxies drop long opus streams in bursts; a single immediate retry lands
-# inside the same burst and kills the whole attempt (incident 2026-08-24).
+# inside the same burst and kills the whole attempt.
 STREAM_RETRIES = max(0, int(os.getenv("VT_STREAM_RETRIES", "3")))
 STREAM_RETRY_MAX_DELAY_S = 60.0
 TOOL_TIMEOUT_SECONDS = float(os.getenv("VIBE_TRADING_TOOL_TIMEOUT_SECONDS", "1800"))
-# F2 (batch F): write tools used to be "never killed" — the watchdog warned once
-# past the timeout and then waited forever, so one hung write tool ate the whole
-# attempt budget and defeated the FINALIZE_RESERVE partial-answer path. They now
-# get a grace window of this factor × the per-call (budget-capped) timeout:
+# Write tools are not "never killed": a watchdog that only warns and then waits
+# forever lets one hung write tool eat the whole attempt budget and defeat the
+# FINALIZE_RESERVE partial-answer path. They get a grace window of this factor × the per-call (budget-capped) timeout:
 # warn at 1×, abandon waiting at 2×. Abandoning marks the run degraded, returns
 # a structured timeout error to the model, and discards the late result via the
 # same queue mechanism the readonly path uses (the worker thread may still
 # finish its side effect in the background — that is announced in the error).
 #
-# V1: the base of that 1×/2× window is per-tool (``_tool_timeout``), not the
-# tenant-wide constant. Pinning it to TOOL_TIMEOUT_SECONDS made the watchdog
-# fire at 600s on a run_swarm whose own wait budget is 7200s, so the two-hour
-# swarm tier was unreachable and the ``wait_budget_exhausted`` salvage path
-# (which is what carries the run_id back) never executed.
+# The base of that 1×/2× window is per-tool (``_tool_timeout``), not the
+# tenant-wide constant: pinned to TOOL_TIMEOUT_SECONDS the watchdog would fire
+# at 600s on a run_swarm whose own wait budget is 7200s, making the two-hour
+# swarm tier unreachable and the ``wait_budget_exhausted`` salvage path (which
+# is what carries the run_id back) dead code.
 WRITE_TOOL_TIMEOUT_FACTOR = 2.0
-# Batch 3: when an attempt deadline is bound, force the final text answer once
+# When an attempt deadline is bound, force the final text answer once
 # less than this many seconds (or ~1.2 avg iterations) remain — a partial
 # answer beats the caller timing out on nothing.
 FINALIZE_RESERVE_S = float(os.getenv("VIBE_FINALIZE_RESERVE_S", "60"))
-# V1: seconds held back when clamping a tool timeout to the attempt budget.
-# Keep at least as much back as the forced-finalize path needs — the literal
-# 45.0 used before was 15s SHORT of FINALIZE_RESERVE_S's default, so abandoning
-# a tool could leave the loop with less time than the forced-finalize path
-# requires and the "a partial answer beats a timeout" guarantee became nominal.
+# Seconds held back when clamping a tool timeout to the attempt budget. Keep
+# at least as much back as the forced-finalize path needs — a reserve shorter
+# than FINALIZE_RESERVE_S lets abandoning a tool leave the loop with less time
+# than the forced-finalize path requires, and the "a partial answer beats a
+# timeout" guarantee becomes nominal.
 _TOOL_CAP_RESERVE_S = max(45.0, FINALIZE_RESERVE_S)
 # Minimum window a tool gets even on a nearly-spent budget, so a late call
-# still gets one quick shot instead of an instant failure (batch 3 semantics,
-# unchanged). Promoted from call-site literals to named constants in V1 so the
-# nesting/clamp regressions can scale them, and so the overshoot they permit
+# still gets one quick shot instead of an instant failure. Named constants so
+# the nesting/clamp regressions can scale them, and so the overshoot they permit
 # (up to floor + grace floor past the deadline) is visible in one place.
 _TOOL_CAP_FLOOR_S = 10.0
 _TOOL_GRACE_FLOOR_S = 5.0
 GOAL_MAX_CONTINUATIONS = int(os.getenv("VIBE_TRADING_GOAL_MAX_CONTINUATIONS", "3"))
-# V2: consecutive failures of the SAME (tool, args) pair before the call is
+# Consecutive failures of the SAME (tool, args) pair before the call is
 # refused outright. Keyed identically to the duplicate guard, which only ever
 # registered successes — so a dead upstream could burn 40+ iterations of LLM
 # spend before max_iterations stopped it.
 TOOL_CIRCUIT_FAILURE_LIMIT = max(
     1, int(os.getenv("VIBE_TOOL_CIRCUIT_FAILURE_LIMIT", "3"))
 )
-# V2: in-place retries for a stream that SUCCEEDS but returns neither text nor
+# In-place retries for a stream that SUCCEEDS but returns neither text nor
 # tool calls (relay truncation, upstream degraded empty turn). The transport
-# layer already retries; this degenerate provider response used to fail a
-# possibly hour-long attempt without a single retry.
+# layer only retries transport failures; without this a degenerate provider
+# response would fail a possibly hour-long attempt without a single retry.
 EMPTY_RESPONSE_RETRIES = max(0, int(os.getenv("VIBE_EMPTY_RESPONSE_RETRIES", "1")))
 _EMPTY_RESPONSE_NUDGE = (
     "[SYSTEM] Your previous turn returned no content and no tool calls. "
@@ -354,9 +351,9 @@ def estimate_tokens(messages: list, *, count_reasoning: bool = False) -> int:
 
 # Placeholder for pruned tool results. MUST tell the model the data was
 # dropped and can be re-fetched — the bare "[cleared]" marker plus the
-# name-level duplicate guard once dead-locked an attempt into retracting
-# REAL numbers as hallucinations (dea1222743ef, 2026-08-25: result pruned,
-# every re-fetch refused with "already succeeded").
+# name-level duplicate guard can dead-lock an attempt into retracting REAL
+# numbers as hallucinations (result pruned, every re-fetch refused with
+# "already succeeded").
 # Aliased from context_policy (the shared marker registry) so the duplicate
 # guard's "was this result pruned?" test and Layer 2's skip rule can never
 # disagree about what a cleared placeholder looks like.
@@ -457,11 +454,10 @@ def _microcompact(
             msg["content"] = _CLEARED_PLACEHOLDER
 
 
-# Dynamic status bar (E2). The system prompt used to embed a minute-level
-# timestamp and the WorkspaceMemory "## State" block — both changed between
-# turns, so the very first bytes of the context diverged every iteration and
-# the provider prompt cache never hit. That dynamic information now rides a
-# single ephemeral ``<agent_status>`` user message appended to the END of the
+# Dynamic status bar. A minute-level timestamp or the WorkspaceMemory "## State"
+# block embedded in the system prompt changes between turns, so the very first
+# bytes of the context diverge every iteration and the provider prompt cache
+# never hits. That dynamic information instead rides a single ephemeral ``<agent_status>`` user message appended to the END of the
 # trajectory each iteration (the previous one is removed first — "use and
 # discard"), together with any budget / wrap-up nudge lines. The system
 # prompt itself is byte-stable for the whole session.
@@ -514,11 +510,10 @@ def _context_collapse(messages: list) -> None:
     Preserves head + tail of large text, collapses the middle.
     Zero API cost — pure string operation.
 
-    V2: which messages may be folded, and how hard, comes from
+    Which messages may be folded, and how hard, comes from
     ``src.agent.context_policy`` — the single rule source Layers 1 and 3 also
-    read. Before that this loop folded anything over 2400 chars outside the
-    last six messages, which meant it cut the middle out of the grounding
-    results Layer 1 refuses to prune and out of the Layer 3 handoff summary.
+    read, so this layer never cuts the middle out of the grounding results
+    Layer 1 refuses to prune or out of the Layer 3 handoff summary.
 
     Args:
         messages: Message list (mutated in place).
@@ -786,7 +781,7 @@ def tool_timeout_for(registry: Any, tool_name: str) -> float | None:
     Defaults to the tenant-wide ``TOOL_TIMEOUT_SECONDS``. A tool whose NORMAL
     runtime legitimately exceeds it declares ``timeout_seconds``
     (``run_swarm``: SWARM_TIMEOUT + margin). The declaration only RAISES the
-    base of the F2 1x-warn / 2x-abandon window, never lowers it, and the
+    base of the 1x-warn / 2x-abandon window, never lowers it, and the
     attempt budget still clamps the result via ``cap_timeout`` at the call
     site — so a hung tool can never outlive the caller's deadline regardless
     of what it declares.
@@ -853,12 +848,11 @@ def invoke_tool_guarded(
 ) -> tuple[str, int]:
     """Run one tool under the watchdog: thread + timeout + heartbeat + progress.
 
-    Extracted from ``AgentLoop._invoke_tool`` in V2 so the swarm worker runs
-    its tools through the SAME guard. The worker used to call
-    ``registry.execute`` inline, so a tool that hung inside an iteration
-    blocked forever — the worker only checked its deadline at iteration
-    boundaries, and the layer-level deadline in ``swarm/runtime.py`` then had
-    to wait ``layer_budget + 60s`` to notice.
+    Shared with the swarm worker so it runs its tools through the SAME guard:
+    a worker calling ``registry.execute`` inline would block forever on a tool
+    that hangs inside an iteration — it only checks its deadline at iteration
+    boundaries, and the layer-level deadline in ``swarm/runtime.py`` would
+    then need ``layer_budget + 60s`` to notice.
 
     Semantics are unchanged from the main loop: a readonly tool that overruns
     is abandoned immediately with a structured ``tool_timeout``; a write tool
@@ -878,8 +872,8 @@ def invoke_tool_guarded(
         cancel_event: Attempt-level cancel signal (defaults to the one bound
             in :mod:`src.core.cancel`). While set, the wait on the worker
             thread is abandoned within ``CANCEL_POLL_S`` and a structured
-            ``cancelled`` result is returned — a cancel no longer has to wait
-            for a 30-minute tool to come back on its own (P1 2026-09-04).
+            ``cancelled`` result is returned — a cancel does not have to wait
+            for a 30-minute tool to come back on its own.
 
     Returns:
         Tuple of (result_str, elapsed_ms).
@@ -1155,8 +1149,8 @@ class AgentLoop:
         self._event_callback = event_callback
         self.max_iterations = max_iterations
         # call_key -> the appended tool-result message dict. Keyed by
-        # (name, args) — a name-level guard once refused every follow-up
-        # get_market_data with different symbols (dea1222743ef). The message
+        # (name, args) — a name-level guard would refuse every follow-up
+        # get_market_data with different symbols. The message
         # ref lets the guard see whether _microcompact pruned the result:
         # a pruned result means the model no longer has the data, so an
         # identical re-fetch must be allowed through.
@@ -1166,11 +1160,11 @@ class AgentLoop:
         self._persistent_memory = persistent_memory
         self._run_iteration: int = 0
         self._stats: Dict[str, Any] = _new_run_stats()
-        # (tool_name, raw_result) pairs feeding the finalization verifier (F1).
+        # (tool_name, raw_result) pairs feeding the finalization verifier.
         self._grounding_results: List[tuple[str, str]] = []
-        # V2: Layer 1 hysteresis state (armed flag), carried across iterations.
+        # Layer 1 hysteresis state (armed flag), carried across iterations.
         self._microcompact_state: Dict[str, Any] = {}
-        # V2 circuit breaker: call_key -> consecutive failure count. Keyed the
+        # Circuit breaker: call_key -> consecutive failure count. Keyed the
         # same way as the duplicate guard, which only ever registered SUCCESSES
         # — so an identical failing call could repeat until the iteration cap.
         self._consecutive_failures: Dict[str, int] = {}
@@ -1217,7 +1211,7 @@ class AgentLoop:
         _cancel.bind_cancel_event(self._cancel_event)
         self._called_ok = {}
         self._session_id = session_id or ""
-        # V2: resume Layer 5 from the session's stored handoff summary instead
+        # Resume Layer 5 from the session's stored handoff summary instead
         # of restarting from zero. The next compaction then takes the iterative
         # update path, so decisions and constraints compressed away in an
         # earlier attempt are inherited rather than lost (no extra LLM call).
@@ -1352,7 +1346,7 @@ class AgentLoop:
 
                 logger.info(f"ReAct iteration {iteration}/{self.max_iterations}")
 
-                # Per-iteration status bar (E2): time + State counters live at
+                # Per-iteration status bar: time + State counters live at
                 # the trajectory tail, keeping the system prompt byte-stable.
                 # Budget / wrap-up nudges fold into the same message and are
                 # recomputed while their condition holds (the bar is replaced
@@ -1669,7 +1663,7 @@ class AgentLoop:
                             "provider": os.getenv("LANGCHAIN_PROVIDER", "openai"),
                             "model": getattr(self.llm, "model_name", None) or os.getenv("LANGCHAIN_MODEL_NAME", ""),
                         }
-                        # V2: one in-place retry with an explicit nudge before
+                        # One in-place retry with an explicit nudge before
                         # writing off the attempt. The stream SUCCEEDED — this
                         # is a degraded provider turn, not a transport failure,
                         # so the STREAM_RETRIES path above never covered it.
@@ -1835,9 +1829,9 @@ class AgentLoop:
                 "max_iterations": self.max_iterations,
             }
 
-        # V2 (P2-11): tidy the long-term memory index at run end when it nears
-        # its cap, instead of waiting for the model to act on the F7① "index is
-        # full" warning itself. Runs here, after the trajectory is finished, so
+        # Tidy the long-term memory index at run end when it nears its cap,
+        # instead of waiting for the model to act on the "index is full"
+        # warning itself. Runs here, after the trajectory is finished, so
         # the session-start snapshot frozen into the system prompt is never
         # churned mid-run. Best effort — it never affects the result.
         if self._persistent_memory is not None:
@@ -1984,8 +1978,8 @@ class AgentLoop:
         if self._stats.get("verify_warnings"):
             stats["verify_warnings"] = self._stats["verify_warnings"]
         # Degradation counters (only present when non-zero): L3 summary call
-        # failures and oversized-result offload failures. Both were counted
-        # into _stats but never emitted (P1 2026-09-04).
+        # failures and oversized-result offload failures; counted into _stats
+        # and emitted here.
         for counter in ("compact_failures", "offload_failures"):
             if self._stats.get(counter):
                 stats[counter] = int(self._stats[counter])
@@ -2314,8 +2308,8 @@ class AgentLoop:
 
         Thin wrapper over :func:`invoke_tool_guarded`: resolves the per-tool
         timeout, clamps it to the attempt budget, and wires the loop's event
-        sink. The guard body is shared with the swarm worker (V2) so the two
-        can no longer drift on timeout / heartbeat / budget-clamp semantics.
+        sink. The guard body is shared with the swarm worker so the two
+        cannot drift on timeout / heartbeat / budget-clamp semantics.
 
         Args:
             tool_name: Tool name to execute.
@@ -2326,7 +2320,7 @@ class AgentLoop:
         """
         timeout = self._tool_timeout(tool_name)
         if timeout is not None:
-            # Never let a single tool outlive the attempt budget (batch 3):
+            # Never let a single tool outlive the attempt budget:
             # keep a reserve so the loop can still produce a final answer.
             timeout = _budget.cap_timeout(
                 timeout, reserve_s=_TOOL_CAP_RESERVE_S, floor_s=_TOOL_CAP_FLOOR_S
@@ -2352,7 +2346,7 @@ class AgentLoop:
         Defaults to the tenant-wide ``TOOL_TIMEOUT_SECONDS``. A tool whose
         NORMAL runtime legitimately exceeds it declares ``timeout_seconds``
         (``run_swarm``: SWARM_TIMEOUT + margin). The declaration only RAISES
-        the base of the F2 1×-warn / 2×-abandon window, never lowers it, and
+        the base of the 1×-warn / 2×-abandon window, never lowers it, and
         the attempt budget still clamps the result via ``cap_timeout`` at the
         call site — so a hung tool can never outlive the caller's deadline
         regardless of what it declares.
@@ -2400,7 +2394,7 @@ class AgentLoop:
         """
         self._update_memory(tc.name)
 
-        # P0 2026-09-04: scrub env-derived credential VALUES before the result
+        # Scrub env-derived credential VALUES before the result
         # reaches the trajectory, the trace or the grounding verifier. The
         # shell tools already scrub their own stdout; this covers every other
         # tool (read_file on a dumped .env, an MCP error echoing a header …).
@@ -2417,9 +2411,9 @@ class AgentLoop:
             tool_stats["errors"] += 1
 
         status = "ok" if success else "error"
-        # V2: oversized results go to disk and the model gets an EXPLICIT
+        # Oversized results go to disk and the model gets an EXPLICIT
         # preview envelope pointing at the file. The raw ``result`` is
-        # deliberately still what the success classifier, the F1 grounding
+        # deliberately still what the success classifier, the grounding
         # verifier and the trace consume — only the trajectory copy shrinks.
         payload, offload_failed = prepare_for_context(
             result,
@@ -2542,10 +2536,10 @@ class AgentLoop:
             prompt = _STRUCTURED_SUMMARY_PROMPT.format(focus_section=focus_section) + conv_text
 
         compact_t0 = _time.perf_counter()
-        # V2: compaction is a CORRECT mechanism — it must never be the thing
-        # that kills an otherwise healthy run. Before this guard, one provider
-        # hiccup on the summary call propagated to run()'s top-level except and
-        # failed the whole attempt. On failure we degrade to the zero-LLM
+        # Compaction is a CORRECT mechanism — it must never be the thing that
+        # kills an otherwise healthy run: without this guard one provider
+        # hiccup on the summary call would propagate to run()'s top-level
+        # except and fail the whole attempt. On failure we degrade to the zero-LLM
         # layers (L1/L2 already ran this iteration) and leave the trajectory
         # untouched; the next iteration retries compaction.
         try:
@@ -2570,7 +2564,7 @@ class AgentLoop:
             logger.warning("Auto compact produced an empty summary; skipping rebuild")
             return
         self._previous_summary = summary
-        # V2: persist the moment it exists, not at run end — the attempt that
+        # Persist the moment it exists, not at run end — the attempt that
         # times out or crashes is exactly the one whose summary the NEXT
         # attempt needs. See src/session/handoff.py.
         handoff.save(self._session_id, summary, attempt_iter=iteration)
@@ -2609,7 +2603,7 @@ class AgentLoop:
         # Fix orphaned tool pairs in the reconstructed message list
         _fix_tool_pairs(messages)
 
-        # P1 2026-09-04: the duplicate-call guard keys on the tool-result
+        # The duplicate-call guard keys on the tool-result
         # message OBJECT. Results compressed into the summary are gone from
         # the trajectory, so an identical re-fetch must be allowed again —
         # otherwise the model is told "use the result above" about data it

@@ -307,11 +307,11 @@ class SessionService:
             if attempt.run_dir:
                 reply_metadata["run_id"] = Path(attempt.run_dir).name
             reply_metadata["status"] = attempt.status.value
-            # Machine-readable outcome (P1 2026-09-04): the router used to
-            # take ANY non-empty assistant message linked to the attempt as
-            # the answer, so "Execution failed: …" prose was forwarded to the
-            # user as if it were the research result. Keep the prose, add
-            # the flag; the router keys on it.
+            # Machine-readable outcome: without the flag the router would take
+            # ANY non-empty assistant message linked to the attempt as the
+            # answer, forwarding "Execution failed: …" prose to the user as if
+            # it were the research result. Keep the prose, add the flag; the
+            # router keys on it.
             reply_metadata["ok"] = attempt.status == AttemptStatus.COMPLETED
             if attempt.status != AttemptStatus.COMPLETED:
                 reply_metadata["error"] = attempt.error or "unknown error"
@@ -459,9 +459,9 @@ class SessionService:
             ),
         )
 
-        # Iteration ceiling is an env knob now (batch 3): the multi-tenant
-        # router hands laicai tenants 25 — the incident data showed 50 lets a
-        # single question grind for 15-19 minutes, past every outer budget.
+        # Iteration ceiling is an env knob: the multi-tenant router hands
+        # laicai tenants their tier (50, see ops/cube-router engine_env);
+        # wall-clock deadlines, not the iteration count, are the hard stop.
         try:
             max_iterations = max(1, int(os.getenv("VIBE_MAX_ITERATIONS", "50")))
         except ValueError:
@@ -473,9 +473,9 @@ class SessionService:
             max_iterations=max_iterations,
             persistent_memory=pm,
         )
-        # A second attempt on the same session used to silently overwrite
-        # the registry entry, orphaning the first loop: unreachable by
-        # cancel_current, still burning tokens (P1 2026-09-04).
+        # A second attempt on the same session must not silently overwrite
+        # the registry entry: that orphans the first loop — unreachable by
+        # cancel_current, still burning tokens.
         previous = self._active_loops.get(session_id)
         if previous is not None and previous is not agent:
             previous.cancel()
@@ -528,7 +528,7 @@ class SessionService:
         LLM can still see previous artifact paths and strategy content during
         iterative updates.
 
-        Two layers since V2:
+        Two layers:
 
         1. The session's stored handoff summary (produced by Layer 3 of a
            previous attempt) is prepended as background reference. Without it,

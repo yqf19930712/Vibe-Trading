@@ -33,16 +33,16 @@ FETCH_BUDGET_S = float(os.getenv("VIBE_TRADING_FETCH_BUDGET_S", "120"))
 
 _SOURCE_PATTERNS = [
     (re.compile(r"^\d{6}\.(SZ|SH|BJ)$", re.I), "tushare", "a_share"),
-    # US/HK primary = the chain head (tickflow / ifind, China-direct) — the
-    # 2026-08-25 reorder must apply to the PRIMARY pass too, not only the
-    # fallback walk (attempt f9b0c0cdcded still led with yfinance here).
+    # US/HK primary = the chain head (tickflow / ifind, China-direct): the
+    # chain order must apply to the PRIMARY pass too, not only the fallback
+    # walk, or the primary pass still leads with yfinance.
     (re.compile(r"^[A-Z]+\.US$", re.I), "tickflow", "us_equity"),
     (re.compile(r"^\d{3,5}\.HK$", re.I), "ifind", "hk_equity"),
     (re.compile(r"^[A-Z]+-USDT$", re.I), "okx", "crypto"),
     (re.compile(r"^[A-Z]+/USDT$", re.I), "ccxt", "crypto"),
-    # Yahoo-format and bare-US symbols (incident 2026-08-25): these used to
-    # fall through to the a_share default and walk a CN chain that can never
-    # serve them (runs #7/#8: CRML, GC=F, ^TNX, DX-Y.NYB, SPY, URA → 9 gaps).
+    # Yahoo-format and bare-US symbols: without these rows they fall through
+    # to the a_share default and walk a CN chain that can never serve them
+    # (CRML, GC=F, ^TNX, DX-Y.NYB, SPY, URA → all gaps).
     # Yahoo specials (futures/indices/odd tickers) stay yfinance-native; bare
     # plain tickers go to the chain head like .US. Bare-ticker pattern is
     # uppercase-only on purpose — normalized CN codes are digits and crypto
@@ -267,7 +267,7 @@ def fetch_market_data(
 ) -> dict[str, Any]:
     """Fetch normalized OHLCV data through the repository loader layer.
 
-    Reliability semantics (batch 2): a primary-source failure OR an empty
+    Reliability semantics: a primary-source failure OR an empty
     per-symbol result walks the market's ``FALLBACK_CHAINS`` until a source
     delivers or the chain/budget is exhausted; every attempt is accounted in
     the per-attempt fetch stats, and symbols nothing could serve are reported
@@ -278,7 +278,7 @@ def fetch_market_data(
 
     # Belt-and-braces for callers that bypass the registry's schema coercion
     # (gateway/MCP direct calls): stringified numerics/arrays must not blow up
-    # deep in cap_rows (attempt 052d98f52286: max_rows "0" → TypeError).
+    # deep in cap_rows (max_rows "0" → TypeError).
     if isinstance(max_rows, str):
         try:
             max_rows = int(max_rows.strip(), 10)

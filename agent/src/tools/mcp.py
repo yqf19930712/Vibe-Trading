@@ -30,10 +30,10 @@ from src.tools.subprocess_env import _subprocess_env
 
 logger = logging.getLogger(__name__)
 
-# F5: remote MCP results are third-party content. Unlike the in-house reader
-# tools (web_search / read_url / read_document), they used to reach the model
-# unbounded and unscanned. They now get a size cap and the same
-# prompt-injection warning layer the reader tools use.
+# Remote MCP results are third-party content: like the in-house reader tools
+# (web_search / read_url / read_document) they get a size cap and the same
+# prompt-injection warning layer, instead of reaching the model unbounded and
+# unscanned.
 _RESULT_CHAR_LIMIT = 50_000
 _STRING_FIELD_TRUNC = 20_000
 # Remote tool DESCRIPTIONS are untrusted third-party input too — they are

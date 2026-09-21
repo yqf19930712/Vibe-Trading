@@ -1,12 +1,10 @@
-"""Shared protection rules for the three context-compression layers (V2).
+"""Shared protection rules for the three context-compression layers.
 
 Layer 1 (``_microcompact``), Layer 2 (``_context_collapse``) and Layer 3
-(``_auto_compact``) each used to carry their own idea of "what may I touch":
-L1 had a private protected-tool set, L2 had a single ``startswith("[cleared")``
-check, L3 had none at all. The layers therefore contradicted each other — L2
-folded the middle out of the grounding results L1 explicitly refuses to prune,
-and folded the handoff summary L3 had just paid an LLM call to produce. Every
-"can this message be compressed, and how hard" decision now lives here.
+(``_auto_compact``) must agree on "what may I touch": a private per-layer rule
+set lets L2 fold the middle out of the grounding results L1 refuses to prune,
+or fold the handoff summary L3 has just paid an LLM call to produce. Every
+"can this message be compressed, and how hard" decision therefore lives here.
 
 Design note — graded rules, not boolean exemptions. Each message class gets
 its own fold parameters; only structural messages (already-folded

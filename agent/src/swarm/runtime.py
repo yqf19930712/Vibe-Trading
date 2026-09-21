@@ -56,8 +56,8 @@ logger = logging.getLogger(__name__)
 _RETRYABLE_WORKER_STATUSES = frozenset({"failed", "incomplete"})
 
 # Cap on a single upstream report injected into a downstream worker's system
-# prompt (V2). ``task_summaries`` holds the full report.md text, and an
-# editor/PM role with several upstreams used to concatenate all of them with no
+# prompt. ``task_summaries`` holds the full report.md text, and an editor/PM
+# role with several upstreams would otherwise concatenate all of them with no
 # budget at all. Workers have ``read_file``, so the pointer is enough.
 UPSTREAM_SUMMARY_MAX_CHARS = 8_000
 _UPSTREAM_HEAD_CHARS = 6_000
@@ -726,9 +726,9 @@ class SwarmRuntime:
                 )
 
                 # Build upstream summaries from input_from mapping.
-                # V2: each upstream report is capped — the value here is the
-                # full report.md text, and a multi-upstream role concatenated
-                # every one of them into its system prompt unbudgeted. Over the
+                # Each upstream report is capped — the value here is the full
+                # report.md text, and a multi-upstream role would otherwise
+                # concatenate every one of them into its system prompt. Over the
                 # cap the worker gets head + tail and the artifact path to
                 # read_file (book §2.7.6: return conclusions plus a pointer,
                 # not the whole document).
@@ -900,7 +900,7 @@ class SwarmRuntime:
                 cancel_event=cancel_event,
             )
             # Real per-task completion time. The layer barrier persists task
-            # status much later (all tasks used to share one completed_at).
+            # status much later (tasks must not share one completed_at).
             result = result.model_copy(
                 update={"finished_at": datetime.now(timezone.utc).isoformat()}
             )

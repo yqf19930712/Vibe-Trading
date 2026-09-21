@@ -30,7 +30,7 @@ class BaseTool(ABC):
     # The tool's own upper bound on a single call, in seconds.
     # None = use the loop's global VIBE_TRADING_TOOL_TIMEOUT_SECONDS.
     #
-    # This is NOT an exemption from the F2 write-tool watchdog: the loop still
+    # This is NOT an exemption from the write-tool watchdog: the loop still
     # clamps whatever is declared here by the attempt's remaining budget
     # (``cap_timeout``), so a hung tool can never outlive the caller's
     # deadline. The declaration only RAISES the base of the 1x-warn / 2x-abandon
@@ -77,10 +77,10 @@ def _coerce_params(schema: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, 
     """Best-effort coercion of LLM-emitted args toward the declared schema.
 
     OpenAI-compatible channels intermittently stringify argument values —
-    attempt 052d98f52286 sent ``max_rows: "0"`` and even a JSON-encoded
-    string for an array param (``codes: "[\\"CBRS.US\\"]"``), which blew up
+    e.g. ``max_rows: "0"`` or a JSON-encoded
+    string for an array param (``codes: "[\\"CBRS.US\\"]"``), which blows up
     deep inside the tool (``'<' not supported between str and int``) and
-    burned four identical retries. Coercion is lossless-only: values that
+    burns identical retries. Coercion is lossless-only: values that
     don't parse cleanly pass through unchanged so the tool's own validation
     still owns the final word.
     """

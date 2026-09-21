@@ -23,7 +23,7 @@ from src.security.scanner import with_security_warnings, wrap_external_content
 logger = logging.getLogger(__name__)
 
 # Free, no-key engines aggregated by ddgs, tried in order. A single engine
-# returning nothing or being rate-limited no longer fails the whole search.
+# returning nothing or being rate-limited does not fail the whole search.
 # Override (or pin to one engine) via VIBE_TRADING_SEARCH_BACKENDS.
 # ddgs 9.x dropped the google/bing backends (requesting them logs a warning
 # and shrinks the pool), and datacenter egress IPs get refused by individual
@@ -178,7 +178,7 @@ class WebSearchTool(BaseTool):
                 payload,
                 fields=("results.*.title", "results.*.snippet"),
             )
-            # V2: snippets are attacker-controlled text (anyone can put a
+            # Snippets are attacker-controlled text (anyone can put a
             # sentence on a page a search engine indexes). Declare each one as
             # untrusted DATA rather than pasting it bare into the trajectory.
             findings = payload.get("security_warnings")
@@ -201,10 +201,10 @@ class WebSearchTool(BaseTool):
             {
                 "status": "error",
                 "error": (
-                    # Only actions the MODEL can take belong here. The old text
-                    # told it to set VIBE_TRADING_SEARCH_BACKENDS (an operator
-                    # env var it cannot touch) and named google/bing, which
-                    # ddgs 9.x no longer has.
+                    # Only actions the MODEL can take belong here: not
+                    # VIBE_TRADING_SEARCH_BACKENDS (an operator env var it
+                    # cannot touch), and no engine names ddgs 9.x lacks
+                    # (google/bing).
                     f"Web search failed after {_MAX_ATTEMPTS} attempts "
                     f"(backends: {backends if supports_backend else 'duckduckgo'}): {last_error}. "
                     "Free search engines rate-limit aggressively from cloud/shared IPs — "

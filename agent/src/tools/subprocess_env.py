@@ -5,13 +5,13 @@ and MCP stdio servers, and ``backtest_subprocess_env()`` for the backtest
 Runner (the shell allowlist plus the data-source tokens and network plumbing
 the loaders read in that child).
 
-Why this exists (review 2026-09-04, P0): ``bash`` / ``background_run`` used
-to inherit the whole engine process env. In the multi-tenant deployment that
-env carries the SHARED builtin LLM credentials (``OPENAI_API_KEY`` /
+Why this exists: the engine process env in the multi-tenant deployment
+carries the SHARED builtin LLM credentials (``OPENAI_API_KEY`` /
 ``ANTHROPIC_*``), the data-source tokens (``TUSHARE_TOKEN``, ``JINA_API_KEY``,
 ``IFIND_MCP_TOKEN`` …) and the engine's own Bearer key (``API_AUTH_KEY``) —
-so a single ``env`` command run by the model dumped every tenant-shared
-secret into the tool result, the trace and the LLM context.
+if ``bash`` / ``background_run`` inherited it, a single ``env`` command run by
+the model would dump every tenant-shared secret into the tool result, the
+trace and the LLM context.
 
 The engine's own LLM calls are unaffected: those are in-process httpx calls
 that read ``os.environ`` directly, not subprocesses.

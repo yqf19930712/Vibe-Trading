@@ -57,9 +57,9 @@ MEMORY_TTL_ENV = "VIBE_MEMORY_TTL_DAYS"
 # in-process lock it serialises every read-modify-write of MEMORY.md, so two
 # attempts of one tenant cannot drop each other's index line.
 INDEX_LOCK_FILENAME = ".MEMORY.lock"
-# V2 (P2-11): once the index gets this long the engine runs one consolidation
-# pass on its own at run end, instead of waiting for the model to notice the
-# F7① "index is full" warning and call consolidate_memory itself. Past
+# Once the index gets this long the engine runs one consolidation pass on its
+# own at run end, instead of waiting for the model to notice the "index is
+# full" warning and call consolidate_memory itself. Past
 # MAX_INDEX_LINES new entries stop appearing in the session-start snapshot
 # altogether, so the tidy-up has to happen BEFORE the cap, not at it.
 AUTO_CONSOLIDATE_INDEX_LINES = 180
@@ -115,7 +115,7 @@ def _tokenize(text: str) -> set[str]:
 
     ASCII words >= 3 chars + individual characters from non-Latin scripts
     listed in ``_NON_LATIN_SCRIPT_RANGES`` (CJK, Thai, Arabic, Hebrew,
-    Cyrillic), plus adjacent-pair 2-grams of those characters (F7④: single
+    Cyrillic), plus adjacent-pair 2-grams of those characters (single
     CJK chars are far too promiscuous — "分" matches half the corpus — so
     scoring weights 2-grams full and lone chars low). Underscores are
     treated as word boundaries so snake_case titles (e.g. ``mcp_wiring_test``)
@@ -139,11 +139,11 @@ def _tokenize(text: str) -> set[str]:
 
 
 #: Weight applied to lone non-Latin (e.g. single CJK) character tokens when
-#: scoring — they carry little signal on their own (F7④).
+#: scoring — they carry little signal on their own.
 SINGLE_CJK_WEIGHT = 0.3
 #: Recency bonus: score is multiplied by ``1 + RECENCY_WEIGHT * freshness``
 #: where freshness decays linearly from 1 (just modified) to 0 over
-#: ``RECENCY_HORIZON_DAYS`` (F7④).
+#: ``RECENCY_HORIZON_DAYS``.
 RECENCY_WEIGHT = 0.1
 RECENCY_HORIZON_DAYS = 30.0
 
@@ -318,19 +318,18 @@ class PersistentMemory:
         self._index_path = self._dir / "MEMORY.md"
         self._lock = _dir_lock(self._dir)
         self._snapshot: str = ""
-        # Whether the most recent add() landed inside the line-capped index
-        # (F7①). True until an add is actually dropped by the cap.
+        # Whether the most recent add() landed inside the line-capped index.
+        # True until an add is actually dropped by the cap.
         self.last_add_indexed: bool = True
         self._load_snapshot()
 
     def _load_snapshot(self) -> None:
         """Load index as frozen snapshot. Called once at init.
 
-        A corrupt index (half-written multibyte sequence, non-UTF-8 bytes) used
-        to raise ``UnicodeDecodeError`` straight out of ``PersistentMemory()``
-        and fail every attempt of the tenant until someone SSH'd in (P1
-        2026-09-04). The file is now set aside as ``MEMORY.md.corrupt-<ts>``
-        and the run continues from an empty snapshot; the entry files are
+        A corrupt index (half-written multibyte sequence, non-UTF-8 bytes) must
+        not raise ``UnicodeDecodeError`` out of ``PersistentMemory()`` — that
+        would fail every attempt of the tenant until someone SSH'd in. The
+        file is set aside as ``MEMORY.md.corrupt-<ts>`` and the run continues from an empty snapshot; the entry files are
         untouched, so ``consolidate()`` / ``_rebuild_index`` can regenerate
         the index from them.
         """
@@ -390,7 +389,7 @@ class PersistentMemory:
                 memory_type=_coerce_str(meta.get("type"), default="project"),
                 body=body[:MAX_ENTRY_CHARS],
                 modified_at=path.stat().st_mtime,
-                # F7③: optional fields — legacy entries simply have "".
+                # Optional fields — legacy entries simply have "".
                 created=_coerce_str(meta.get("created")),
                 source=_coerce_str(meta.get("source")),
             ))
@@ -453,7 +452,7 @@ class PersistentMemory:
     def find_relevant(self, query: str, max_results: int = MAX_RESULTS) -> List[MemoryEntry]:
         """Keyword search across all memory entries.
 
-        Scoring (F7④): weighted token overlap — metadata hits × 2.0 + body
+        Scoring: weighted token overlap — metadata hits × 2.0 + body
         hits × 1.0, where non-Latin 2-grams and ASCII words weigh 1.0 and lone
         non-Latin chars weigh ``SINGLE_CJK_WEIGHT`` (they match half the corpus
         on their own). The result is then multiplied by a small recency bonus
@@ -504,7 +503,7 @@ class PersistentMemory:
                 ``MAX_ENTRY_CHARS`` with a visible marker.
             memory_type: One of user/feedback/project/reference.
             description: One-line description for retrieval scoring.
-            source: Optional provenance note (F7③) — which conversation /
+            source: Optional provenance note — which conversation /
                 tool / task produced this memory. Stored in frontmatter;
                 readers treat a missing field as "".
 
@@ -662,7 +661,7 @@ class PersistentMemory:
             return None
 
     def consolidate(self) -> dict:
-        """Deduplicate entries sharing a title and rebuild the index (F7⑤).
+        """Deduplicate entries sharing a title and rebuild the index.
 
         Same-title entries can accumulate under different ``memory_type``
         prefixes (``project_x.md`` + ``user_x.md``) because the filename

@@ -10,8 +10,8 @@ routinely exceeded the limit, so the cut landed mid-JSON.
 The fix follows book §2.7.4 tier 1 — write the full result to disk, hand the
 model a bounded preview that says so, and tell it exactly how to read the rest.
 
-Three tool-aware refinements (2026-09-04, review round 3 P0 — the generic
-envelope was quietly disabling the two tools the model needs most):
+Three tool-aware refinements (the generic envelope would otherwise quietly
+disable the two tools the model needs most):
 
 * ``load_skill`` gets its own, much larger budget (:data:`SKILL_RESULT_LIMIT`)
   and is trimmed **by Markdown ``##`` section**, never mid-sentence; the reply

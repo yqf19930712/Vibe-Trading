@@ -144,7 +144,7 @@ def _wait_tunnel_ready(deadline_s):
 
     Cold boot spawns ssh and immediately serves the first ask; if that ssh dies
     (guest network not up yet) every proxied tool call in the run fails with
-    ECONNREFUSED (2026-08-25, attempt 88e080ef0a46). Best-effort: on timeout we
+    ECONNREFUSED. Best-effort: on timeout we
     proceed anyway — the keeper thread keeps retrying in the background.
     """
     if not _tunnel["cmd"]:
@@ -161,8 +161,8 @@ def _wait_tunnel_ready(deadline_s):
 def _tunnel_keeper():
     """Respawn a dead tunnel DURING runs, not only on /health probes.
 
-    The router only probes /health before an ask, so a tunnel that died
-    mid-run used to stay dead for the whole run.
+    The router only probes /health before an ask, so a tunnel that dies
+    mid-run would otherwise stay dead for the whole run.
     """
     while True:
         time.sleep(10)

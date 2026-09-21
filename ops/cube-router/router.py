@@ -1,8 +1,8 @@
 """cube-router — multi-tenant orchestrator for Vibe-Trading on CubeSandbox.
 
-Successor of ops/vibe-router/router.py. Same public API (`/ask` NDJSON,
-`/forget`, `/healthz`, same bearer auth), but tenant instances are no longer
-host processes: each tenant gets a KVM MicroVM sandbox created from a
+Same public API as the retired ops/vibe-router (`/ask` NDJSON, `/forget`,
+`/healthz`, same bearer auth), but tenant instances are KVM MicroVM sandboxes
+rather than host processes: each tenant gets a KVM MicroVM sandbox created from a
 CubeSandbox template (image: python + vibe-trading + in-guest launcher).
 
 Per-tenant layout inside the sandbox (template default):
@@ -91,10 +91,10 @@ DEFAULT_ASK_TIMEOUT_S = int(os.environ.get("VIBE_ASK_TIMEOUT_S", str(15 * 60)))
 # multi-iteration workers).
 SWARM_ASK_TIMEOUT_S = int(os.environ.get("VIBE_SWARM_ASK_TIMEOUT_S", str(2 * 60 * 60)))
 # THE single place a caller's budget tier is decided. Callers declare a
-# structured `intent` and the number is derived here — previously 7200 was
-# written out in four places (laicai chat-tools, laicai warlab-engine, the
-# SWARM_TIMEOUT env below, and the engine's swarm_tool), and the 2026-08-24
-# incident was exactly those four drifting apart. An explicit `timeoutS` still
+# structured `intent` and the number is derived here — writing 7200 out in
+# several places (laicai chat-tools, laicai warlab-engine, the SWARM_TIMEOUT
+# env below, the engine's swarm_tool) lets them drift apart. An explicit
+# `timeoutS` still
 # wins so laicai can be rolled back on its own without touching the router.
 BUDGET_BY_INTENT = {
     "standard": DEFAULT_ASK_TIMEOUT_S,
@@ -204,12 +204,11 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
             "VIBE_TRADING_ENABLE_SHELL_TOOLS": "1",
         }
     )
-    # Tenant performance/reliability tier (batches 2+3). Router env overrides;
-    # incident 2026-08-24 showed the engine defaults (50 iters, 1800s tool and
-    # swarm timeouts) let a run outlive every caller budget.
-    # 2026-08-26: iterations back to 50 (operator decision) — 25 starved
-    # swarm-intent runs whose data-collection phase alone ate ~20 iterations
-    # (attempt c5810ef14c1e); wall-clock deadlines remain the hard stop.
+    # Tenant performance/reliability tier. Router env overrides. The engine
+    # defaults (1800s tool timeout) let a run outlive every caller budget;
+    # iterations stay at 50 because 25 starves swarm-intent runs whose
+    # data-collection phase alone eats ~20 iterations — wall-clock deadlines
+    # are the hard stop, not the iteration count.
     for key, default in (
         ("VIBE_MAX_ITERATIONS", "50"),
         ("VIBE_TRADING_DATA_CACHE", "1"),
@@ -221,10 +220,10 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
         # matching budget (intent="deep_team", or an explicit timeoutS).
         ("SWARM_TIMEOUT", str(SWARM_ASK_TIMEOUT_S)),
         # LLM streaming read timeout (httpx). The engine default of 120s is
-        # too tight for long-context opus-class calls: incident 2026-08-24, a
-        # swarm worker's stream went silent >120s twice in a row (ReadTimeout
-        # at iteration 10 and again on the task retry), failing the whole
-        # investment_committee run. 300s rides out thinking pauses while a
+        # too tight for long-context opus-class calls: a swarm worker's
+        # stream can go silent >120s twice in a row (ReadTimeout on the
+        # iteration and again on the task retry), failing the whole run.
+        # 300s rides out thinking pauses while a
         # genuinely dead upstream still fails within one worker iteration.
         ("TIMEOUT_SECONDS", "300"),
         # ddgs 9.x has no google/bing; "auto" rotates every engine it has.
@@ -309,7 +308,7 @@ async def sbx_info(sandbox_id: str) -> Optional[dict]:
     r = await api.get(f"/sandboxes/{sandbox_id}")
     if r.status_code == 404:
         return None
-    # Half-deleted sandbox (2026-08-27 incident): cubelet already reaped the
+    # Half-deleted sandbox: cubelet already reaped the
     # task but the CubeAPI/cubemaster record lingers, answering 500 with
     # "NotFoundAtCubelet". Treat it as gone so callers take the same
     # rebuild path as a clean 404 instead of erroring forever.
@@ -339,8 +338,8 @@ async def sbx_delete(sandbox_id: str) -> bool:
     CubeAPI refuses to delete a paused sandbox ("sandbox not in normal state")
     and answers 500 — which httpx does not raise on, so without the status check
     below the failure is swallowed and the sandbox leaks forever, holding disk
-    and a slot against VIBE_MAX_INSTANCES. Callers that must know (``/forget``,
-    P1 2026-09-04) read the bool; the self-heal paths ignore it as before.
+    and a slot against VIBE_MAX_INSTANCES. Callers that must know (``/forget``)
+    read the bool; the self-heal paths ignore it as before.
     """
     try:
         await sbx_resume(sandbox_id)
@@ -452,10 +451,10 @@ async def _ensure_ready(
             await asyncio.sleep(1.5)
             h = await _launcher_health(inst)
         if h is None:
-            # 2026-08-27 incident: resume reported success but the VM never
-            # came up; cubelet then reaped the failed task, leaving a
-            # half-deleted record (sbx_info 500 NotFoundAtCubelet) that the
-            # 404-only self-heal never clears. Tear the sandbox down and drop
+            # Resume can report success while the VM never comes up; cubelet
+            # then reaps the failed task, leaving a half-deleted record
+            # (sbx_info 500 NotFoundAtCubelet) that a 404-only self-heal
+            # never clears. Tear the sandbox down and drop
             # the mapping HERE so the tenant's next ask cold-rebuilds cleanly.
             log.warning("tenant %s sandbox %s unreachable after resume; discarding",
                         inst.tk[:8], inst.sandbox_id[:12])
@@ -599,8 +598,8 @@ async def _cancel_attempt_bg(
     generator. Called from the unanswered path of _ask_stream: on client
     disconnect uvicorn *cancels* the generator task, so any `await` in its
     finally raises CancelledError before the HTTP request goes out — the
-    engine kept grinding, got frozen by pause, and resumed as a zombie that
-    422'd new asks (2026-08-28 incident). A separate task survives that
+    engine keeps grinding, gets frozen by pause, and resumes as a zombie that
+    422s new asks. A separate task survives that
     cancellation and reliably delivers the cancel.
 
     Owns the ask-log line for this ask: ``engine_cancelled`` means the engine
@@ -652,7 +651,7 @@ async def _post_turn(
     payload: dict = {"content": query}
     if deadline_s is not None:
         # The engine finalizes with what it has before this budget runs out
-        # (batch 3) instead of grinding past the caller's timeout.
+        # instead of grinding past the caller's timeout.
         payload["deadline_s"] = round(deadline_s, 1)
     # Structured intent rides alongside deadline_s. Engines that don't know
     # these fields yet ignore them (the request model tolerates extras), so the
@@ -668,7 +667,7 @@ async def _post_turn(
     if r.status_code == 422:
         # Pydantic validation on the engine side. The one users actually hit
         # is the input length cap (portfolio context + question); say so
-        # instead of surfacing a bare 422 (P1 2026-09-04).
+        # instead of surfacing a bare 422.
         raise HTTPException(400, _engine_422_detail(r))
     r.raise_for_status()
     return r.json().get("attempt_id")
@@ -702,10 +701,10 @@ def _classify_answer_message(msg: dict, attempt_id: Optional[str]) -> tuple[str,
     Returns ``(kind, text)`` with kind ∈ {"skip", "answer", "failed"}. Pure
     so the router test can pin it without an engine.
 
-    A failed attempt used to be forwarded as the answer: the engine writes
-    an assistant message "Execution failed: …" linked to the attempt, and
-    the old loop accepted any non-empty linked assistant text (P1
-    2026-09-04). The engine now stamps ``metadata.ok`` / ``metadata.error``;
+    A failed attempt must not be forwarded as the answer: the engine writes
+    an assistant message "Execution failed: …" linked to the attempt, so
+    accepting any non-empty linked assistant text would hand that prose to
+    the user. The engine stamps ``metadata.ok`` / ``metadata.error``;
     ``metadata.status == "failed"`` (which older engines already wrote)
     is honoured as well.
     """
@@ -860,7 +859,7 @@ class AskBody(BaseModel):
     vibeSessionId: Optional[str] = None
     model: Optional[str] = None
     llm: Optional[LlmOverride] = None
-    # Structured research-depth intent (cross-repo contract, 2026-08-29).
+    # Structured research-depth intent (cross-repo contract with laicai).
     # "deep_team" = multi-agent swarm committee. The router derives the budget
     # from it (BUDGET_BY_INTENT) instead of every caller hardcoding 7200.
     # Optional on purpose: an older laicai that sends only `timeoutS` behaves
@@ -881,9 +880,9 @@ def _auth(authorization: Optional[str]) -> None:
 
 
 # In-flight attempts (attempt_id → (inst, sid)) so a graceful router shutdown
-# can tell engines to stop. Incident run #9 (2026-08-24): a deploy restart
-# killed the stream mid-run, the generator finally never ran, and the orphaned
-# attempt burned 27 minutes writing an answer nobody would read.
+# can tell engines to stop: a deploy restart that kills the stream mid-run
+# never runs the generator's finally, and the orphaned attempt would burn
+# half an hour writing an answer nobody will read.
 _INFLIGHT: dict[str, tuple[Instance, str]] = {}
 
 
@@ -951,9 +950,9 @@ async def _ask_stream(body: AskBody, timeout_s: int):
             inst.refcount += 1
             try:
                 # Per-tenant serialization point: a second ask for the same
-                # tenant queues HERE while the first is running — previously
-                # invisible (incident run #9: 93 min of silent lock wait read
-                # as a giant first_progress). Measure it explicitly.
+                # tenant queues HERE while the first is running — unmeasured,
+                # a long silent lock wait reads as a giant first_progress.
+                # Measure it explicitly.
                 lock_t0 = time.monotonic()
                 async with inst.lock:
                     stats["lock_wait_ms"] = int((time.monotonic() - lock_t0) * 1000)
@@ -1045,12 +1044,12 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                         if not answered:
                             # Timeout / client gone / internal error: tell the
                             # engine to stop burning tokens on an answer nobody
-                            # will receive (incident 2026-08-24: a 504'd attempt
-                            # kept grinding and starved the tenant's retry).
-                            # MUST be a detached task, not an await — on client
-                            # disconnect this generator is being cancelled and
-                            # an await here dies before sending (2026-08-28
-                            # zombie-attempt incident). It stamps
+                            # will receive (a 504'd attempt that keeps grinding
+                            # starves the tenant's retry). MUST be a detached
+                            # task, not an await — on client disconnect this
+                            # generator is being cancelled and an await here
+                            # dies before sending, leaving a zombie attempt. It
+                            # stamps
                             # engine_cancelled from the engine's answer and
                             # writes the ask-log line.
                             cancel_task = _spawn(
@@ -1137,7 +1136,7 @@ async def forget(body: dict, authorization: Optional[str] = Header(None)):
     if errors:
         # laicai's engine-forget job keys on `res.ok` (engine-forget.ts): a
         # non-2xx keeps the job pending for the 23:30 retry instead of
-        # marking a half-done purge as finished (P1 2026-09-04).
+        # marking a half-done purge as finished.
         detail = "; ".join(errors)
         log.warning("forget tenant %s incomplete: %s", tk[:8], detail)
         return JSONResponse(status_code=500, content={"ok": False, "error": detail})
@@ -1315,8 +1314,8 @@ def _safe_tenant_path(base: Path, p: Path) -> Optional[Path]:
 
     The engine runs as uid 1000 inside the tenant's own bind-mount and can
     create symlinks there at will; the router runs as root on the host and
-    read/wrote whatever those paths pointed at (P0 2026-09-04: a tenant
-    ``memory/x.md -> /etc/shadow`` was readable through ``/memory``, and
+    would read/write whatever those paths point at (a tenant
+    ``memory/x.md -> /etc/shadow`` readable through ``/memory``,
     ``MEMORY.md -> /root/.ssh/authorized_keys`` writable through
     ``/memory/delete``). Rules:
 
@@ -1575,7 +1574,7 @@ async def memory_list(uid: str, authorization: Optional[str] = Header(None)):
             return []
         out = []
         for p in d.iterdir():
-            # Symlink entries are skipped outright (P0 2026-09-04): is_file()
+            # Symlink entries are skipped outright: is_file()
             # follows links, so without this a tenant-planted link read
             # arbitrary host files through the memory page.
             if _safe_tenant_path(d, p) is None:
@@ -1700,7 +1699,7 @@ def _dir_bytes(path: Path) -> int:
     Walks with ``followlinks=False`` and skips symlinked files: a tenant can
     plant ``big -> /`` inside its bind-mount and the old ``rglob`` (which
     descends into symlinked directories) would have walked the whole host
-    filesystem as root (P0 2026-09-04).
+    filesystem as root.
     """
     if path.is_symlink() or not path.is_dir():
         return 0
@@ -1792,8 +1791,8 @@ async def tenants_usage(
         "data_root_bytes": sum(r["disk_bytes"] for r in rows),
         "disk_used_pct": _disk_used_pct(DATA_ROOT),
         "tenants_total": len(rows),
-        # tk8 list (was a bare count, P1 2026-09-04): a consumer could see
-        # THAT someone was over the line but not WHO, so nothing could act.
+        # tk8 list, not a bare count: a consumer must see WHO is over the
+        # line, not just THAT someone is, or nothing can act.
         "over_watermark": _over_watermark_tk8s(rows),
         "tenants": rows[: max(1, min(limit, 200))],
     }
@@ -1901,15 +1900,15 @@ def _vibe_template_ids() -> set[str]:
 
 
 async def _sweep_stale_templates() -> None:
-    """One-shot cleanup after a template switch (2026-08-27 operator policy).
+    """One-shot cleanup after a template switch.
 
     A template switch always involves a router restart with no in-flight asks,
     so any old-template sandbox found here serves nobody. For each sandbox
     whose template is not the current one: running instances are paused first
     (graceful quiesce), then deleted (the delete helper resumes paused ones —
     a CubeAPI quirk); finally every superseded vibe-engine template is removed.
-    Covers both state.json tenants and orphans state no longer tracks (the v3
-    fossil that pinned its template for days). Non-vibe templates (e.g. the
+    Covers both state.json tenants and orphans state does not track (a stale
+    sandbox can otherwise pin its template for days). Non-vibe templates (e.g. the
     sandbox-code base) are never touched. Disable with
     VIBE_SWEEP_STALE_TEMPLATES=0.
     """

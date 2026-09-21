@@ -296,9 +296,9 @@ class MCPServerConfig(ConfigBase):
     url: str = ""
     headers: dict[str, str] = Field(default_factory=dict)
     auth: MCPOAuthConfig | None = None
-    # V1: upper bound added. This value feeds the per-call client timeout AND
+    # Upper bound. This value feeds the per-call client timeout AND
     # (via MCPRemoteTool.timeout_seconds) the loop-side watchdog, so leaving it
-    # unbounded let a misconfigured server hold a write-tool slot for
+    # unbounded would let a misconfigured server hold a write-tool slot for
     # arbitrarily long. 1800s is generous for any legitimate MCP call and still
     # comfortably inside a normal attempt budget.
     tool_timeout: float = Field(default=30.0, ge=0.1, le=1800.0)

@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from rich.console import Console
 
+from src.core.paths import data_root as _core_data_root
 from src.goal.context import default_goal_criteria
 from src.ui_services import build_run_analysis, load_run_context
 
@@ -42,13 +43,12 @@ for _s in ("stdout", "stderr"):
 def _data_root() -> Path:
     """Root for per-tenant mutable state (runs / sessions / uploads).
 
-    Honors ``VIBE_DATA_DIR`` so a multi-tenant launcher can point each instance
-    at a per-user HOME (``$HOME/.vibe-trading``) to isolate state across tenants.
-    Defaults to the install dir, preserving single-user behavior unchanged.
+    Thin alias of ``src.core.paths.data_root`` — the single resolver of
+    ``VIBE_DATA_DIR`` (per-tenant HOME; unset = this install dir). Kept as a
+    module-level name because the ``*_DIR`` constants below read it.
     See PRODUCT_DESIGN.md §2.3.
     """
-    env = os.getenv("VIBE_DATA_DIR")
-    return Path(env).expanduser() if env else Path(__file__).resolve().parent
+    return _core_data_root()
 
 
 # Fail loud rather than silently writing tenant state into the shared install
@@ -252,10 +252,9 @@ class SessionResponse(BaseModel):
 
 class SendMessageRequest(BaseModel):
     """Send chat message: natural-language strategy description."""
-    # 20000 (was 5000): laicai injects the user's real portfolio context in
-    # front of the question, and a moderately sized book already blew the
-    # old cap into a bare 422 (P1 2026-09-04). The router maps a 422 here to
-    # an explicit "问题过长" error frame.
+    # 20000: laicai injects the user's real portfolio context in front of the
+    # question, and a moderately sized book alone runs to several thousand
+    # characters. The router maps a 422 here to an explicit "问题过长" error frame.
     content: str = Field(..., description="Natural language strategy description", min_length=1, max_length=20000)
     # Wall-clock budget for this attempt (seconds). When set, the agent loop
     # finalizes with whatever it has BEFORE the caller's timeout instead of
