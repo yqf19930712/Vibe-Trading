@@ -203,3 +203,15 @@ def test_complete_tool_calls_still_execute(tmp_path: Path, monkeypatch, finish_r
     agent.run("w")
 
     assert tool.written == {"a.md": "complete"}
+
+
+def test_refusal_points_long_files_at_append_mode() -> None:
+    """write_file can append, so the refusal names the way to write in parts."""
+    import json as _json
+
+    from src.agent.loop import _truncated_tool_call_error
+    from src.tools.write_file_tool import WriteFileTool
+
+    message = _json.loads(_truncated_tool_call_error("write_file"))["message"]
+    assert "mode='append'" in message
+    assert "append" in WriteFileTool.parameters["properties"]["mode"]["enum"]

@@ -224,8 +224,9 @@ def _truncated_tool_call_error(tool_name: str) -> str:
                 "limit (finish_reason=length) while its arguments were still "
                 "being written, so they are incomplete. Re-issue it with "
                 "shorter arguments — split long content into several smaller "
-                "calls (write a long file in parts, keep scripts short) and "
-                "keep the text before the call brief."
+                "calls (a long file: write_file with the first part, then "
+                "write_file mode='append' for each further part; keep scripts "
+                "short) and keep the text before the call brief."
             ),
         },
         ensure_ascii=False,
