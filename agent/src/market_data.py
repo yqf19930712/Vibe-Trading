@@ -125,18 +125,27 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _summarize(records: list[dict[str, Any]], columns: list[str]) -> dict[str, Any]:
-    """Build the per-symbol ``summary`` block from the (already capped) rows.
+def _summarize(
+    records: list[dict[str, Any]],
+    columns: list[str],
+    full: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build the per-symbol ``summary`` block.
 
     The summary is what survives structured truncation
     (``tool_result_store``) — start/end date, row count, first/last close,
     range high/low and the period return — so the model can still reason
-    about the series when the middle rows have been dropped.
+    about the series when the middle rows have been dropped. Every statistic
+    is computed over the FULL series (``full``, before :func:`cap_rows`
+    thinned it): the high and low of an every-Nth sample are not the
+    period's high and low, and the summary presents them as exactly that.
+    ``rows`` stays the count of rows actually returned.
     """
     if not records:
         return {"rows": 0}
+    series = full if full else records
     date_col = columns[0] if columns else None
-    first, last = records[0], records[-1]
+    first, last = series[0], series[-1]
     summary: dict[str, Any] = {"rows": len(records)}
     if date_col is not None:
         summary["start"] = first.get(date_col)
@@ -153,8 +162,8 @@ def _summarize(records: list[dict[str, Any]], columns: list[str]) -> dict[str, A
         summary["last_close"] = last_close
     if first_close and last_close is not None:
         summary["change_pct"] = round((last_close / first_close - 1.0) * 100.0, 2)
-    highs = [v for v in (_num(r, "high" if "high" in columns else "close") for r in records) if v is not None]
-    lows = [v for v in (_num(r, "low" if "low" in columns else "close") for r in records) if v is not None]
+    highs = [v for v in (_num(r, "high" if "high" in columns else "close") for r in series) if v is not None]
+    lows = [v for v in (_num(r, "low" if "low" in columns else "close") for r in series) if v is not None]
     if highs:
         summary["high"] = max(highs)
     if lows:
@@ -162,7 +171,10 @@ def _summarize(records: list[dict[str, Any]], columns: list[str]) -> dict[str, A
     return summary
 
 
-def to_table(capped: list | dict[str, object]) -> dict[str, Any]:
+def to_table(
+    capped: list | dict[str, object],
+    full: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Turn a (possibly capped) record list into the compact table payload.
 
     Shape (``summary`` first so a structured truncation keeps it)::
@@ -172,7 +184,8 @@ def to_table(capped: list | dict[str, object]) -> dict[str, Any]:
     A capped series (see :func:`cap_rows`) additionally carries
     ``total_rows`` / ``returned`` / ``truncated`` / ``policy`` / ``hint``.
     Column names are emitted once instead of once per row — the single
-    biggest saving over ``to_dict(orient="records")``.
+    biggest saving over ``to_dict(orient="records")``. Pass the uncapped
+    series as ``full`` so the summary statistics describe the whole period.
     """
     meta: dict[str, Any] = {}
     if isinstance(capped, dict):
@@ -191,7 +204,7 @@ def to_table(capped: list | dict[str, object]) -> dict[str, Any]:
         for key in row:
             if key not in columns:
                 columns.append(str(key))
-    table: dict[str, Any] = {"summary": _summarize(records, columns)}
+    table: dict[str, Any] = {"summary": _summarize(records, columns, full)}
     if meta:
         table["summary"]["total_rows"] = meta["total_rows"]
         table.update(meta)
@@ -306,7 +319,7 @@ def fetch_market_data(
             for row in records:
                 for key, value in row.items():
                     row[key] = _json_safe(value)
-            results[symbol] = to_table(cap_rows(records, max_rows))
+            results[symbol] = to_table(cap_rows(records, max_rows), full=records)
 
     # ── Primary pass (requested/detected source per code) ────────────────────
     if source == "auto":

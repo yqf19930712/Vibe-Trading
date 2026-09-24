@@ -72,6 +72,8 @@ class RealtimeQuoteTool(BaseTool):
     description = (
         "Get realtime snapshot quotes for US stocks/ETFs (last price, change vs "
         "prev close, OHLC, volume, session) via the structured TickFlow API. "
+        "change_pct is in PERCENT (0.25 means +0.25%), the same unit as "
+        "get_market_data's summary.change_pct. "
         "Use this instead of bash-curling quote websites. US symbols only "
         '(e.g. ["INTC.US", "NVDA"]); for A-shares/HK realtime use other means.'
     )
@@ -123,15 +125,20 @@ class RealtimeQuoteTool(BaseTool):
                     ext = q.get("ext") or {}
                     last = q.get("last_price")
                     prev = q.get("prev_close")
+                    # TickFlow reports a fraction; the tool speaks percent
+                    # like get_market_data, so the same field name never
+                    # means two units 100x apart within one answer.
                     change_pct = ext.get("change_pct")
                     if change_pct is None and last is not None and prev:
                         change_pct = (last - prev) / prev
+                    if isinstance(change_pct, (int, float)):
+                        change_pct = change_pct * 100.0
                     quotes.append({
                         "symbol": q.get("symbol"),
                         "name": ext.get("name"),
                         "last_price": last,
                         "prev_close": prev,
-                        "change_pct": round(change_pct, 6) if isinstance(change_pct, (int, float)) else None,
+                        "change_pct": round(change_pct, 4) if isinstance(change_pct, (int, float)) else None,
                         "open": q.get("open"),
                         "high": q.get("high"),
                         "low": q.get("low"),
