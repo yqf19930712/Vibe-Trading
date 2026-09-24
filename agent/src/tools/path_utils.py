@@ -12,6 +12,11 @@ Three helpers, three threat models:
 * `safe_document_path(p)` — document-reader inputs. Uses the same import-root
   boundary as `safe_user_path()`.
 
+* `safe_tool_input(p, run_dir)` / `safe_tool_output_dir(p, run_dir)` — data
+  files read / written by analysis tools (factor_analysis, alpha_bench):
+  relative paths live under the current run dir, absolute ones must sit in a
+  run root (inputs may also come from the import roots).
+
 All helpers raise ``ValueError`` on rejection — callers already expect this.
 """
 
@@ -235,6 +240,42 @@ def safe_run_dir(p: str) -> Path:
         f"run_dir {p!r} is outside allowed run roots. "
         f"Set {_ALLOWED_RUN_ROOTS_ENV} to add a run directory."
     )
+
+
+def safe_tool_input(p: str, run_dir: str | None) -> Path:
+    """Validate a data file an analysis tool reads.
+
+    Relative paths resolve under ``run_dir``; an absolute path is accepted
+    inside any allowed run root (an earlier run's artifacts) or import root
+    (uploads, configured file roots).
+
+    Raises:
+        ValueError: The path escapes all of those roots.
+    """
+    _rejects_unc(p)
+    if run_dir and not Path(p).expanduser().is_absolute():
+        return safe_path(p, safe_run_dir(run_dir))
+    try:
+        return safe_run_dir(p)
+    except ValueError:
+        pass
+    return _safe_import_path(p, purpose="tool input")
+
+
+def safe_tool_output_dir(p: str, run_dir: str | None) -> Path:
+    """Validate a directory an analysis tool writes into.
+
+    Relative paths resolve under ``run_dir``; an absolute path must sit in
+    an allowed run root, never elsewhere in the sandbox (engine code, other
+    state under the data root).
+
+    Raises:
+        ValueError: The path escapes the run roots.
+    """
+    _rejects_unc(p)
+    if run_dir and not Path(p).expanduser().is_absolute():
+        return safe_path(p, safe_run_dir(run_dir))
+    return safe_run_dir(p)
 
 
 def safe_run_id(run_id: str) -> Path:
