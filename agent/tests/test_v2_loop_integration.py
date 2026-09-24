@@ -77,6 +77,9 @@ def _agent(llm: Any, tmp_path: Path, max_iter: int = 4) -> AgentLoop:
 @pytest.fixture(autouse=True)
 def _tenant_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VIBE_DATA_DIR", str(tmp_path / "tenant"))
+    # The handoff sidecar is only written next to an existing session.
+    for sid in ("sess-1", "sess-2"):
+        (tmp_path / "tenant" / "sessions" / sid).mkdir(parents=True)
 
 
 class TestEmptyResponseRetry:

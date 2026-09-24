@@ -21,8 +21,13 @@ from src.session import handoff
 
 @pytest.fixture(autouse=True)
 def _tenant_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Point the per-tenant data root at a temp dir (VIBE_DATA_DIR contract)."""
+    """Point the per-tenant data root at a temp dir (VIBE_DATA_DIR contract).
+
+    The sidecar only ever lives next to an existing session, so the session
+    directory the tests write for is created up front.
+    """
     monkeypatch.setenv("VIBE_DATA_DIR", str(tmp_path))
+    (tmp_path / "sessions" / "s1").mkdir(parents=True)
     return tmp_path
 
 
@@ -61,20 +66,20 @@ class TestRoundTrip:
 class TestRobustness:
     def test_corrupt_json_returns_empty(self, _tenant_root: Path) -> None:
         path = _tenant_root / "sessions" / "s1" / "handoff.json"
-        path.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{not json", encoding="utf-8")
         assert handoff.load("s1") == ""
 
     def test_wrong_shape_returns_empty(self, _tenant_root: Path) -> None:
         path = _tenant_root / "sessions" / "s1" / "handoff.json"
-        path.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('["a list"]', encoding="utf-8")
         assert handoff.load("s1") == ""
 
     def test_stale_summary_is_not_carried_over(self, _tenant_root: Path) -> None:
         """A summary from a long-abandoned topic is worse than none."""
         path = _tenant_root / "sessions" / "s1" / "handoff.json"
-        path.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         old = datetime.now(timezone.utc) - timedelta(
             days=handoff.HANDOFF_TTL_DAYS + 1
         )
@@ -86,7 +91,7 @@ class TestRobustness:
 
     def test_fresh_summary_within_ttl_is_carried_over(self, _tenant_root: Path) -> None:
         path = _tenant_root / "sessions" / "s1" / "handoff.json"
-        path.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         recent = datetime.now(timezone.utc) - timedelta(days=1)
         path.write_text(
             json.dumps({"summary": "recent", "updated_at": recent.isoformat()}),
@@ -100,7 +105,7 @@ class TestRobustness:
         def _boom(*_args, **_kwargs):
             raise OSError(28, "No space left on device")
 
-        monkeypatch.setattr(Path, "mkdir", _boom)
+        monkeypatch.setattr(handoff, "atomic_write_text", _boom)
         assert handoff.save("s1", "text") is False
 
     def test_oversized_summary_is_clipped_with_a_marker(self) -> None:
@@ -173,3 +178,19 @@ class TestHistoryInjection:
 
         assert total <= 6_000
         assert kept, "the budget must still admit at least the newest turn"
+
+
+class TestDeletedSession:
+    def test_save_never_recreates_a_missing_session_directory(self, _tenant_root: Path) -> None:
+        assert handoff.save("gone", "## Goal\nsecret") is False
+        assert not (_tenant_root / "sessions" / "gone").exists()
+
+    def test_save_is_refused_for_a_tombstoned_session(self, _tenant_root: Path) -> None:
+        from src.session import tombstone
+
+        tombstone.mark("s1", _tenant_root / "sessions")
+        try:
+            assert handoff.save("s1", "## Goal\nsecret") is False
+            assert not (_tenant_root / "sessions" / "s1" / "handoff.json").exists()
+        finally:
+            tombstone._reset_for_tests()

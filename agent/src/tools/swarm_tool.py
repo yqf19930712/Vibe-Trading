@@ -1320,7 +1320,7 @@ class SwarmTool(BaseTool):
 
         from src.config import load_swarm_agent_config
         from src.swarm.runtime import SwarmRuntime
-        from src.swarm.store import SwarmStore, swarm_runs_root
+        from src.swarm.store import SwarmStore, run_owner, swarm_runs_root
 
         # Single source of truth (honors VIBE_DATA_DIR for per-tenant isolation).
         swarm_base_dir = swarm_runs_root()
@@ -1351,12 +1351,15 @@ class SwarmTool(BaseTool):
                     {"run_id": current_run_id, "event": payload},
                 )
 
-            run = runtime.start_run(
-                preset,
-                variables,
-                live_callback=_live_callback if self._event_callback is not None else None,
-                include_shell_tools=self.include_shell_tools,
-            )
+            # The run records its owning session so deleting the session
+            # also deletes the run (run.json holds the user's request).
+            with run_owner(self._session_id):
+                run = runtime.start_run(
+                    preset,
+                    variables,
+                    live_callback=_live_callback if self._event_callback is not None else None,
+                    include_shell_tools=self.include_shell_tools,
+                )
         except FileNotFoundError as exc:
             _record("start_failed")
             return json.dumps(

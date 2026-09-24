@@ -1896,6 +1896,9 @@ def _get_session_service():
         event_bus=event_bus,
         runs_dir=RUNS_DIR,
     )
+    # A deleted session's goal ledger goes with it — also on the late sweep
+    # after an attempt that outlived the delete finally exits.
+    _session_service.add_purge_hook(lambda sid: _get_goal_store().delete_session_goals(sid))
     # Sessions deleted from the host while the engine was down leave their
     # sessions.db rows behind; sweep them before the first search can
     # surface a deleted conversation.

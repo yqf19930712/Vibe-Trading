@@ -72,14 +72,20 @@ def save(session_id: str, summary: str, *, attempt_iter: int = 0) -> bool:
     """
     if not session_id or not summary or not summary.strip():
         return False
+    from src.session import tombstone
+
     path = _path(session_id)
+    # The sidecar belongs to an existing session: never recreate a deleted
+    # (or deleting) session's directory just to hold its summary.
+    if tombstone.is_deleted(session_id, path.parent.parent) or not path.parent.is_dir():
+        logger.info("handoff for session %s not saved: session is gone", session_id)
+        return False
     payload = {
         "summary": _clip(summary),
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "attempt_iter": int(attempt_iter or 0),
     }
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
         # Atomic replace: a concurrent reader never sees a half-written file.
         atomic_write_text(path, json.dumps(payload, ensure_ascii=False))
     except OSError as exc:  # noqa: BLE001 - full disk must not kill the attempt

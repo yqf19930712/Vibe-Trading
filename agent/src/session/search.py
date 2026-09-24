@@ -90,6 +90,12 @@ class SessionSearchIndex:
         """
         self._store_base_dir = store_base_dir
 
+    def _is_deleted(self, session_id: str) -> bool:
+        """Whether ``session_id`` is tombstoned; its rows must not come back."""
+        from src.session import tombstone
+
+        return tombstone.is_deleted(session_id, self._store_base_dir)
+
     def _session_dir_exists(self, session_id: str) -> bool:
         """Whether the bound store still has ``session_id`` (True when unbound)."""
         if self._store_base_dir is None:
@@ -171,6 +177,8 @@ class SessionSearchIndex:
                 the stored timestamp so that bulk reindex restores the
                 true session start time rather than the reindex moment.
         """
+        if self._is_deleted(session_id):
+            return
         conn = self._get_conn()
         # Preserve the existing started_at when the caller does not supply
         # one — otherwise INSERT OR REPLACE would overwrite the original
@@ -197,6 +205,8 @@ class SessionSearchIndex:
             tool_name: Tool name if this is a tool result.
         """
         if not content or not content.strip():
+            return
+        if self._is_deleted(session_id):
             return
         conn = self._get_conn()
         conn.execute(
