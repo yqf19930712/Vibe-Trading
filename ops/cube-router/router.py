@@ -146,6 +146,15 @@ ASK_LOG_MAX_BYTES = 20 * 1024 * 1024
 # single-name knobs (VIBE_MAX_OUTPUT_TOKENS, VIBE_LENGTH_CONTINUATIONS,
 # VIBE_CONTEXT_WINDOW_TOKENS — the model's context window the engine sizes
 # its compaction thresholds from, …).
+#
+# VIBE_CONTEXT_WINDOW_TOKENS describes the builtin models, so a BYOK engine
+# does not get it: it gets VIBE_BYOK_CONTEXT_WINDOW_TOKENS instead when that
+# is set (a conservative window for whatever model a user brings), and
+# otherwise runs uncapped on the engine's own threshold. The engine only
+# ever lowers its threshold to the window, so the builtin value on a
+# larger-window BYOK model would over-compact, and on a smaller one it would
+# not protect anything anyway.
+BYOK_CONTEXT_WINDOW_ENV = "VIBE_BYOK_CONTEXT_WINDOW_TOKENS"
 FORWARD_ENV = [
     "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_MODEL",
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
@@ -335,6 +344,10 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
         env["OPENAI_API_KEY"] = llm.apiKey
         env["OPENAI_BASE_URL"] = llm.baseUrl
         env["OPENAI_API_BASE"] = llm.baseUrl
+        env.pop("VIBE_CONTEXT_WINDOW_TOKENS", None)
+        byok_window = os.environ.get(BYOK_CONTEXT_WINDOW_ENV, "").strip()
+        if byok_window:
+            env["VIBE_CONTEXT_WINDOW_TOKENS"] = byok_window
     elif model:
         env["LANGCHAIN_MODEL_NAME"] = model
     env.update(

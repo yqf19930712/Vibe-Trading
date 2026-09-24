@@ -715,10 +715,35 @@ class TestForwardedEnv:
         env, _ = router.engine_env(None, None)
         assert env["VIBE_CONTEXT_WINDOW_TOKENS"] == "128000"
         assert router.llm_fingerprint(None, None, env) != router.llm_fingerprint(None, None, base_env)
-        # BYOK keeps it too (it describes the window, not a credential).
+
+    def test_byok_does_not_inherit_the_builtin_window(self, monkeypatch):
+        """The router's window describes the builtin models, not the user's."""
+        monkeypatch.setenv("VIBE_CONTEXT_WINDOW_TOKENS", "64000")
+        monkeypatch.delenv("VIBE_BYOK_CONTEXT_WINDOW_TOKENS", raising=False)
         llm = router.LlmOverride(provider="deepseek", model="deepseek-chat",
                                  apiKey="k" * 10, baseUrl="https://api.deepseek.com")
-        assert router.engine_env(None, llm)[0]["VIBE_CONTEXT_WINDOW_TOKENS"] == "128000"
+
+        byok_env, _ = router.engine_env(None, llm)
+        builtin_env, _ = router.engine_env("claude-x", None)
+
+        assert "VIBE_CONTEXT_WINDOW_TOKENS" not in byok_env  # engine's own threshold
+        assert builtin_env["VIBE_CONTEXT_WINDOW_TOKENS"] == "64000"
+        assert "VIBE_BYOK_CONTEXT_WINDOW_TOKENS" not in router.forwarded_env_names()
+
+    def test_byok_gets_the_byok_window_when_configured(self, monkeypatch):
+        monkeypatch.setenv("VIBE_CONTEXT_WINDOW_TOKENS", "1000000")
+        llm = router.LlmOverride(provider="deepseek", model="deepseek-chat",
+                                 apiKey="k" * 10, baseUrl="https://api.deepseek.com")
+        monkeypatch.delenv("VIBE_BYOK_CONTEXT_WINDOW_TOKENS", raising=False)
+        before, _ = router.engine_env(None, llm)
+        monkeypatch.setenv("VIBE_BYOK_CONTEXT_WINDOW_TOKENS", "56000")
+
+        env, _ = router.engine_env(None, llm)
+
+        assert env["VIBE_CONTEXT_WINDOW_TOKENS"] == "56000"
+        assert "VIBE_BYOK_CONTEXT_WINDOW_TOKENS" not in env
+        # Part of the BYOK fingerprint: setting it reboots BYOK engines.
+        assert router.llm_fingerprint(None, llm, env) != router.llm_fingerprint(None, llm, before)
 
     def test_byok_still_strips_the_builtin_anthropic_credentials(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "builtin")
