@@ -40,9 +40,11 @@ def tenant(tmp_path, monkeypatch) -> Path:
     monkeypatch.setattr(router, "DATA_ROOT", tmp_path)
     monkeypatch.setattr(router, "STATE_FILE", tmp_path / "state.json")
     router._du_cache.clear()
+    router.state.clear()
     d = tmp_path / router.tenant_key(UID)
     d.mkdir()
-    return d
+    yield d
+    router.state.clear()
 
 
 # ── A1: symlink escape ───────────────────────────────────────────────────────

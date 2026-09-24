@@ -121,6 +121,14 @@ def budget_for(intent: Optional[str], explicit: Optional[int]) -> int:
     if explicit:
         return explicit
     return BUDGET_BY_INTENT.get(intent or "standard", DEFAULT_ASK_TIMEOUT_S)
+# /forget leaves a tombstone (``forgotten_at``) in the tenant's state row; for
+# this long an /ask for the tenant is refused with 410 instead of recreating
+# its data dir and sandbox. Expired tombstones are pruned at startup.
+FORGET_TOMBSTONE_S = int(os.environ.get("VIBE_FORGET_TOMBSTONE_S", str(30 * 24 * 3600)))
+# /forget waits this long for the tenant lock (held by an in-flight cold
+# start of the same tenant). Past it the purge goes ahead: the tombstone is
+# already written, and the cold start aborts on it and removes what it made.
+FORGET_LOCK_WAIT_S = float(os.environ.get("VIBE_FORGET_LOCK_WAIT_S", "10"))
 # Per-ask observability: one JSONL line per /ask (segment timings, outcome,
 # attempt_id) so slow/failed asks can be traced without any extra infra.
 ASK_LOG = Path(os.environ.get("VIBE_ASK_LOG", "/var/lib/cube-router/ask_log.jsonl"))
@@ -317,7 +325,50 @@ def _save_state() -> None:
     tmp.replace(STATE_FILE)
 
 
-state: dict = {}  # tk -> {"sandbox_id": str, "llm_fp": str|None}
+# tk -> {"sandbox_id", "template_id", "llm_fp", "api_key"} for a tenant with a
+# sandbox; {"forgotten_at": epoch} (plus the sandbox fields while a sandbox
+# delete is still pending) for a tenant purged by /forget.
+state: dict = {}
+
+
+class _TenantForgotten(HTTPException):
+    """410: the tenant was purged by /forget; nothing may be recreated for it."""
+
+    def __init__(self) -> None:
+        super().__init__(410, "tenant forgotten: its engine data was purged; asks are refused")
+
+
+def _tombstoned(tk: str) -> bool:
+    row = state.get(tk)
+    ts = row.get("forgotten_at") if isinstance(row, dict) else None
+    return isinstance(ts, (int, float)) and time.time() - ts < FORGET_TOMBSTONE_S
+
+
+def _check_not_forgotten(tk: str) -> None:
+    if _tombstoned(tk):
+        raise _TenantForgotten()
+
+
+def _set_tombstone(tk: str) -> None:
+    row = state.setdefault(tk, {})
+    if not _tombstoned(tk):
+        row["forgotten_at"] = time.time()
+        _save_state()
+
+
+def _prune_tombstones() -> int:
+    """Drop expired tombstone rows that no longer name a sandbox."""
+    now = time.time()
+    doomed = [
+        tk for tk, row in state.items()
+        if isinstance(row, dict) and isinstance(row.get("forgotten_at"), (int, float))
+        and now - row["forgotten_at"] >= FORGET_TOMBSTONE_S and not row.get("sandbox_id")
+    ]
+    for tk in doomed:
+        state.pop(tk, None)
+    if doomed:
+        _save_state()
+    return len(doomed)
 
 
 # ── CubeAPI (E2B-compatible control plane) ───────────────────────────────────
@@ -341,6 +392,7 @@ def tenant_data_dir(tk: str) -> Path:
 
 
 async def sbx_create(tk: str) -> str:
+    _check_not_forgotten(tk)  # before tenant_data_dir() recreates the dir
     host_mount = json.dumps([{
         "hostPath": str(tenant_data_dir(tk)),
         "mountPath": GUEST_DATA_DIR,
@@ -527,7 +579,12 @@ def _pending_fp(fp: Optional[str]) -> str:
 
 
 def _persist_instance(inst: Instance) -> None:
-    """Write the instance's sandbox, template, key and fingerprint to state.json."""
+    """Write the instance's sandbox, template, key and fingerprint to state.json.
+
+    Refused (410) for a forgotten tenant, so a cold start that raced /forget
+    cannot write the mapping back.
+    """
+    _check_not_forgotten(inst.tk)
     row = state.setdefault(inst.tk, {})
     row.update({
         "sandbox_id": inst.sandbox_id,
@@ -539,14 +596,28 @@ def _persist_instance(inst: Instance) -> None:
 
 
 def _drop_state_row(tk: str, sandbox_id: Optional[str] = None) -> None:
-    """Forget a tenant's sandbox mapping (only if it still names ``sandbox_id``)."""
+    """Forget a tenant's sandbox mapping (only if it still names ``sandbox_id``).
+
+    A /forget tombstone in the row survives.
+    """
     row = state.get(tk)
     if row is None:
         return
     if sandbox_id is not None and row.get("sandbox_id") != sandbox_id:
         return
-    state.pop(tk, None)
+    ts = row.get("forgotten_at")
+    if ts:
+        state[tk] = {"forgotten_at": ts}
+    else:
+        state.pop(tk, None)
     _save_state()
+
+
+async def _discard_sandbox(tk: str, sandbox_id: str) -> None:
+    """Delete a sandbox that never became usable; its state row goes only if
+    the delete succeeded, so a failed delete is found (and retried) again."""
+    if await sbx_delete(sandbox_id):
+        _drop_state_row(tk, sandbox_id)
 
 
 def _mark_engine_stale(inst: Instance) -> None:
@@ -558,7 +629,7 @@ def _mark_engine_stale(inst: Instance) -> None:
     if pool.get(inst.tk) is inst:
         try:
             _persist_instance(inst)
-        except OSError as e:
+        except (OSError, HTTPException) as e:
             log.warning("state write failed while marking %s stale: %s", inst.tk[:8], e)
 
 
@@ -656,9 +727,11 @@ async def get_or_create(
     meta: Optional[dict] = None,
 ) -> Instance:
     t0 = time.monotonic()
+    _check_not_forgotten(tk)
     async with pool_mutex:
         lock = uid_locks.setdefault(tk, asyncio.Lock())
     async with lock:
+        _check_not_forgotten(tk)
         inst = pool.get(tk)
         if inst is None:
             st = state.get(tk)
@@ -669,8 +742,7 @@ async def get_or_create(
                     # (NotFoundAtCubelet residue) before rebuilding; a plain
                     # 404 delete is a harmless no-op.
                     await sbx_delete(st["sandbox_id"])
-                    state.pop(tk, None)
-                    _save_state()
+                    _drop_state_row(tk)
                 elif st.get("template_id") != TEMPLATE_ID:
                     # Engine code is baked into the image, so a new template only
                     # reaches a tenant by rebuilding its sandbox. Lossless: the
@@ -678,8 +750,7 @@ async def get_or_create(
                     log.info("tenant %s template %s -> %s; rebuilding sandbox",
                              tk[:8], st.get("template_id"), TEMPLATE_ID)
                     await sbx_delete(st["sandbox_id"])
-                    state.pop(tk, None)
-                    _save_state()
+                    _drop_state_row(tk)
                 else:
                     # Re-attached from state.json after a router restart: the
                     # sandbox may be running or paused, either way it is not
@@ -704,22 +775,31 @@ async def get_or_create(
             fp = llm_fingerprint(model, llm, env)
             await _ensure_ready(inst, fp, env, api_key, meta=meta)
         except BaseException as exc:
-            if fresh:
-                # Never became a usable tenant instance: give the slot back
-                # and drop the half-made sandbox instead of leaking it. On
-                # cancellation (client gone mid-boot) the delete runs
-                # detached so the cancel is not blocked on CubeAPI; the
-                # sandbox is then in neither pool nor state (the row the
-                # boot pre-wrote goes too), so nothing else would ever reap
-                # it.
+            forgotten = _tombstoned(tk)
+            if fresh or forgotten:
+                # Never became a usable tenant instance (or the tenant was
+                # purged meanwhile): give the slot back and drop the sandbox
+                # instead of leaking it. On cancellation (client gone
+                # mid-boot) the delete runs detached so the cancel is not
+                # blocked on CubeAPI; the sandbox is then in neither pool nor
+                # state (the row the boot pre-wrote goes too), so nothing
+                # else would ever reap it.
                 if pool.get(tk) is inst:
                     pool.pop(tk, None)
                 if inst.sandbox_id:
-                    _drop_state_row(tk, inst.sandbox_id)
                     if isinstance(exc, Exception):
-                        await sbx_delete(inst.sandbox_id)
+                        await _discard_sandbox(tk, inst.sandbox_id)
                     else:
+                        _drop_state_row(tk, inst.sandbox_id)
                         _spawn(sbx_delete(inst.sandbox_id))
+                if forgotten:
+                    # A cold start that raced /forget may have recreated the
+                    # tenant's data dir before it saw the tombstone.
+                    purge = asyncio.to_thread(_rmtree_tenant_dir, DATA_ROOT / tk)
+                    if isinstance(exc, Exception):
+                        await purge
+                    else:
+                        _spawn(purge)
             raise
         finally:
             inst.booting = False
@@ -1251,7 +1331,9 @@ def _frame(obj: dict) -> str:
 def _classify_status(status_code: int, exc: Optional[HTTPException] = None) -> str:
     if isinstance(exc, _EngineFailed):
         return "engine_failed"
-    return {503: "busy", 504: "timeout", 502: "upstream_failed"}.get(status_code, "error")
+    return {
+        503: "busy", 504: "timeout", 502: "upstream_failed", 410: "forgotten",
+    }.get(status_code, "error")
 
 
 async def _ask_stream(body: AskBody, timeout_s: int):
@@ -1291,6 +1373,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
             stats["iterations"] = engine_stats.get("iterations")
 
     try:
+        _check_not_forgotten(tk)
         async with _active_slot(min(ACTIVE_QUEUE_WAIT_S, float(timeout_s)), stats):
             meta: dict[str, Any] = {}
             try:
@@ -1503,9 +1586,32 @@ async def forget(body: dict, authorization: Optional[str] = Header(None)):
     if not uid:
         raise HTTPException(400, "uid required")
     tk = tenant_key(uid)
+    # Tombstone first: from here on no ask can create a sandbox, write the
+    # mapping back or recreate the data dir for this tenant — including a
+    # cold start already in flight, which aborts on it and removes what it
+    # made. Then take the tenant lock (bounded) so an in-flight cold start
+    # normally finishes aborting before the purge runs.
+    _set_tombstone(tk)
+    async with pool_mutex:
+        lock = uid_locks.setdefault(tk, asyncio.Lock())
+    locked = False
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=FORGET_LOCK_WAIT_S)
+        locked = True
+    except asyncio.TimeoutError:
+        log.warning("forget tenant %s: tenant lock busy for %.0fs; purging anyway",
+                    tk[:8], FORGET_LOCK_WAIT_S)
+    try:
+        return await _forget_locked(tk)
+    finally:
+        if locked:
+            lock.release()
+
+
+async def _forget_locked(tk: str):
     async with pool_mutex:
         inst = pool.pop(tk, None)
-    sandbox_id = inst.sandbox_id if inst else (state.get(tk) or {}).get("sandbox_id")
+    sandbox_id = (inst.sandbox_id if inst else "") or (state.get(tk) or {}).get("sandbox_id")
     errors: list[str] = []
     sandbox_ok = True
     if sandbox_id:
@@ -1522,9 +1628,9 @@ async def forget(body: dict, authorization: Optional[str] = Header(None)):
         errors.append(rm_err)
     if sandbox_ok:
         # Keep the mapping while the sandbox still exists so the nightly
-        # retry can find it again; a leftover dir alone needs no state.
-        state.pop(tk, None)
-        _save_state()
+        # retry can find it again; a leftover dir alone needs no mapping.
+        # The tombstone stays either way.
+        _drop_state_row(tk)
     if errors:
         # laicai's engine-forget job keys on `res.ok` (engine-forget.ts): a
         # non-2xx keeps the job pending for the 23:30 retry instead of
@@ -2339,11 +2445,21 @@ async def _sweep_stale_templates() -> None:
     vibe_tpls = await asyncio.to_thread(_vibe_template_ids)
     doomed: list[str] = []
 
-    # 1. state.json tenants pinned to superseded templates.
+    # 1. state.json tenants pinned to superseded templates, and forgotten
+    #    tenants whose sandbox delete is still pending (their row keeps the
+    #    sandbox id until a delete succeeds).
     changed = False
+    forgotten_rows: dict[str, str] = {}  # sandbox_id -> tk
     for tk, st in list(state.items()):
         sid = st.get("sandbox_id")
-        if not sid or st.get("template_id") == TEMPLATE_ID:
+        if not sid:
+            continue
+        if st.get("forgotten_at"):
+            log.info("sweep: forgotten tenant %s still maps sandbox %s", tk[:8], sid[:12])
+            doomed.append(sid)
+            forgotten_rows[sid] = tk
+            continue
+        if st.get("template_id") == TEMPLATE_ID:
             continue
         log.info("sweep: tenant %s sandbox %s on stale template %s",
                  tk[:8], sid[:12], st.get("template_id"))
@@ -2380,8 +2496,12 @@ async def _sweep_stale_templates() -> None:
             status = str((info or {}).get("status") or (info or {}).get("state") or "").lower()
             if status == "running":
                 await sbx_pause(sid)
-            await sbx_delete(sid)
-            log.info("sweep: destroyed sandbox %s", sid[:12])
+            if await sbx_delete(sid):
+                log.info("sweep: destroyed sandbox %s", sid[:12])
+                if sid in forgotten_rows:
+                    _drop_state_row(forgotten_rows[sid], sid)
+            else:
+                log.warning("sweep: destroy %s refused; retried next start", sid[:12])
         except Exception as e:  # noqa: BLE001
             log.warning("sweep: destroy %s failed: %s", sid[:12], e)
 
@@ -2405,6 +2525,9 @@ async def _startup():
     global state
     state = _load_state()
     log.info("loaded %d tenant mappings from %s", len(state), STATE_FILE)
+    pruned = _prune_tombstones()
+    if pruned:
+        log.info("pruned %d expired /forget tombstones", pruned)
     _spawn(_reaper())
     if SWEEP_STALE:
         _spawn(_sweep_stale_templates())

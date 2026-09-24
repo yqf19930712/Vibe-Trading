@@ -24,6 +24,9 @@ No CubeAPI, no sandbox, no engine: every upstream call is an async fake.
     moves on to the next victim and the reaper retries next sweep.
   · The answer window is anchored at the ask's arrival (queue / cold start /
     lock wait come out of it) and attempt_meta reports the remaining window.
+  · /forget writes a tombstone first and takes the tenant lock (bounded):
+    a racing cold start aborts and removes its sandbox and data dir, and
+    later asks for the tenant get 410 until the tombstone expires.
 """
 from __future__ import annotations
 
@@ -839,3 +842,143 @@ class TestAnswerWindow:
         assert meta["attempt_id"] == "a1" and meta["vibe_session_id"] == "sid-1"
         assert 99.0 <= meta["answer_deadline_s"] <= 99.8
         assert meta["engine_deadline_s"] == pytest.approx(89.7, abs=0.3)
+
+
+# ── /forget: tenant lock + tombstone ─────────────────────────────────────────
+
+AUTH = f"Bearer {os.environ['VIBE_ROUTER_TOKEN']}"
+
+
+class TestForgetTombstone:
+    def _cube(self, monkeypatch, boot_delay=0.0):
+        calls = {"create": [], "delete": [], "boots": 0}
+
+        async def sbx_create(tk):
+            router.tenant_data_dir(tk)
+            calls["create"].append(tk)
+            return f"sbx-{len(calls['create'])}"
+
+        async def sbx_delete(sandbox_id):
+            calls["delete"].append(sandbox_id)
+            return True
+
+        async def health(inst):
+            return {"launcher": "ok", "engine": "stopped"}
+
+        async def boot():
+            calls["boots"] += 1
+            await asyncio.sleep(boot_delay)
+            return _Resp(200, {"ok": True})
+
+        monkeypatch.setattr(router, "sbx_create", sbx_create)
+        monkeypatch.setattr(router, "sbx_delete", sbx_delete)
+        monkeypatch.setattr(router, "_launcher_health", health)
+        monkeypatch.setattr(router, "http", _FakeHttp(boot))
+        return calls
+
+    def test_forgotten_tenant_cannot_be_recreated(self, monkeypatch, clean_state):
+        calls = self._cube(monkeypatch)
+        uid = "gone-user"
+        tk = router.tenant_key(uid)
+        _run(router.get_or_create(tk))
+        assert (clean_state / tk).is_dir() and tk in router.pool
+
+        assert _run(router.forget({"uid": uid}, authorization=AUTH)) == {"ok": True}
+        assert not (clean_state / tk).exists()
+        assert set(router.state[tk]) == {"forgotten_at"}
+
+        with pytest.raises(HTTPException) as ei:
+            _run(router.get_or_create(tk))
+        assert ei.value.status_code == 410
+        assert not (clean_state / tk).exists()
+        assert calls["create"] == [tk]
+        # Survives a router restart (it is in state.json).
+        import json as _json
+
+        assert "forgotten_at" in _json.loads((clean_state / "state.json").read_text())[tk]
+
+    def test_ask_for_a_forgotten_tenant_is_a_410_frame(self, monkeypatch, clean_state):
+        h = _AskHarness(monkeypatch)
+        router.state[router.tenant_key("u-ask")] = {"forgotten_at": time.time()}
+        frames = h.run()
+        assert len(frames) == 1
+        assert frames[0]["t"] == "error" and frames[0]["status"] == 410
+        assert frames[0]["stats"]["router"]["outcome"] == "forgotten"
+
+    def test_forget_waits_for_an_in_flight_cold_start(self, monkeypatch, clean_state):
+        calls = self._cube(monkeypatch, boot_delay=0.2)
+        uid = "racer"
+        tk = router.tenant_key(uid)
+
+        async def go():
+            cold = asyncio.create_task(router.get_or_create(tk))
+            await asyncio.sleep(0.05)  # inside the boot, tenant lock held
+            forget_res = await router.forget({"uid": uid}, authorization=AUTH)
+            with pytest.raises(HTTPException) as ei:
+                await cold
+            return forget_res, ei.value
+
+        res, exc = _run(go())
+        assert res == {"ok": True}
+        assert exc.status_code == 410       # the cold start aborted on the tombstone
+        assert calls["delete"] == ["sbx-1"]  # … and removed its own sandbox
+        assert tk not in router.pool
+        assert set(router.state[tk]) == {"forgotten_at"}
+        assert not (clean_state / tk).exists()
+
+    def test_lock_wait_is_bounded_and_the_racer_cleans_up(self, monkeypatch, clean_state):
+        monkeypatch.setattr(router, "FORGET_LOCK_WAIT_S", 0.05)
+        calls = self._cube(monkeypatch, boot_delay=0.4)
+        uid = "slow-racer"
+        tk = router.tenant_key(uid)
+
+        async def go():
+            cold = asyncio.create_task(router.get_or_create(tk))
+            await asyncio.sleep(0.05)
+            t0 = time.monotonic()
+            forget_res = await router.forget({"uid": uid}, authorization=AUTH)
+            waited = time.monotonic() - t0
+            with pytest.raises(HTTPException):
+                await cold
+            return forget_res, waited
+
+        res, waited = _run(go())
+        assert res == {"ok": True}
+        assert waited < 0.3
+        assert "sbx-1" in calls["delete"]
+        assert tk not in router.pool
+        assert set(router.state[tk]) == {"forgotten_at"}
+        assert not (clean_state / tk).exists()
+
+    def test_failed_sandbox_delete_keeps_mapping_and_tombstone(self, monkeypatch, clean_state):
+        tk = router.tenant_key("stuck")
+        router.state[tk] = {"sandbox_id": "sbx-stuck", "template_id": router.TEMPLATE_ID}
+
+        async def refuse(sandbox_id):
+            return False
+
+        monkeypatch.setattr(router, "sbx_delete", refuse)
+        resp = _run(router.forget({"uid": "stuck"}, authorization=AUTH))
+        assert resp.status_code == 500
+        assert router.state[tk]["sandbox_id"] == "sbx-stuck"
+        assert "forgotten_at" in router.state[tk]
+
+    def test_expired_tombstones_are_pruned_and_allow_asks_again(self, monkeypatch, clean_state):
+        monkeypatch.setattr(router, "FORGET_TOMBSTONE_S", 100)
+        router.state["old"] = {"forgotten_at": time.time() - 1000}
+        router.state["fresh"] = {"forgotten_at": time.time()}
+        router.state["old-with-sandbox"] = {"forgotten_at": time.time() - 1000, "sandbox_id": "sbx"}
+        assert not router._tombstoned("old") and router._tombstoned("fresh")
+        assert router._prune_tombstones() == 1
+        assert "old" not in router.state
+        assert "fresh" in router.state and "old-with-sandbox" in router.state
+
+    def test_drop_state_row_keeps_the_tombstone(self, clean_state):
+        router.state["t"] = {"sandbox_id": "s", "api_key": "k", "forgotten_at": 1.0}
+        router._drop_state_row("t", "s")
+        assert router.state["t"] == {"forgotten_at": 1.0}
+        router.state["u"] = {"sandbox_id": "s"}
+        router._drop_state_row("u", "other")
+        assert "u" in router.state
+        router._drop_state_row("u")
+        assert "u" not in router.state
