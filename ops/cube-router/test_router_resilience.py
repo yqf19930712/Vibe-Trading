@@ -22,6 +22,8 @@ No CubeAPI, no sandbox, no engine: every upstream call is an async fake.
     every 503 busy frame carries code=busy + busy_reason.
   · A pause CubeAPI refuses leaves the sandbox counted as RUNNING; eviction
     moves on to the next victim and the reaper retries next sweep.
+  · The answer window is anchored at the ask's arrival (queue / cold start /
+    lock wait come out of it) and attempt_meta reports the remaining window.
 """
 from __future__ import annotations
 
@@ -813,3 +815,27 @@ class TestPauseRefused:
         paused = _run(router._reap_idle_once())
         assert paused == [b]
         assert a.paused is False and b.paused is True
+
+
+# ── the answer window starts when the ask arrives ────────────────────────────
+
+
+class TestAnswerWindow:
+    def test_queue_and_boot_time_come_out_of_the_answer_window(self, monkeypatch):
+        h = _AskHarness(monkeypatch)
+
+        async def slow_cold_start(tk, model, llm, meta=None):
+            await asyncio.sleep(0.3)
+            return h.inst
+
+        monkeypatch.setattr(router, "get_or_create", slow_cold_start)
+        t_before = time.monotonic()
+        frames = h.run(timeout_s=100)
+        t_after = time.monotonic()
+
+        deadline = h.waiter_kw["deadline"]
+        assert t_before + 100 <= deadline <= t_after + 100
+        meta = next(f for f in frames if f.get("ev") == "attempt_meta")["data"]
+        assert meta["attempt_id"] == "a1" and meta["vibe_session_id"] == "sid-1"
+        assert 99.0 <= meta["answer_deadline_s"] <= 99.8
+        assert meta["engine_deadline_s"] == pytest.approx(89.7, abs=0.3)

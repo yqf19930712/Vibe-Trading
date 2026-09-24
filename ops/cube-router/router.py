@@ -1257,6 +1257,11 @@ def _classify_status(status_code: int, exc: Optional[HTTPException] = None) -> s
 async def _ask_stream(body: AskBody, timeout_s: int):
     tk = tenant_key(body.uid)
     t_req = time.monotonic()
+    # The whole ask — slot queue, cold start, lock wait, engine work — lives
+    # inside timeout_s from arrival. The caller's own clock started a moment
+    # earlier and allows timeout_s + a small margin, so the router's 504 (with
+    # stats) always lands before the caller gives up.
+    answer_deadline = t_req + timeout_s
     stats: dict[str, Any] = {
         "tk8": tk[:8],
         "channel": "byok" if body.llm else "builtin",
@@ -1310,6 +1315,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                         engine_deadline_s = max(
                             60.0, timeout_s - (time.monotonic() - t_req) - 10.0
                         )
+                        stats["engine_deadline_s"] = round(engine_deadline_s, 1)
                         sid_ = await _ensure_session(inst, body.vibeSessionId)
                         turn_kwargs = {
                             "deadline_s": engine_deadline_s,
@@ -1345,10 +1351,19 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                     # the admin detail page can tail engine logs/trace while
                     # the run is still in flight (not only after the terminal
                     # frame). Consumers ignore unknown ev names, so this is
-                    # backward-compatible.
+                    # backward-compatible. ``answer_deadline_s`` = seconds from
+                    # this frame until the router answers or 504s;
+                    # ``engine_deadline_s`` = the budget handed to the engine.
                     yield _frame({
                         "t": "progress", "ev": "attempt_meta",
-                        "data": {"attempt_id": attempt_id, "vibe_session_id": sid},
+                        "data": {
+                            "attempt_id": attempt_id,
+                            "vibe_session_id": sid,
+                            "answer_deadline_s": round(
+                                max(0.0, answer_deadline - time.monotonic()), 1
+                            ),
+                            "engine_deadline_s": stats.get("engine_deadline_s"),
+                        },
                     })
 
                     answered = False
@@ -1381,7 +1396,8 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                     pump = asyncio.create_task(_pump_events(inst, sid, q, stats=stats))
                     waiter = asyncio.create_task(
                         _wait_answer(
-                            inst, sid, attempt_id, timeout_s, failed=failed, stats=stats
+                            inst, sid, attempt_id, timeout_s, failed=failed,
+                            deadline=answer_deadline, stats=stats,
                         )
                     )
                     try:
