@@ -934,6 +934,34 @@ async def _pump_events(
         log.info("event pump for %s dropped (%s); reconnecting in %.1fs", sid, reason, delay)
 
 
+# Events the caller bills or reads as this ask's outcome (laicai sums every
+# forwarded llm_usage into the user's token quota and stores attempt_stats as
+# the run's engine stats).
+_METERED_EVENTS = frozenset({"llm_usage", "attempt_stats"})
+
+
+def _event_belongs_to_ask(ev: dict, attempt_id: Optional[str]) -> bool:
+    """Whether one engine event may be forwarded as part of this ask.
+
+    The engine stamps ``attempt_id`` on every attempt-scoped event, and its
+    per-session buffer replays the whole buffer to a subscriber that joins
+    while an attempt is running — on a continued session that buffer still
+    holds the previous attempt's ``llm_usage`` / ``attempt_stats``. Only the
+    current attempt's events go through. Session-level events carry no
+    ``attempt_id`` (``heartbeat``, ``message.received``, …) and pass as
+    before, except metered ones: usage that cannot be attributed to this
+    attempt is never forwarded. An engine that returned no ``attempt_id``
+    gives nothing to filter on, so everything passes.
+    """
+    if attempt_id is None:
+        return True
+    data = ev.get("data")
+    owner = data.get("attempt_id") if isinstance(data, dict) else None
+    if owner is None:
+        return ev.get("ev") not in _METERED_EVENTS
+    return owner == attempt_id
+
+
 class _SessionGone(Exception):
     pass
 
@@ -1138,6 +1166,20 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                     q: "asyncio.Queue[dict]" = asyncio.Queue()
                     failed = _FailSignal()
 
+                    def _admit_event(ev: dict) -> bool:
+                        """Attribution filter + the bookkeeping of an admitted event."""
+                        if not _event_belongs_to_ask(ev, attempt_id):
+                            stats["stale_events_dropped"] = (
+                                int(stats.get("stale_events_dropped") or 0) + 1
+                            )
+                            return False
+                        if ev.get("ev") != "heartbeat":
+                            stats.setdefault(
+                                "first_progress_ms", int((time.monotonic() - t_req) * 1000)
+                            )
+                        _grab_engine_stats(ev)
+                        return True
+
                     def _note_attempt_failed(ev: dict) -> None:
                         if ev.get("ev") != "attempt.failed":
                             return
@@ -1160,16 +1202,14 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                             except asyncio.TimeoutError:
                                 continue
                             inst.last_activity = time.monotonic()
-                            stats.setdefault(
-                                "first_progress_ms", int((time.monotonic() - t_req) * 1000)
-                            )
-                            _grab_engine_stats(ev)
+                            if not _admit_event(ev):
+                                continue
                             _note_attempt_failed(ev)
                             yield _frame({"t": "progress", **ev})
                         while not q.empty():
                             ev = q.get_nowait()
-                            _grab_engine_stats(ev)
-                            yield _frame({"t": "progress", **ev})
+                            if _admit_event(ev):
+                                yield _frame({"t": "progress", **ev})
                         answer = await waiter
                         answered = True
                         inst.last_activity = time.monotonic()

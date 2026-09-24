@@ -10,6 +10,8 @@ No CubeAPI, no sandbox, no engine: every upstream call is an async fake.
     fails fast when the launcher says the engine process is gone.
   · The event pump reopens a dropped stream with Last-Event-ID and never
     forwards an event id twice.
+  · Only the current attempt's events reach the caller: a continued
+    session's replayed llm_usage / attempt_stats are dropped and counted.
 """
 from __future__ import annotations
 
@@ -272,3 +274,128 @@ class TestPumpReconnect:
         ], want=2)
         assert [g["ev"] for g in got] == ["heartbeat", "text_delta"]
         assert "Last-Event-ID" not in fake.calls[1]["headers"]
+
+
+# ── /ask stream harness (every upstream call stubbed) ────────────────────────
+
+
+class _AskHarness:
+    """Stubs the upstream calls of ``_ask_stream``; tests tweak the hooks."""
+
+    def __init__(self, monkeypatch):
+        self.inst = _inst(router.tenant_key("u-ask"))
+        self.events: list[dict] = []
+        self.answer_delay = 0.05
+        self.answer: object = "答案"
+        self.recorded: list[dict] = []
+        self.cancelled: list[str] = []
+        self.waiter_kw: dict = {}
+        h = self
+
+        async def get_or_create(tk, model, llm, meta=None):
+            return h.inst
+
+        async def ensure_session(inst, sid):
+            return sid or "sid-1"
+
+        async def post_turn(inst, sid, query, **kw):
+            h.turn_kw = kw
+            return "a1"
+
+        async def pump(inst, sid, q, **kw):
+            for ev in h.events:
+                q.put_nowait(ev)
+            await asyncio.sleep(3600)
+
+        async def wait_answer(inst, sid, attempt_id, timeout_s, failed=None, **kw):
+            h.waiter_kw = {"timeout_s": timeout_s, **kw}
+            await asyncio.sleep(h.answer_delay)
+            if isinstance(h.answer, BaseException):
+                raise h.answer
+            return h.answer
+
+        async def cancel_bg(inst, sid, tk, stats, finalize=None):
+            h.cancelled.append(sid)
+            if finalize is not None:
+                finalize()
+            router._record_ask(stats)
+
+        monkeypatch.setattr(router, "get_or_create", get_or_create)
+        monkeypatch.setattr(router, "_ensure_session", ensure_session)
+        monkeypatch.setattr(router, "_post_turn", post_turn)
+        monkeypatch.setattr(router, "_pump_events", pump)
+        monkeypatch.setattr(router, "_wait_answer", wait_answer)
+        monkeypatch.setattr(router, "_cancel_attempt_bg", cancel_bg)
+        monkeypatch.setattr(router, "_record_ask", self.recorded.append)
+
+    def run(self, body=None, timeout_s: int = 30) -> list[dict]:
+        import json as _json
+
+        body = body or router.AskBody(uid="u-ask", query="q", vibeSessionId="sid-1")
+
+        async def collect():
+            return [_json.loads(line) async for line in router._ask_stream(body, timeout_s)]
+
+        return _run(collect())
+
+
+# ── forwarded events are attributed to the current attempt ──────────────────
+
+
+class TestEventAttribution:
+    def test_pure_rule(self):
+        own = {"ev": "llm_usage", "data": {"attempt_id": "a1", "input_tokens": 1}}
+        stale = {"ev": "llm_usage", "data": {"attempt_id": "a0", "input_tokens": 1}}
+        orphan_usage = {"ev": "llm_usage", "data": {"input_tokens": 1}}
+        session_level = {"ev": "message.received", "data": {"role": "user", "content": "q"}}
+        heartbeat = {"ev": "heartbeat", "data": {"ts": 1}}
+        stale_delta = {"ev": "text_delta", "data": {"attempt_id": "a0", "delta": "x"}}
+        assert router._event_belongs_to_ask(own, "a1")
+        assert not router._event_belongs_to_ask(stale, "a1")
+        assert not router._event_belongs_to_ask(orphan_usage, "a1")
+        assert router._event_belongs_to_ask(session_level, "a1")
+        assert router._event_belongs_to_ask(heartbeat, "a1")
+        assert not router._event_belongs_to_ask(stale_delta, "a1")
+        # No attempt id from the engine: nothing to filter on.
+        assert router._event_belongs_to_ask(stale, None)
+
+    def test_replayed_previous_attempt_is_neither_forwarded_nor_counted(self, monkeypatch):
+        h = _AskHarness(monkeypatch)
+        prev_stats = {"attempt_id": "a0", "status": "success", "iterations": 9}
+        cur_stats = {"attempt_id": "a1", "status": "success", "iterations": 2}
+        h.events = [
+            # What a continued session's buffer replays first …
+            {"ev": "message.received", "data": {"role": "user", "content": "上一问"}},
+            {"ev": "attempt.created", "data": {"attempt_id": "a0"}},
+            {"ev": "llm_usage", "data": {"attempt_id": "a0", "input_tokens": 400000,
+                                         "output_tokens": 90000, "source": "swarm"}},
+            {"ev": "attempt_stats", "data": prev_stats},
+            {"ev": "attempt.completed", "data": {"attempt_id": "a0", "status": "completed"}},
+            {"ev": "llm_usage", "data": {"input_tokens": 7}},
+            # … then this attempt's own events.
+            {"ev": "attempt.started", "data": {"attempt_id": "a1"}},
+            {"ev": "heartbeat", "data": {"ts": 1}},
+            {"ev": "llm_usage", "data": {"attempt_id": "a1", "input_tokens": 9000,
+                                         "output_tokens": 3000}},
+            {"ev": "attempt_stats", "data": cur_stats},
+        ]
+        frames = h.run()
+
+        progress = [f for f in frames if f["t"] == "progress"]
+        usage = [f["data"] for f in progress if f["ev"] == "llm_usage"]
+        assert usage == [{"attempt_id": "a1", "input_tokens": 9000, "output_tokens": 3000}]
+        assert [f["data"] for f in progress if f["ev"] == "attempt_stats"] == [cur_stats]
+        assert not any(isinstance(f.get("data"), dict) and f["data"].get("attempt_id") == "a0"
+                       for f in progress)
+        assert any(f["ev"] == "message.received" for f in progress)
+        answer = frames[-1]
+        assert answer["t"] == "answer"
+        assert answer["stats"]["engine"] == cur_stats
+        assert answer["stats"]["router"]["stale_events_dropped"] == 5
+        assert h.recorded and h.recorded[0]["stale_events_dropped"] == 5
+
+    def test_stale_attempt_failed_does_not_end_this_ask(self, monkeypatch):
+        h = _AskHarness(monkeypatch)
+        h.events = [{"ev": "attempt.failed", "data": {"attempt_id": "a0", "error": "old"}}]
+        frames = h.run()
+        assert frames[-1]["t"] == "answer"
