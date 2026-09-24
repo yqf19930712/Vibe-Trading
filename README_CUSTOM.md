@@ -94,7 +94,7 @@ cubemastercli tpl create-from-image \
 
 镜像内：launcher 常驻 `:8898`（模板探针目标），引擎 `:8899` 由 launcher 按 router 下发的租户 env 拉起；以非 root 用户 `vibe` 运行，`HOME=/home/vibe`。
 
-**`/app`（引擎代码）归 root、对运行用户只读**：构建期 `python -m compileall -q /app/agent` 预编译字节码后 `chmod -R go-w /app`，只有 `/home/vibe/.vibe-trading`（租户 bind-mount 的挂载点）chown 给 `vibe`；镜像 `ENV` 固定 `VIBE_DATA_DIR=/home/vibe/.vibe-trading`、`PYTHONDONTWRITEBYTECODE=1`、`PYTHONNOUSERSITE=1`。理由：引擎的 shell 工具以 `vibe` 身份运行，可写的 `/app` 会让租户代码改写引擎本身，下一次 `/boot` 就以带全租户共享 LLM 凭据的 env 跑起来；`PYTHONNOUSERSITE` 挡的是同一类路径——租户在可写的 HOME 里放 `~/.local/.../site-packages` 的 `.pth` / `sitecustomize`（该变量不进 shell 子进程的白名单 env，所以 bash 里 `pip install --user` 照常可用）。运行时引擎不写 `/app`：租户状态走 `VIBE_DATA_DIR`，缓存走 HOME，backtest 子进程 cwd 虽是 `/app/agent`，产物写 run_dir。已知行为：`api_server` 的 `/settings/*` 写接口（写 `agent/.env`）在镜像里失败，router 不调用它们。**引擎新增任何运行时写路径都必须落在 `VIBE_DATA_DIR` 或 HOME 下**（`ops/cube-router/test_engine_image.py` 只检查 Dockerfile，不检查引擎代码）。
+**`/app`（引擎代码）归 root、对运行用户只读**：构建期 `python -m compileall -q /app/agent` 预编译字节码后 `chmod -R go-w /app`，只有 `/home/vibe/.vibe-trading`（租户 bind-mount 的挂载点）chown 给 `vibe`；镜像 `ENV` 固定 `VIBE_DATA_DIR=/home/vibe/.vibe-trading`、`PYTHONDONTWRITEBYTECODE=1`、`PYTHONNOUSERSITE=1`。理由：引擎的 shell 工具以 `vibe` 身份运行（CubeSandbox 里由 root launcher 降权保证，见下文「进程身份」），可写的 `/app` 会让租户代码改写引擎本身，下一次 `/boot` 就以带全租户共享 LLM 凭据的 env 跑起来；`PYTHONNOUSERSITE` 挡的是同一类路径——租户在可写的 HOME 里放 `~/.local/.../site-packages` 的 `.pth` / `sitecustomize`（该变量不进 shell 子进程的白名单 env，所以 bash 里 `pip install --user` 照常可用）。运行时引擎不写 `/app`：租户状态走 `VIBE_DATA_DIR`，缓存走 HOME，backtest 子进程 cwd 虽是 `/app/agent`，产物写 run_dir。已知行为：`api_server` 的 `/settings/*` 写接口（写 `agent/.env`）在镜像里失败，router 不调用它们。**引擎新增任何运行时写路径都必须落在 `VIBE_DATA_DIR` 或 HOME 下**（`ops/cube-router/test_engine_image.py` 只检查 Dockerfile，不检查引擎代码）。
 
 新镜像发布前在宿主上核对（任一不符都不要切模板）：
 
@@ -107,7 +107,7 @@ docker run --rm --entrypoint sh <image> -c 'find /app -writable 2>/dev/null | he
 #   find 无输出；__pycache__ 里有 .cpython-312.pyc；三个变量都在
 ```
 
-切到新模板后在一个租户沙箱里经正常 `/ask` 复核：宿主 `DATA_ROOT/<tk>/` 下 `sessions/`、`runs/`、`logs/engine.jsonl` 有新内容；让模型用 bash 执行 `echo x > /app/agent/src/evil.py` 得到 Permission denied、`pip install --user six && python -c "import six"` 成功、`curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8899/sessions` 为 `401`（多租户档不信任 loopback）、`head -3 ~/.ssh/egress_key` 的工具结果为 `[redacted:VIBE_EGRESS_SSH_KEY]`（配了出境隧道时）；backtest 与一次短 `deep_team` 各跑通、`.swarm/runs` 落在租户目录。
+切到新模板后在一个租户沙箱里经正常 `/ask` 复核：宿主 `DATA_ROOT/<tk>/` 下 `sessions/`、`runs/`、`logs/engine.jsonl` 有新内容；让模型用 bash 执行 `id` 应为 `uid=1000(vibe)`（是 root 说明 launcher 没降权）、`echo x > /app/agent/src/evil.py` 得到 Permission denied、`pip install --user six && python -c "import six"` 成功、`curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8899/sessions` 为 `401`（多租户档不信任 loopback）；注意模型可能拒绝执行明显是在探测鉴权或列进程、读 `.ssh` 的命令（返回空回复），这类检查以测试为准（`test_launcher_privdrop.py`、`test_tenant_api_boundary.py`），沙箱里只做 `id` / 写 `/app` 这类无歧义的；backtest 与一次短 `deep_team` 各跑通、`.swarm/runs` 落在租户目录。
 
 ### 3. cube-router 部署
 
@@ -200,7 +200,7 @@ launcher `:8898` 的 `/boot` `/stop` 在 guest 内经 loopback 可达。多租�
 - **回退 router.py 到不含 launcher 鉴权的版本**：旧 router 不带 Authorization 头，持 token 的 launcher 一律 401、该租户所有 ask 502，所以必须**同时回退 router.py 与模板 id**：（建议先在新 router 上做一次「只关鉴权」缩小影响面）部署旧 `router.py`，同时把 `VIBE_CUBE_TEMPLATE_ID` 改成**不同于持 token 沙箱所用模板**的 id 再重启——回到旧引擎就用旧镜像重新建一次模板（启动清扫多半已删掉旧模板），只回退 router 就用新镜像再建一个模板拿新 id（新 launcher 在旧 router 下永远收不到 token）。旧 router 的启动清扫（`VIBE_SWEEP_STALE_TEMPLATES` 不为 0 时）会销毁不在当前模板上的全部沙箱；关了清扫时 `get_or_create` 也会在各租户下一问发现 `template_id` 不符、先删后建。验证：挑一个开关开启期间建过沙箱的租户发一问，应冷启成功而不是 `engine boot failed: 401`。
 - 单个租户出现 launcher 401（例如 `VIBE_ROUTER_SECRET` 被改）不会自愈：删掉它的沙箱与 state 行，下一问重建。
 
-**残余面**：launcher 与 bash 工具同为 uid 1000。launcher 启动时 `PR_SET_DUMPABLE=0` 挡住同 uid 的 ptrace 与读内存，但挡不住同 uid 的 `kill`；若 guest 里杀掉 launcher 后 `:8898` 能被租户进程重新监听，伪造的 launcher 会在下一次 `/boot` 收到完整 boot env（含共享 LLM 凭据与出境私钥）。根治要改进程模型（launcher 以 root 运行、降权后再拉起引擎，私钥放 root 专属目录或交给 agent 托管），列在放量前的收紧清单里。可以在沙箱里只观察不动手：`pgrep -af launcher; ps -o pid,ppid,user,cmd -p 1`。
+**进程身份**：CubeSandbox 不理会镜像的 `USER vibe`，模板 CMD（launcher）在 guest 里是 root。launcher 保留 root，拉起引擎时降到 `vibe`（uid 1000），引擎的工具子进程随之是 uid 1000——租户 shell 杀不掉、ptrace 不了 launcher；出境私钥在 `/run/vibe-launcher/egress_key`（root 0700），uid 1000 读不到。每次 `/boot` 前 launcher 把 `/home/vibe/.vibe-trading` 下属主不是 `vibe` 的条目 chown 过去（历史上引擎以 root 运行、留下的 root 文件；不跟随 symlink）。本机 `docker run` 会遵守 `USER`，那时 launcher 本身就是 `vibe`、不降权，私钥写 `~/.ssh`。
 
 ### 换模型（不需要动代码）
 
