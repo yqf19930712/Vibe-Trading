@@ -14,6 +14,10 @@ No CubeAPI, no sandbox, no engine: every upstream call is an async fake.
     session's replayed llm_usage / attempt_stats are dropped and counted.
   · The engine fingerprint covers every forwarded router.env name and value
     (hashed), so an env edit + router restart reboots existing engines.
+  · An interrupted or timed-out /boot leaves the router holding the NEW key
+    under a boot-pending fingerprint (adopted if the engine came up with it,
+    rebooted otherwise); an engine 401 marks the instance stale, and /ask
+    reboots once and retries.
 """
 from __future__ import annotations
 
@@ -464,3 +468,216 @@ class TestEnvFingerprint:
         inst = router.Instance("tk", "sbx", fp, "old-key")
         _run(router._ensure_ready(inst, fp, env, key))
         assert booted == []
+
+
+# ── interrupted /boot never leaves the router with a dead key ────────────────
+
+
+@pytest.fixture()
+def clean_state(monkeypatch, tmp_path):
+    router.pool.clear()
+    router.state.clear()
+    router.uid_locks.clear()
+    monkeypatch.setattr(router, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(router, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(router, "pool_mutex", asyncio.Lock())
+    monkeypatch.setattr(router, "capacity_lock", asyncio.Lock())
+    yield tmp_path
+    router.pool.clear()
+    router.state.clear()
+    router.uid_locks.clear()
+
+
+class _FakeHttp:
+    """Launcher /boot (post) + engine calls (request) through one object."""
+
+    def __init__(self, boot, engine=None):
+        self.boot = boot
+        self.engine = engine or (lambda method, url, headers: _Resp(404, {}))
+        self.boots: list[dict] = []
+        self.engine_calls: list[tuple[str, str, dict]] = []
+
+    async def post(self, url, json=None, **kw):
+        self.boots.append({"url": url, "env": dict((json or {}).get("env") or {}), **kw})
+        return await self.boot()
+
+    async def request(self, method, url, headers=None, **kw):
+        self.engine_calls.append((method, url, dict(headers or {})))
+        return self.engine(method, url, headers or {})
+
+
+class TestBootInterruption:
+    def _setup(self, monkeypatch, boot, engine=None, health="stopped"):
+        fake = _FakeHttp(boot, engine)
+        monkeypatch.setattr(router, "http", fake)
+        state = {"engine": health}
+
+        async def launcher_health(inst):
+            return {"launcher": "ok", "engine": state["engine"]}
+
+        monkeypatch.setattr(router, "_launcher_health", launcher_health)
+        return fake, state
+
+    def _pooled(self, tk="t" * 64):
+        inst = router.Instance(tk, "sbx-1", "old-fp", "OLD-KEY")
+        router.pool[tk] = inst
+        return inst
+
+    def test_transport_error_mid_boot_keeps_the_new_key(self, monkeypatch, clean_state):
+        async def boot():
+            raise httpx.ReadError("connection reset during boot")
+
+        self._setup(monkeypatch, boot)
+        inst = self._pooled()
+        env, key = router.engine_env(None, None)
+        fp = router.llm_fingerprint(None, None, env)
+        with pytest.raises(httpx.ReadError):
+            _run(router._ensure_ready(inst, fp, env, key))
+        assert inst.api_key == key
+        assert inst.llm_fp == router._pending_fp(fp)
+        row = router.state[inst.tk]
+        assert row["api_key"] == key and row["llm_fp"] == router._pending_fp(fp)
+
+    def test_launcher_boot_timeout_500_keeps_the_new_key(self, monkeypatch, clean_state):
+        async def boot():
+            return _Resp(500, {"ok": False}, "engine not healthy after 120s")
+
+        self._setup(monkeypatch, boot)
+        inst = self._pooled()
+        env, key = router.engine_env(None, None)
+        fp = router.llm_fingerprint(None, None, env)
+        with pytest.raises(HTTPException) as ei:
+            _run(router._ensure_ready(inst, fp, env, key))
+        assert ei.value.status_code == 502
+        assert inst.api_key == key and inst.llm_fp == router._pending_fp(fp)
+
+    def test_cancelled_boot_keeps_the_new_key(self, monkeypatch, clean_state):
+        async def boot():
+            await asyncio.sleep(3600)
+
+        self._setup(monkeypatch, boot)
+        inst = self._pooled()
+        env, key = router.engine_env(None, None)
+        fp = router.llm_fingerprint(None, None, env)
+
+        async def go():
+            t = asyncio.create_task(router._ensure_ready(inst, fp, env, key))
+            await asyncio.sleep(0.02)
+            t.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await t
+
+        _run(go())
+        assert inst.api_key == key and inst.llm_fp == router._pending_fp(fp)
+
+    def test_next_ask_adopts_an_engine_that_came_up_with_that_key(self, monkeypatch, clean_state):
+        async def boot():
+            raise AssertionError("must not reboot")
+
+        def engine(method, url, headers):
+            assert url.endswith("/sessions/keyprobe")
+            return _Resp(404 if headers.get("Authorization") == "Bearer NEW" else 401, {})
+
+        fake, _ = self._setup(monkeypatch, boot, engine, health="running")
+        env, _ = router.engine_env(None, None)
+        fp = router.llm_fingerprint(None, None, env)
+        inst = self._pooled()
+        inst.api_key, inst.llm_fp = "NEW", router._pending_fp(fp)
+        meta: dict = {}
+        _run(router._ensure_ready(inst, fp, env, "UNUSED", meta=meta))
+        assert inst.llm_fp == fp and inst.api_key == "NEW"
+        assert meta.get("boot_adopted") is True
+        assert router.state[inst.tk]["llm_fp"] == fp
+
+    def test_next_ask_reboots_when_the_engine_rejects_the_pending_key(self, monkeypatch, clean_state):
+        async def boot():
+            return _Resp(200, {"ok": True})
+
+        fake, _ = self._setup(monkeypatch, boot, lambda m, u, h: _Resp(401, {}), health="running")
+        env, key = router.engine_env(None, None)
+        fp = router.llm_fingerprint(None, None, env)
+        inst = self._pooled()
+        inst.api_key, inst.llm_fp = "NEW", router._pending_fp(fp)
+        _run(router._ensure_ready(inst, fp, env, key))
+        assert len(fake.boots) == 1
+        assert inst.llm_fp == fp and inst.api_key == key
+
+    def test_pending_boot_of_another_configuration_is_rebooted(self, monkeypatch, clean_state):
+        async def boot():
+            return _Resp(200, {"ok": True})
+
+        fake, _ = self._setup(monkeypatch, boot, health="running")
+        env, key = router.engine_env(None, None)
+        fp = router.llm_fingerprint(None, None, env)
+        inst = self._pooled()
+        inst.llm_fp = router._pending_fp("byok:someotherconfig")
+        _run(router._ensure_ready(inst, fp, env, key))
+        assert len(fake.boots) == 1 and inst.llm_fp == fp
+
+    def test_401_from_the_engine_marks_the_instance_for_reboot(self, monkeypatch, clean_state):
+        fake, _ = self._setup(monkeypatch, None, lambda m, u, h: _Resp(401, {}), health="running")
+        inst = self._pooled()
+        inst.llm_fp = "good-fp"
+        r = _run(router._vibe(inst, "GET", "/sessions/x/messages"))
+        assert r.status_code == 401
+        assert inst.llm_fp == router._FP_STALE
+        assert router.state[inst.tk]["llm_fp"] == router._FP_STALE
+
+    def test_failed_fresh_cold_start_drops_the_prewritten_state_row(self, monkeypatch, clean_state):
+        async def boot():
+            return _Resp(500, {"ok": False}, "engine process exited during boot")
+
+        self._setup(monkeypatch, boot)
+        deleted: list[str] = []
+
+        async def sbx_create(tk):
+            return "sbx-new"
+
+        async def sbx_delete(sandbox_id):
+            deleted.append(sandbox_id)
+            return True
+
+        monkeypatch.setattr(router, "sbx_create", sbx_create)
+        monkeypatch.setattr(router, "sbx_delete", sbx_delete)
+        tk = router.tenant_key("fresh-user")
+        with pytest.raises(HTTPException):
+            _run(router.get_or_create(tk))
+        assert deleted == ["sbx-new"]
+        assert tk not in router.pool and tk not in router.state
+
+
+class TestAskRebootsOnRejectedKey:
+    def test_post_turn_401_reboots_once_and_retries(self, monkeypatch):
+        h = _AskHarness(monkeypatch)
+        posts = {"n": 0}
+        reboots: list[str] = []
+
+        async def post_turn(inst, sid, query, **kw):
+            posts["n"] += 1
+            if posts["n"] == 1:
+                raise router._EngineUnauthorized()
+            return "a1"
+
+        async def reboot(inst, model, llm):
+            reboots.append(inst.tk)
+
+        monkeypatch.setattr(router, "_post_turn", post_turn)
+        monkeypatch.setattr(router, "_reboot_engine", reboot)
+        frames = h.run()
+        assert frames[-1]["t"] == "answer"
+        assert reboots == [h.inst.tk] and posts["n"] == 2
+        assert frames[-1]["stats"]["router"]["auth_reboot"] is True
+
+    def test_a_second_rejection_is_an_error_frame(self, monkeypatch):
+        h = _AskHarness(monkeypatch)
+
+        async def post_turn(inst, sid, query, **kw):
+            raise router._EngineUnauthorized()
+
+        async def reboot(inst, model, llm):
+            return None
+
+        monkeypatch.setattr(router, "_post_turn", post_turn)
+        monkeypatch.setattr(router, "_reboot_engine", reboot)
+        frames = h.run()
+        assert frames[-1]["t"] == "error" and frames[-1]["status"] == 502

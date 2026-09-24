@@ -469,7 +469,72 @@ async def _launcher_health(inst: Instance) -> Optional[dict]:
     return None
 
 
+# llm_fp values that never equal a real fingerprint:
+#   boot-pending:<fp> — a /boot for <fp> was sent but its 200 never arrived
+#                       (client gone, transport error, launcher boot timeout);
+#                       the engine may be up with the new env and key, or not.
+#   stale             — the engine rejected the router's key (it was restarted
+#                       outside the router); reboot before the next use.
+_BOOT_PENDING = "boot-pending:"
+_FP_STALE = "stale"
+
+
+def _pending_fp(fp: Optional[str]) -> str:
+    return f"{_BOOT_PENDING}{fp or ''}"
+
+
+def _persist_instance(inst: Instance) -> None:
+    """Write the instance's sandbox, template, key and fingerprint to state.json."""
+    row = state.setdefault(inst.tk, {})
+    row.update({
+        "sandbox_id": inst.sandbox_id,
+        "template_id": TEMPLATE_ID,
+        "llm_fp": inst.llm_fp,
+        "api_key": inst.api_key,
+    })
+    _save_state()
+
+
+def _drop_state_row(tk: str, sandbox_id: Optional[str] = None) -> None:
+    """Forget a tenant's sandbox mapping (only if it still names ``sandbox_id``)."""
+    row = state.get(tk)
+    if row is None:
+        return
+    if sandbox_id is not None and row.get("sandbox_id") != sandbox_id:
+        return
+    state.pop(tk, None)
+    _save_state()
+
+
+def _mark_engine_stale(inst: Instance) -> None:
+    """The engine answered 401 to the router's key: reboot it before next use."""
+    if inst.llm_fp == _FP_STALE:
+        return
+    log.warning("tenant %s engine rejected the router key; reboot on next use", inst.tk[:8])
+    inst.llm_fp = _FP_STALE
+    if pool.get(inst.tk) is inst:
+        try:
+            _persist_instance(inst)
+        except OSError as e:
+            log.warning("state write failed while marking %s stale: %s", inst.tk[:8], e)
+
+
 async def _boot_engine(inst: Instance, fp: Optional[str], env: dict, api_key: str) -> None:
+    """(Re)start the tenant engine with ``env`` via the launcher.
+
+    The new key is committed to the instance and state.json BEFORE the
+    launcher is called, under a ``boot-pending:<fp>`` fingerprint. The
+    launcher's /boot is synchronous and finishes whether or not the router
+    is still listening (and on its own boot timeout it answers 500 while the
+    engine may still come up), so a router that only recorded the key on a
+    200 kept a key the engine no longer accepted. With the key written
+    first, the worst case is an unconfirmed configuration: _ensure_ready
+    adopts it when the engine turns out to be up with this key, and boots
+    again otherwise.
+    """
+    inst.api_key = api_key
+    inst.llm_fp = _pending_fp(fp)
+    _persist_instance(inst)
     r = await http.post(
         f"{inst.launcher_url}/boot", json={"env": env},
         timeout=httpx.Timeout(30.0, read=float(READY_TIMEOUT_S)),
@@ -477,12 +542,16 @@ async def _boot_engine(inst: Instance, fp: Optional[str], env: dict, api_key: st
     if r.status_code != 200:
         raise HTTPException(502, f"engine boot failed: {r.status_code} {r.text[:200]}")
     inst.llm_fp = fp
-    inst.api_key = api_key
-    state.setdefault(inst.tk, {})["llm_fp"] = fp
-    state[inst.tk]["sandbox_id"] = inst.sandbox_id
-    state[inst.tk]["api_key"] = api_key
-    state[inst.tk]["template_id"] = TEMPLATE_ID
-    _save_state()
+    _persist_instance(inst)
+
+
+async def _engine_accepts_key(inst: Instance) -> bool:
+    """Cheap authenticated probe: does the running engine take our key?"""
+    try:
+        r = await _vibe(inst, "GET", "/sessions/keyprobe", timeout=8.0)
+    except Exception:  # noqa: BLE001 - unreachable counts as "no"
+        return False
+    return r.status_code in (200, 404)
 
 
 async def _ensure_ready(
@@ -510,17 +579,33 @@ async def _ensure_ready(
                         inst.tk[:8], inst.sandbox_id[:12])
             await sbx_delete(inst.sandbox_id)
             pool.pop(inst.tk, None)
-            state.pop(inst.tk, None)
-            _save_state()
+            _drop_state_row(inst.tk)
             raise HTTPException(502, "sandbox unreachable after resume; rebuilt on next request")
     inst.paused = False
-    if h.get("engine") == "running" and inst.llm_fp == fp and inst.api_key:
-        return
+    if h.get("engine") == "running" and inst.api_key:
+        if inst.llm_fp == fp:
+            return
+        if inst.llm_fp == _pending_fp(fp) and await _engine_accepts_key(inst):
+            # The unconfirmed boot for this very configuration did land: the
+            # engine is up and takes the key it was booted with.
+            inst.llm_fp = fp
+            _persist_instance(inst)
+            if meta is not None:
+                meta["boot_adopted"] = True
+            return
     if inst.refcount > 0 and inst.llm_fp != fp:
         raise HTTPException(503, "instance busy; retry to switch model")
     if meta is not None:
         meta["booted"] = True
     await _boot_engine(inst, fp, env, api_key)
+
+
+async def _reboot_engine(
+    inst: Instance, model: Optional[str], llm: Optional["LlmOverride"],
+) -> None:
+    """Boot the engine again with a fresh key (after it rejected ours)."""
+    env, api_key = engine_env(model, llm)
+    await _boot_engine(inst, llm_fingerprint(model, llm, env), env, api_key)
 
 
 async def get_or_create(
@@ -581,11 +666,13 @@ async def get_or_create(
                 # and drop the half-made sandbox instead of leaking it. On
                 # cancellation (client gone mid-boot) the delete runs
                 # detached so the cancel is not blocked on CubeAPI; the
-                # sandbox is in neither pool nor state, so nothing else
-                # would ever reap it.
+                # sandbox is then in neither pool nor state (the row the
+                # boot pre-wrote goes too), so nothing else would ever reap
+                # it.
                 if pool.get(tk) is inst:
                     pool.pop(tk, None)
                 if inst.sandbox_id:
+                    _drop_state_row(tk, inst.sandbox_id)
                     if isinstance(exc, Exception):
                         await sbx_delete(inst.sandbox_id)
                     else:
@@ -645,7 +732,17 @@ def _engine_headers(inst: Instance) -> dict:
 
 async def _vibe(inst: Instance, method: str, path: str, **kw):
     headers = {**_engine_headers(inst), **kw.pop("headers", {})}
-    return await http.request(method, f"{inst.base_url}{path}", headers=headers, **kw)
+    r = await http.request(method, f"{inst.base_url}{path}", headers=headers, **kw)
+    if r.status_code == 401:
+        _mark_engine_stale(inst)
+    return r
+
+
+class _EngineUnauthorized(HTTPException):
+    """The engine rejected the router's key for this instance."""
+
+    def __init__(self) -> None:
+        super().__init__(502, "deep engine rejected the router key")
 
 
 async def _cancel_attempt_bg(
@@ -690,6 +787,8 @@ async def _ensure_session(inst: Instance, vibe_session_id: Optional[str]) -> str
     if vibe_session_id:
         return vibe_session_id
     r = await _vibe(inst, "POST", "/sessions", json={"title": "laicai"})
+    if r.status_code == 401:
+        raise _EngineUnauthorized()
     r.raise_for_status()
     sid = r.json().get("session_id")
     if not sid:
@@ -721,6 +820,8 @@ async def _post_turn(
     r = await _vibe(inst, "POST", f"/sessions/{sid}/messages", json=payload)
     if r.status_code == 404:
         raise _SessionGone()
+    if r.status_code == 401:
+        raise _EngineUnauthorized()
     if r.status_code == 422:
         # Pydantic validation on the engine side. The one users actually hit
         # is the input length cap (portfolio context + question); say so
@@ -922,6 +1023,8 @@ async def _pump_events(
                 timeout=httpx.Timeout(30.0, read=PUMP_READ_TIMEOUT_S),
             ) as r:
                 if r.status_code != 200:
+                    if r.status_code == 401:
+                        _mark_engine_stale(inst)
                     raise RuntimeError(f"events http {r.status_code}")
                 ev_type: Optional[str] = None
                 ev_id: Optional[str] = None
@@ -1153,27 +1256,41 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                 async with inst.lock:
                     stats["lock_wait_ms"] = int((time.monotonic() - lock_t0) * 1000)
                     sess_t0 = time.monotonic()
-                    # Engine-side budget = what's left of the caller's timeout
-                    # after queueing/boot, minus a margin for the answer poll.
-                    engine_deadline_s = max(
-                        60.0, timeout_s - (time.monotonic() - t_req) - 10.0
-                    )
-                    sid = await _ensure_session(inst, body.vibeSessionId)
-                    turn_kwargs = {
-                        "deadline_s": engine_deadline_s,
-                        "intent": body.intent,
-                        "swarm_preset": body.swarmPreset,
-                    }
+
+                    async def _open_turn() -> tuple[str, Optional[str]]:
+                        # Engine-side budget = what's left of the caller's
+                        # timeout after queueing/boot, minus a margin for the
+                        # answer poll.
+                        engine_deadline_s = max(
+                            60.0, timeout_s - (time.monotonic() - t_req) - 10.0
+                        )
+                        sid_ = await _ensure_session(inst, body.vibeSessionId)
+                        turn_kwargs = {
+                            "deadline_s": engine_deadline_s,
+                            "intent": body.intent,
+                            "swarm_preset": body.swarmPreset,
+                        }
+                        try:
+                            return sid_, await _post_turn(
+                                inst, sid_, body.query, **turn_kwargs
+                            )
+                        except _SessionGone:
+                            stats["session_recovered"] = True
+                            sid_ = await _ensure_session(inst, None)
+                            return sid_, await _post_turn(
+                                inst, sid_, body.query, **turn_kwargs
+                            )
+
                     try:
-                        attempt_id = await _post_turn(
-                            inst, sid, body.query, **turn_kwargs
-                        )
-                    except _SessionGone:
-                        stats["session_recovered"] = True
-                        sid = await _ensure_session(inst, None)
-                        attempt_id = await _post_turn(
-                            inst, sid, body.query, **turn_kwargs
-                        )
+                        sid, attempt_id = await _open_turn()
+                    except _EngineUnauthorized:
+                        # The engine was restarted outside the router (its
+                        # key is not ours): boot it once with a fresh key and
+                        # retry. Safe here — inst.lock is held, so no other
+                        # ask of this tenant is in flight.
+                        stats["auth_reboot"] = True
+                        await _reboot_engine(inst, body.model, body.llm)
+                        sid, attempt_id = await _open_turn()
                     stats["session_ms"] = int((time.monotonic() - sess_t0) * 1000)
                     stats["attempt_id"] = attempt_id
                     _INFLIGHT[attempt_id] = (inst, sid)

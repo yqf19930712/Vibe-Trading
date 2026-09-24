@@ -37,6 +37,10 @@ BOOT_TIMEOUT_SEC = int(os.environ.get("VIBE_LAUNCHER_BOOT_TIMEOUT", "120"))
 TUNNEL_LOCAL_PORT = int(os.environ.get("VIBE_EGRESS_LOCAL_PORT", "8118"))
 
 _engine = {"proc": None}
+# One engine lifecycle change at a time. The HTTP server is threaded, and a
+# /boot whose client went away keeps running here; a second /boot (or /stop)
+# arriving meanwhile waits for it instead of interleaving kill/spawn with it.
+_lifecycle_lock = threading.Lock()
 # In-guest encrypted egress tunnel: sandbox -> ssh -> server B's loopback
 # tinyproxy (domain-whitelisted). A plaintext HTTP proxy across the border
 # gets keyword-reset on the CONNECT line for blocked domains; SSH does not.
@@ -236,10 +240,12 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, json.JSONDecodeError) as exc:
                 self._reply(400, {"error": str(exc)})
                 return
-            ok, msg = _boot_engine(extra_env)
+            with _lifecycle_lock:
+                ok, msg = _boot_engine(extra_env)
             self._reply(200 if ok else 500, {"ok": ok, "detail": msg})
         elif self.path == "/stop":
-            _stop_engine()
+            with _lifecycle_lock:
+                _stop_engine()
             self._reply(200, {"ok": True})
         else:
             self._reply(404, {"error": "not found"})
