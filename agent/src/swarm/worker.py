@@ -137,6 +137,45 @@ def _emit(
         logger.warning("Event callback failed for %s", event_type, exc_info=True)
 
 
+# ``worker_text`` carries the streamed reply for the live dashboard. One event
+# per token delta meant one events.jsonl append (and one session-stream event)
+# per token for every worker in parallel; deltas are coalesced and flushed at
+# most every _WORKER_TEXT_FLUSH_S seconds or _WORKER_TEXT_FLUSH_CHARS chars,
+# plus once at the end of each call. The text is unchanged, only batched.
+_WORKER_TEXT_FLUSH_S = 0.5
+_WORKER_TEXT_FLUSH_CHARS = 2000
+
+
+class _TextCoalescer:
+    """Batches streamed text deltas into fewer ``worker_text`` events."""
+
+    def __init__(self, emit: Callable[[str], None]) -> None:
+        self._emit = emit
+        self._parts: list[str] = []
+        self._size = 0
+        self._last_flush = time.monotonic()
+
+    def add(self, delta: str) -> None:
+        if not delta:
+            return
+        self._parts.append(delta)
+        self._size += len(delta)
+        if (
+            self._size >= _WORKER_TEXT_FLUSH_CHARS
+            or time.monotonic() - self._last_flush >= _WORKER_TEXT_FLUSH_S
+        ):
+            self.flush()
+
+    def flush(self) -> None:
+        self._last_flush = time.monotonic()
+        if not self._parts:
+            return
+        text = "".join(self._parts)
+        self._parts = []
+        self._size = 0
+        self._emit(text)
+
+
 def _filter_skill_descriptions(loader: SkillsLoader, skill_names: list[str]) -> str:
     """Return skill descriptions filtered to the given whitelist.
 
@@ -627,10 +666,14 @@ def run_worker(
         # Stream the LLM — moonshot/kimi non-streaming invoke is unreliable
         # (issue #42), and streaming also feeds dashboard live progress.
         llm_t0 = time.monotonic()
+        text_out = _TextCoalescer(
+            lambda content, _it=iteration: _emit(
+                event_callback, "worker_text", agent_id, task_id,
+                {"content": content, "iteration": _it},
+            )
+        )
         try:
-            def _on_text_chunk(delta: str) -> None:
-                _emit(event_callback, "worker_text", agent_id, task_id,
-                      {"content": delta, "iteration": iteration})
+            _on_text_chunk = text_out.add
 
             # LLM streaming can stall for 30s+ between request start and the
             # first text chunk (slow first-token providers, reasoning models'
@@ -729,6 +772,7 @@ def run_worker(
                     # of after the full sleep plus one more LLM call.
                     if sleep_unless_cancelled(delay, cancel_event):
                         return _cancelled_result(iteration)
+            text_out.flush()
             llm_elapsed_ms = int((time.monotonic() - llm_t0) * 1000)
             total_llm_ms += llm_elapsed_ms
             # Event ts = LLM call end; elapsed lets the gantt draw the exact
@@ -738,6 +782,7 @@ def run_worker(
                 {"iteration": iteration, "elapsed_ms": llm_elapsed_ms},
             )
         except Exception as exc:
+            text_out.flush()
             total_llm_ms += int((time.monotonic() - llm_t0) * 1000)
             if time.monotonic() - t0 > timeout:
                 # The failure came from the worker's own budget running out

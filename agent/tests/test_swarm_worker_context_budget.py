@@ -130,3 +130,23 @@ def test_hosted_profile_rewrites_the_data_fetch_rule(monkeypatch, hosted: bool) 
 
     assert ("do NOT write yfinance / OKX / tushare download scripts" in prompt) is hosted
     assert ("Use the patterns from load_skill (yfinance, OKX API via Python)" in prompt) is not hosted
+
+
+def test_worker_text_deltas_are_coalesced(tmp_path: Path) -> None:
+    """Token deltas reach the event stream in batches, with the text intact."""
+
+    class _Chunky(_LLM):
+        def stream_chat(self, messages, tools=None, on_text_chunk=None, timeout=None,
+                        should_cancel=None, tool_choice=None) -> LLMResponse:
+            text = "维持持有，止损 1650。" * 20
+            for ch in text:
+                on_text_chunk(ch)
+            return LLMResponse(content=text)
+
+    events: list = []
+    tools = _Tools()
+    _run(tmp_path, _Chunky([]), tools, events)
+
+    texts = [e.data["content"] for e in events if e.type == "worker_text"]
+    assert "".join(texts) == "维持持有，止损 1650。" * 20
+    assert len(texts) < 10
