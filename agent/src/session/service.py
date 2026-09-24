@@ -741,12 +741,13 @@ class SessionService:
         out: list[Dict[str, Any]] = []
         summary = handoff.load(session_id) if session_id else ""
         if summary:
-            clipped = summary
-            if estimate_text_tokens(clipped) > HANDOFF_INJECT_MAX_TOKENS:
-                limit = len(clipped)
-                while limit > 0 and estimate_text_tokens(clipped[:limit]) > HANDOFF_INJECT_MAX_TOKENS:
-                    limit = int(limit * 0.9)
-                clipped = clipped[:limit] + "\n\n...[summary clipped]"
+            # Section-aware: the goal, open asks and concrete numbers are
+            # kept whole before anything else, instead of losing whatever
+            # the template happens to list last.
+            clipped = handoff.fit_summary(
+                summary, HANDOFF_INJECT_MAX_TOKENS,
+                "\n\n...[summary clipped; omitted: {omitted}]",
+            )
             out.append(
                 {
                     "role": "user",

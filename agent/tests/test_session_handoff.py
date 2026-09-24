@@ -194,3 +194,62 @@ class TestDeletedSession:
             assert not (_tenant_root / "sessions" / "s1" / "handoff.json").exists()
         finally:
             tombstone._reset_for_tests()
+
+
+class TestSectionAwareClipping:
+    """Over-budget summaries keep the goal, open asks and numbers first."""
+
+    @staticmethod
+    def _summary(filler_tokens: int = 3000) -> str:
+        filler = "past step details. " * filler_tokens
+        return (
+            "## Goal\nCompare CSI300 momentum vs value for the user.\n\n"
+            "## Constraints & Preferences\nmax drawdown 15%\n\n"
+            f"## Progress\n### Done\n- {filler}\n\n"
+            "## Key Decisions\nuse 20-day window\n\n"
+            f"## Resolved Questions\n{filler}\n\n"
+            "## Pending User Asks\nAdd a 2019 stress test.\n\n"
+            "## Relevant Files\nruns/abc/code/signal_engine.py\n\n"
+            "## Remaining Work\nstress test\n\n"
+            "## Critical Context\nSharpe 1.42, IC 0.031, lookback 20\n\n"
+            f"## Tools & Patterns\n{filler}\n"
+        )
+
+    def test_injection_keeps_pending_asks_and_critical_numbers(self) -> None:
+        from src.core.token_estimate import estimate_text_tokens
+
+        fitted = handoff.fit_summary(self._summary(), 2000, "\n\n...[summary clipped; omitted: {omitted}]")
+        assert estimate_text_tokens(fitted) <= 2000
+        assert "Add a 2019 stress test." in fitted
+        assert "Sharpe 1.42, IC 0.031" in fitted
+        assert "Compare CSI300 momentum" in fitted
+        assert "omitted:" in fitted and "Tools & Patterns" in fitted
+        # kept sections stay in template order
+        assert fitted.index("## Goal") < fitted.index("## Pending User Asks") < fitted.index("## Critical Context")
+
+    def test_history_injection_uses_the_section_aware_fit(self, _tenant_root: Path) -> None:
+        from src.session.service import SessionService
+
+        path = _tenant_root / "sessions" / "s1" / "handoff.json"
+        path.write_text(
+            json.dumps({"summary": self._summary(), "updated_at": datetime.now(timezone.utc).isoformat()}),
+            encoding="utf-8",
+        )
+        out = SessionService._convert_messages_to_history(
+            [{"role": "user", "content": "q"}, {"role": "user", "content": "current"}], session_id="s1"
+        )
+        assert "Sharpe 1.42" in out[0]["content"]
+        assert "Add a 2019 stress test." in out[0]["content"]
+
+    def test_unstructured_text_is_cut_in_the_middle(self) -> None:
+        text = "HEAD " + "middle " * 5000 + " TAIL-LATEST-STATE"
+        fitted = handoff.fit_summary(text, 500, "\n...[clipped: {omitted}]\n")
+        assert fitted.startswith("HEAD ")
+        assert fitted.endswith("TAIL-LATEST-STATE")
+        assert "clipped: middle of the summary" in fitted
+
+    def test_save_time_cap_is_section_aware_too(self) -> None:
+        handoff.save("s1", self._summary(filler_tokens=6000))
+        loaded = handoff.load("s1")
+        assert "Sharpe 1.42" in loaded and "Add a 2019 stress test." in loaded
+        assert "clipped at the size cap" in loaded
