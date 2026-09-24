@@ -51,6 +51,16 @@ class _BoomLoader:
         raise RuntimeError("simulated loader blow-up")
 
 
+@pytest.fixture(autouse=True)
+def _no_fallback_chain(monkeypatch):
+    """Only the stub loaders answer: the per-market fallback chain would
+    reach real network sources (akshare & co.) and could resolve a code the
+    test expects to stay unresolved."""
+    from backtest.loaders import registry
+
+    monkeypatch.setattr(registry, "FALLBACK_CHAINS", {})
+
+
 @pytest.fixture
 def good_only(monkeypatch):
     monkeypatch.setattr(mcp_server, "_get_loader", lambda src: _GoodOnlyLoader)
