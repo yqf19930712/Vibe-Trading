@@ -30,6 +30,7 @@ No CubeAPI, no sandbox, no engine: every upstream call is an async fake.
   · uvicorn access-log lines carry tk8 instead of the raw userId.
   · /boot carries the per-sandbox launcher token as a Bearer header, and in
     the env only with VIBE_LAUNCHER_AUTH=1 (a fingerprint-changing switch).
+  · Error frames a caller can act on carry a machine-readable ``code``.
 """
 from __future__ import annotations
 
@@ -906,6 +907,7 @@ class TestForgetTombstone:
         frames = h.run()
         assert len(frames) == 1
         assert frames[0]["t"] == "error" and frames[0]["status"] == 410
+        assert frames[0]["code"] == "tenant_forgotten"
         assert frames[0]["stats"]["router"]["outcome"] == "forgotten"
 
     def test_forget_waits_for_an_in_flight_cold_start(self, monkeypatch, clean_state):
@@ -1062,3 +1064,32 @@ class TestLauncherToken:
         monkeypatch.setattr(router, "LAUNCHER_AUTH", True)
         on = router.llm_fingerprint(None, None, router.engine_env(None, None)[0])
         assert off != on
+
+
+# ── actionable error frames carry a code ─────────────────────────────────────
+
+
+class TestErrorFrameCodes:
+    def _ask_with_turn_error(self, monkeypatch, exc):
+        h = _AskHarness(monkeypatch)
+
+        async def post_turn(inst, sid, query, **kw):
+            raise exc
+
+        monkeypatch.setattr(router, "_post_turn", post_turn)
+        return h.run()[-1]
+
+    def test_length_cap_is_query_too_long(self, monkeypatch):
+        r = _Resp(422, None, '{"detail":[{"type":"string_too_long","loc":["body","content"]}]}')
+        frame = self._ask_with_turn_error(monkeypatch, router._QueryRejected(r))
+        assert frame["status"] == 400 and frame["code"] == "query_too_long"
+        assert "问题过长" in frame["detail"]
+
+    def test_other_422_is_query_rejected(self, monkeypatch):
+        r = _Resp(422, None, '{"detail":[{"type":"missing","loc":["body","x"]}]}')
+        frame = self._ask_with_turn_error(monkeypatch, router._QueryRejected(r))
+        assert frame["status"] == 400 and frame["code"] == "query_rejected"
+
+    def test_plain_errors_carry_no_code(self, monkeypatch):
+        frame = self._ask_with_turn_error(monkeypatch, HTTPException(502, "boom"))
+        assert frame["status"] == 502 and "code" not in frame

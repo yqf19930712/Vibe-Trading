@@ -395,6 +395,8 @@ state: dict = {}
 class _TenantForgotten(HTTPException):
     """410: the tenant was purged by /forget; nothing may be recreated for it."""
 
+    frame_code = "tenant_forgotten"
+
     def __init__(self) -> None:
         super().__init__(410, "tenant forgotten: its engine data was purged; asks are refused")
 
@@ -589,6 +591,8 @@ def _spawn(coro: Any) -> "asyncio.Task[Any]":
 
 class _Busy(HTTPException):
     """503 busy with a machine-readable reason (``busy_reason``)."""
+
+    frame_code = "busy"
 
     def __init__(self, reason: str, detail: str) -> None:
         super().__init__(503, detail)
@@ -1019,7 +1023,7 @@ async def _post_turn(
         # Pydantic validation on the engine side. The one users actually hit
         # is the input length cap (portfolio context + question); say so
         # instead of surfacing a bare 422.
-        raise HTTPException(400, _engine_422_detail(r))
+        raise _QueryRejected(r)
     r.raise_for_status()
     return r.json().get("attempt_id")
 
@@ -1027,15 +1031,31 @@ async def _post_turn(
 ENGINE_QUERY_MAX_CHARS = 20000  # mirrors SendMessageRequest.content max_length
 
 
+def _engine_422_is_length_cap(text: str) -> bool:
+    return "content" in text and (
+        "string_too_long" in text or "max_length" in text or "too_long" in text
+    )
+
+
 def _engine_422_detail(r: "httpx.Response") -> str:
     """Human-readable detail for an engine 422 (length cap vs other)."""
     text = r.text or ""
-    if "content" in text and ("string_too_long" in text or "max_length" in text or "too_long" in text):
+    if _engine_422_is_length_cap(text):
         return (
             f"问题过长，请精简后重试（引擎单次输入上限 {ENGINE_QUERY_MAX_CHARS} 字符，"
             "含注入的持仓上下文）"
         )
     return f"引擎拒绝了请求参数: {text[:200]}"
+
+
+class _QueryRejected(HTTPException):
+    """400 for an engine 422; ``frame_code`` tells the length cap apart."""
+
+    def __init__(self, r: "httpx.Response") -> None:
+        super().__init__(400, _engine_422_detail(r))
+        self.frame_code = (
+            "query_too_long" if _engine_422_is_length_cap(r.text or "") else "query_rejected"
+        )
 
 
 class _EngineFailed(HTTPException):
@@ -1599,9 +1619,13 @@ async def _ask_stream(body: AskBody, timeout_s: int):
         stats["error"] = str(e.detail)[:300]
         stats["total_ms"] = int((time.monotonic() - t_req) * 1000)
         frame: dict[str, Any] = {"t": "error", "status": e.status_code, "detail": str(e.detail)}
+        # Machine-readable reason for the errors a caller can act on
+        # (busy / query_too_long / query_rejected / tenant_forgotten).
+        code = getattr(e, "frame_code", None)
+        if code:
+            frame["code"] = code
         if isinstance(e, _Busy):
             stats["busy_reason"] = e.busy_reason
-            frame["code"] = "busy"
             frame["busy_reason"] = e.busy_reason
         frame["stats"] = {"router": dict(stats), "engine": engine_stats}
         yield _frame(frame)
