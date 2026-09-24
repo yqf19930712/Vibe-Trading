@@ -25,6 +25,7 @@ from typing import Iterator, List, Optional
 
 from src.agent.frontmatter import parse_frontmatter as _parse_frontmatter
 from src.core.atomic_write import atomic_write_text
+from src.core.token_estimate import estimate_text_tokens
 
 try:  # POSIX only; the in-process lock alone applies elsewhere.
     import fcntl
@@ -73,9 +74,12 @@ MEMORY_TYPES = ("user", "feedback", "project", "reference")
 # write (and on render, for entries saved before the limits existed).
 MAX_TITLE_CHARS = 80
 MAX_DESCRIPTION_CHARS = 160
-# Character budget of the rendered snapshot (the prompt block). ``user``
-# entries come first in the index, so they are the last to be cut.
-MAX_SNAPSHOT_CHARS = 8000
+# Budget of the rendered snapshot — the block every system prompt of the
+# tenant carries — in estimator tokens (``src.core.token_estimate``), fence
+# and notice included. ``user`` entries come first in the index, so they are
+# the last to be cut. This is the only size cap on the block:
+# ``ContextBuilder`` inserts it as is.
+MAX_SNAPSHOT_TOKENS = 2000
 # Slugs longer than this are cut and suffixed with a short title hash, so two
 # long titles sharing a prefix no longer map to the same file.
 _SLUG_MAX_CHARS = 60
@@ -94,6 +98,7 @@ SNAPSHOT_HEADER = (
     "current data wins. Use `remember recall` for a note's full text."
 )
 SNAPSHOT_FOOTER = "</memory-index>"
+_OMITTED_LINE = "- ({n} more saved notes not listed here; `remember recall` searches all of them)"
 
 # Script ranges tokenized and slugged at char level (no word-boundary
 # whitespace). Arabic/Hebrew narrowed to letter blocks to exclude bidi
@@ -453,7 +458,11 @@ class PersistentMemory:
             entries = {}
         now = time.time()
         rendered: List[str] = []
-        used = len(SNAPSHOT_HEADER) + len(SNAPSHOT_FOOTER) + 2
+        # The trailing "N more saved notes" line is reserved up front.
+        used = (
+            estimate_text_tokens(SNAPSHOT_HEADER) + estimate_text_tokens(SNAPSHOT_FOOTER)
+            + estimate_text_tokens(_OMITTED_LINE.format(n=MAX_INDEX_LINES)) + 3
+        )
         omitted = 0
         for raw in index_lines:
             match = _INDEX_LINE_RE.match(raw.strip())
@@ -467,17 +476,16 @@ class PersistentMemory:
                 f"{_clip_line(entry.description, MAX_DESCRIPTION_CHARS)} "
                 f"(updated {entry.updated_date})"
             )
-            if used + len(line) + 1 > MAX_SNAPSHOT_CHARS:
+            cost = estimate_text_tokens(line) + 1
+            if used + cost > MAX_SNAPSHOT_TOKENS:
                 omitted += 1
                 continue
             rendered.append(line)
-            used += len(line) + 1
+            used += cost
         if not rendered:
             return ""
         if omitted:
-            rendered.append(
-                f"- ({omitted} more saved notes not listed here; `remember recall` searches all of them)"
-            )
+            rendered.append(_OMITTED_LINE.format(n=omitted))
         return "\n".join([SNAPSHOT_HEADER, *rendered, SNAPSHOT_FOOTER])
 
     @property
