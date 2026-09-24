@@ -37,6 +37,8 @@ from src.agent.context_policy import (
     collapse_rule,
     first_user_index,
     is_prunable_by_microcompact,
+    is_request_message,
+    mark_request_message,
 )
 from src.agent.memory import WorkspaceMemory
 from src.agent.progress import HeartbeatTimer, ProgressEvent, _set_emitter
@@ -58,6 +60,7 @@ from src.tools.redaction import redact_payload, redact_secret_values
 from src.core import budget as _budget
 from src.core import cancel as _cancel
 from src.core import fetch_stats as _fetch_stats
+from src.core.market_clock import clock_lines
 from src.core.paths import data_root, runs_root
 from src.core.token_estimate import (
     estimate_messages_tokens,
@@ -90,6 +93,12 @@ MICROCOMPACT_KEEP_BUDGET_RATIO = 0.25  # keep newest tool results up to this bud
 # threshold, not every turn".
 MICROCOMPACT_RELEASE_RATIO = 0.35  # disarm once the estimate falls back here
 MICROCOMPACT_ARMED_KEEP_RATIO = 0.15  # deeper cut while armed
+# Batching while armed. The release line sits below the usual unprunable
+# floor (system prompt + request + replayed history + protected results), so
+# in practice the layer rarely disarms; re-cutting every turn would then
+# rewrite a message near the tail each time. Instead, after a cut the layer
+# waits until the context has grown by this share of the threshold.
+MICROCOMPACT_BATCH_RATIO = 0.15
 KEEP_RECENT = 3  # hard floor: newest N tool results are always kept intact
 # Tool results that are never pruned by microcompact. Rationale: these carry
 # the run's grounding data or its key deliverables — re-fetching them is
@@ -184,10 +193,110 @@ _LENGTH_CONTINUE_NUDGE = (
     "in the remaining part."
 )
 OUTPUT_TRUNCATED_MARK = "\n\n（输出被截断）"
+# Appended to an answer whose stream the attempt deadline cut short.
+BUDGET_TRUNCATED_MARK = "\n\n（时间预算耗尽，输出被截断）"
+# Appended when a research goal would need another round the budget (or the
+# forced final turn) no longer allows.
+GOAL_UNFINISHED_MARK = "\n\n（研究目标尚未完成：本次时间预算不足以继续推进。）"
+
+# A tool call whose arguments were still streaming when the output ceiling
+# hit is NOT executed: LangChain completes the cut JSON (``parse_partial_json``)
+# into a valid-looking dict, so a half-written file or script would otherwise
+# land on disk and report ``ok``. Each such call gets this structured error
+# instead, and the turn counts against ``LENGTH_CONTINUATIONS``. The refused
+# call stays in the trajectory (tool_use / tool_result pairing), with long
+# string arguments shortened so the partial payload does not bloat it.
+TRUNCATED_TOOL_CALL_ERROR = "tool_call_truncated"
+_TRUNCATED_ARG_MAX_CHARS = 2000
+_TRUNCATED_ARG_HEAD = 1500
+_TRUNCATED_ARG_TAIL = 500
+
+
+def _truncated_tool_call_error(tool_name: str) -> str:
+    """Structured tool result for a call cut by the output-token ceiling."""
+    return json.dumps(
+        {
+            "status": "error",
+            "error_code": TRUNCATED_TOOL_CALL_ERROR,
+            "tool": tool_name,
+            "message": (
+                "This call was NOT executed: your reply hit the output token "
+                "limit (finish_reason=length) while its arguments were still "
+                "being written, so they are incomplete. Re-issue it with "
+                "shorter arguments — split long content into several smaller "
+                "calls (write a long file in parts, keep scripts short) and "
+                "keep the text before the call brief."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _shorten_truncated_value(value: Any) -> Any:
+    """Shorten long strings inside a refused call's arguments (recursive)."""
+    if isinstance(value, str):
+        if len(value) <= _TRUNCATED_ARG_MAX_CHARS:
+            return value
+        omitted = len(value) - _TRUNCATED_ARG_HEAD - _TRUNCATED_ARG_TAIL
+        return (
+            f"{value[:_TRUNCATED_ARG_HEAD]}\n...[{omitted} chars omitted — "
+            f"truncated call, not executed]...\n{value[-_TRUNCATED_ARG_TAIL:]}"
+        )
+    if isinstance(value, dict):
+        return {k: _shorten_truncated_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_shorten_truncated_value(v) for v in value]
+    return value
+
+
+class _RefusedToolCall:
+    """Tool-call view with shortened arguments, for the trajectory only."""
+
+    def __init__(self, tc: Any) -> None:
+        self.id = tc.id
+        self.name = tc.name
+        self.arguments = _shorten_truncated_value(tc.arguments)
+        self.thought_signature = getattr(tc, "thought_signature", None)
+
+
+def truncated_tool_call_messages(
+    tool_calls: list,
+    *,
+    content: Optional[str],
+    reasoning_content: Optional[str],
+) -> list[dict[str, Any]]:
+    """Trajectory messages for a turn whose tool calls were cut by the ceiling.
+
+    Shared by the main loop and the swarm worker.
+
+    Args:
+        tool_calls: The (truncated) tool calls of the turn — none is executed.
+        content: The turn's visible text.
+        reasoning_content: The channel's reasoning field, as the caller would
+            pass it for an executed turn.
+
+    Returns:
+        The assistant tool-call message followed by one structured
+        ``tool_call_truncated`` error result per call.
+    """
+    assistant = ContextBuilder.format_assistant_tool_calls(
+        [_RefusedToolCall(tc) for tc in tool_calls],
+        content=content,
+        reasoning_content=reasoning_content,
+    )
+    _attach_tool_call_thought_signatures(assistant, tool_calls)
+    return [assistant] + [
+        ContextBuilder.format_tool_result(tc.id, tc.name, _truncated_tool_call_error(tc.name))
+        for tc in tool_calls
+    ]
 
 # Layer 2: Context collapse thresholds
 COLLAPSE_THRESHOLD = int(TOKEN_THRESHOLD * 0.7)
 COLLAPSE_PRESERVE_RECENT = 6
+# In the loop the fold boundary advances in steps of this many messages
+# (roughly three tool rounds) instead of one message per turn, so the prefix
+# before it stays byte-identical in between (see ``_context_collapse``).
+COLLAPSE_STRIDE = 6
 COLLAPSE_TEXT_MIN = 2400
 COLLAPSE_HEAD = 900
 COLLAPSE_TAIL = 500
@@ -201,6 +310,41 @@ TAIL_TOKEN_BUDGET = 20_000
 # budget and the OLDEST turns are the ones dropped (they are already covered
 # by the previous summary and by the full transcript on disk).
 SUMMARY_INPUT_TOKEN_BUDGET = int(TOKEN_THRESHOLD * 0.5)
+# The current request (``vibe_class=request``) is never summarised away:
+# Layer 3 takes it out of the head and re-inserts it right after the summary,
+# verbatim up to this size; a longer one keeps its beginning and end (where
+# task contracts such as an output format usually sit) plus a pointer to the
+# pre-compaction transcript. The tail budget shrinks by what the pinned
+# request costs, down to TAIL_TOKEN_FLOOR, so the rebuilt trajectory stays as
+# small as before.
+REQUEST_PIN_MAX_TOKENS = 8000
+TAIL_TOKEN_FLOOR = 10_000
+# Share of the summary input the request may take (reserved before the other
+# messages are filled in newest-first).
+REQUEST_SUMMARY_INPUT_SHARE = 0.5
+# A request that stays in the tail is quoted to the summariser up to this size.
+REQUEST_QUOTE_MAX_TOKENS = 1500
+
+# The model-initiated ``compact`` tool summarises only once the context has
+# reached this share of the threshold; below it the call is answered with a
+# "not needed" result instead of an LLM summary.
+COMPACT_TOOL_MIN_RATIO = MICROCOMPACT_TRIGGER_RATIO
+
+# Model context window. ``TOKEN_THRESHOLD`` is a cost budget for the messages
+# in estimator units; it assumes a window far larger than itself (true for
+# every model the product ships). ``VIBE_CONTEXT_WINDOW_TOKENS`` — the input
+# tokens the model accepts, i.e. its window minus the output ceiling — caps
+# the threshold for a smaller one: the cap counts the tool schemas and
+# converts to estimator units with the attempt's measured real/estimate ratio
+# (see ``_observe_token_ratio``), keeping CONTEXT_WINDOW_SAFETY in reserve.
+try:
+    CONTEXT_WINDOW_TOKENS = max(0, int(os.getenv("VIBE_CONTEXT_WINDOW_TOKENS", "0") or 0))
+except ValueError:
+    CONTEXT_WINDOW_TOKENS = 0
+CONTEXT_WINDOW_SAFETY = 0.8
+# Lowest threshold the window cap may produce (below it Layer 3 would fire
+# on every turn).
+_MIN_EFFECTIVE_THRESHOLD = 4000
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +355,19 @@ def _coerce_usage_int(value: Any) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+# Prompt-cache counters carried through from LangChain's
+# ``usage_metadata.input_token_details`` (both already INCLUDED in
+# ``input_tokens`` — they break it down, they do not add to it). Output keys
+# are the names the ``llm_usage`` event / ``llm_usage.json`` / attempt_stats
+# use; each appears only when non-zero so channels without caching keep the
+# original three-field shape.
+_CACHE_USAGE_FIELDS = (
+    ("cache_read", "cache_read_tokens"),
+    ("cache_creation", "cache_creation_tokens"),
+)
+_CACHE_CREATION_TTL_KEYS = ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
 
 
 def _normalize_llm_usage(usage: Any) -> dict[str, int] | None:
@@ -230,11 +387,24 @@ def _normalize_llm_usage(usage: Any) -> dict[str, int] | None:
         total_tokens = input_tokens + output_tokens
     if not (input_tokens or output_tokens or total_tokens):
         return None
-    return {
+    normalized = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
     }
+    details = usage.get("input_token_details")
+    if isinstance(details, dict):
+        for source_key, out_key in _CACHE_USAGE_FIELDS:
+            value = _coerce_usage_int(details.get(source_key))
+            if not value and source_key == "cache_creation":
+                # langchain-anthropic zeroes the generic key when the API
+                # reports the per-TTL split; the split then carries the count.
+                value = sum(
+                    _coerce_usage_int(details.get(key)) for key in _CACHE_CREATION_TTL_KEYS
+                )
+            if value:
+                normalized[out_key] = value
+    return normalized
 
 
 def _new_llm_usage_summary(llm: Any) -> dict[str, Any]:
@@ -270,6 +440,9 @@ def _record_llm_usage(
     totals["output_tokens"] = int(totals.get("output_tokens") or 0) + normalized["output_tokens"]
     totals["total_tokens"] = int(totals.get("total_tokens") or 0) + normalized["total_tokens"]
     totals["calls"] = int(totals.get("calls") or 0) + 1
+    for _source_key, out_key in _CACHE_USAGE_FIELDS:
+        if normalized.get(out_key):
+            totals[out_key] = int(totals.get(out_key) or 0) + normalized[out_key]
     summary.setdefault("per_iteration", []).append({"iter": iteration, **normalized})
     summary["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -418,6 +591,12 @@ def _microcompact(
     elif state.get("armed"):
         if estimate <= token_threshold * MICROCOMPACT_RELEASE_RATIO:
             state["armed"] = False
+            state.pop("cut_at", None)
+            return
+        last_cut = state.get("cut_at")
+        if last_cut is not None and estimate < last_cut + token_threshold * MICROCOMPACT_BATCH_RATIO:
+            # Batch: leave the trajectory alone until enough new context
+            # has accumulated to be worth another rewrite.
             return
         keep_ratio = MICROCOMPACT_ARMED_KEEP_RATIO
     else:
@@ -428,6 +607,8 @@ def _microcompact(
 
     tool_msgs = [m for m in messages if m.get("role") == "tool"]
     if len(tool_msgs) <= KEEP_RECENT:
+        if state is not None:
+            state["cut_at"] = estimate
         return
 
     keep_budget = token_threshold * keep_ratio
@@ -452,6 +633,8 @@ def _microcompact(
         content = msg.get("content", "")
         if isinstance(content, str) and len(content) > 100:
             msg["content"] = _CLEARED_PLACEHOLDER
+    if state is not None:
+        state["cut_at"] = estimate_tokens(messages, count_reasoning=count_reasoning)
 
 
 # Dynamic status bar. A minute-level timestamp or the WorkspaceMemory "## State"
@@ -492,10 +675,12 @@ def _build_status_message(state_summary: str, nudge_lines: list[str]) -> dict[st
     Returns:
         OpenAI-format user message dict.
     """
-    now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
+    # Beijing and US Eastern time plus per-market session state, never the
+    # container's local clock (UTC): see src/core/market_clock.py.
+    clock = "\n".join(clock_lines())
     content = (
         f"{_STATUS_PREFIX}\n"
-        f"Now: {now_iso}\n"
+        f"{clock}\n"
         f"State: {state_summary}\n"
         "</agent_status>"
     )
@@ -504,7 +689,7 @@ def _build_status_message(state_summary: str, nudge_lines: list[str]) -> dict[st
     return {"role": "user", "content": content}
 
 
-def _context_collapse(messages: list) -> None:
+def _context_collapse(messages: list, state: dict | None = None) -> None:
     """Layer 2: fold long text blocks in older messages without LLM call.
 
     Preserves head + tail of large text, collapses the middle.
@@ -517,11 +702,21 @@ def _context_collapse(messages: list) -> None:
 
     Args:
         messages: Message list (mutated in place).
+        state: Caller-owned dict carrying the last fold boundary. With it the
+            boundary only advances once ``COLLAPSE_STRIDE`` more messages have
+            slid out of the recent window, so the message that just slid out
+            is not rewritten every turn; without it every call folds up to
+            the recent window (the stateless behaviour).
     """
     if len(messages) <= COLLAPSE_PRESERVE_RECENT + 1:
         return
     fu_index = first_user_index(messages)
     stop = len(messages) - COLLAPSE_PRESERVE_RECENT
+    if state is not None:
+        last_stop = state.get("stop")
+        if last_stop is not None and last_stop <= stop < last_stop + COLLAPSE_STRIDE:
+            return
+        state["stop"] = stop
     for idx in range(1, stop):
         msg = messages[idx]
         rule = collapse_rule(msg, index=idx, first_user_index=fu_index)
@@ -630,10 +825,17 @@ _STRUCTURED_SUMMARY_PROMPT = """\
 Summarize this conversation for handoff to a fresh context window.
 This summary is the ONLY context available — omitted information is lost.
 
-Use EXACTLY this structure:
+Use EXACTLY this structure. Sections are ordered by importance: when the
+summary is later shortened, the end is cut first.
 
 ## Goal
-What the user is trying to accomplish.
+What the user is trying to accomplish (the CURRENT request, see below).
+
+## Pending User Asks
+Unfinished requests still needing action.
+
+## Critical Context
+Specific numbers, parameters, error messages, configuration values.
 
 ## Constraints & Preferences
 User-stated requirements: risk tolerance, strategy parameters, asset preferences.
@@ -650,25 +852,42 @@ Choices made and rationale.
 ## Resolved Questions
 Questions already answered — do NOT re-answer these.
 
-## Pending User Asks
-Unfinished requests still needing action.
-
 ## Relevant Files
 File paths, run_dir, signal engines, artifact locations.
 
 ## Remaining Work
 What still needs to be done (background reference, NOT active instructions).
 
-## Critical Context
-Specific numbers, parameters, error messages, configuration values.
-
 ## Tools & Patterns
 Which tools worked, what failed, effective approaches.
 
 IMPORTANT: This is a handoff — background reference, NOT active instructions.
 Preserve ALL specific numbers, file paths, and parameter values.
-{focus_section}
+{focus_section}{request_section}
 Conversation to summarize:
+"""
+
+# The ## Goal section follows the CURRENT request. Without this, the first
+# compaction of a new attempt in a continued thread iterates on the previous
+# attempt's summary ("PRESERVE all existing information") and keeps its Goal.
+_REQUEST_IN_INPUT_SECTION = """
+CURRENT REQUEST: the user's request for this attempt is the message marked
+"vibe_class": "request" in the conversation below. It stays verbatim in the
+live context right after this summary, so do not copy it; the ## Goal section
+must state THIS request's goal. A different goal carried over from a previous
+summary is an earlier topic: move it to one line under ## Resolved Questions
+(or ## Pending User Asks if it is still open).
+"""
+
+_REQUEST_QUOTED_SECTION = """
+CURRENT REQUEST (quoted below; it stays verbatim in the live context after
+this summary, so do not copy it): the ## Goal section must state THIS
+request's goal. A different goal carried over from a previous summary is an
+earlier topic: move it to one line under ## Resolved Questions (or ## Pending
+User Asks if it is still open).
+<current-request>
+{request}
+</current-request>
 """
 
 _FOCUS_SECTION = """
@@ -691,13 +910,40 @@ Rules:
 - ADD new progress, decisions, and findings.
 - Move "In Progress" items to "Done" when completed.
 - Move answered questions to "Resolved Questions".
-- Keep the same section structure.
+- Keep the same section structure and section order.
 - Do NOT drop any critical context from the previous summary.
-{focus_section}"""
+{focus_section}{request_section}"""
+
+
+def _clip_middle(text: str, max_tokens: int, note: str) -> str:
+    """Keep the beginning and end of ``text`` within ~``max_tokens``.
+
+    Args:
+        text: Text to shorten.
+        max_tokens: Target size (weighted estimate).
+        note: Appended inside the omission marker.
+
+    Returns:
+        ``text`` unchanged when it fits, else head (60%) + marker + tail (40%).
+    """
+    cost = estimate_text_tokens(text)
+    if cost <= max_tokens:
+        return text
+    keep = max(200, int(len(text) * max_tokens / cost))
+    head_n = int(keep * 0.6)
+    tail_n = keep - head_n
+    omitted = len(text) - head_n - tail_n
+    return f"{text[:head_n]}\n\n...[{omitted} chars omitted{note}]...\n\n{text[-tail_n:]}"
 
 
 def _select_summary_input(head: list[dict]) -> tuple[str, int]:
     """Serialize the summary input newest-first within a token budget (V2).
+
+    The current request (``vibe_class=request``), when it is in ``head``, is
+    reserved first — up to ``REQUEST_SUMMARY_INPUT_SHARE`` of the budget,
+    longer ones keep beginning and end — so the summariser always sees what
+    the attempt is for. The rest is filled newest-first; an oldest message
+    that does not fit is skipped. Chronological order is kept.
 
     Args:
         head: The messages Layer 3 is about to summarize.
@@ -707,24 +953,44 @@ def _select_summary_input(head: list[dict]) -> tuple[str, int]:
         anything was dropped the text is prefixed with an explicit note so the
         summarizer does not read the gap as "nothing happened before".
     """
-    kept: list[dict] = []
-    budget = SUMMARY_INPUT_TOKEN_BUDGET
     # The thinking transcript is not part of the conversation being
     # summarised (and would eat the budget several times over).
-    for msg in reversed(messages_for_estimate(head)):
+    items = messages_for_estimate(head)
+    budget = SUMMARY_INPUT_TOKEN_BUDGET
+    kept_idx: set[int] = set()
+
+    def _cost(msg: Any) -> int:
         try:
             blob = json.dumps(msg, default=str, ensure_ascii=False)
         except (TypeError, ValueError):
             blob = str(msg)
-        cost = estimate_text_tokens(blob)
+        return estimate_text_tokens(blob)
+
+    request_i = next((i for i, m in enumerate(head) if is_request_message(m)), None)
+    if request_i is not None:
+        request = dict(items[request_i])
+        if isinstance(request.get("content"), str):
+            request["content"] = _clip_middle(
+                request["content"],
+                int(SUMMARY_INPUT_TOKEN_BUDGET * REQUEST_SUMMARY_INPUT_SHARE),
+                " of the request in this summary input",
+            )
+        items[request_i] = request
+        budget -= _cost(request)
+        kept_idx.add(request_i)
+
+    for i in range(len(items) - 1, -1, -1):
+        if i == request_i:
+            continue
+        cost = _cost(items[i])
         if cost > budget:
             # A single message bigger than the whole remaining budget is
             # skipped, not a stop condition: shorter older messages after it
             # can still fit.
             continue
-        kept.append(msg)
+        kept_idx.add(i)
         budget -= cost
-    kept.reverse()
+    kept = [items[i] for i in sorted(kept_idx)]
     dropped = len(head) - len(kept)
     try:
         text = json.dumps(kept, default=str, ensure_ascii=False)
@@ -737,6 +1003,16 @@ def _select_summary_input(head: list[dict]) -> tuple[str, int]:
             "disk.]\n" + text
         )
     return text, dropped
+
+
+def _tool_schema_tokens(registry: Any) -> int:
+    """Estimated size of the tool definitions sent with every request."""
+    try:
+        return estimate_text_tokens(
+            json.dumps(registry.get_definitions(), ensure_ascii=False, default=str)
+        )
+    except Exception:  # noqa: BLE001 - a stand-in registry without definitions
+        return 0
 
 
 def _is_tool_success(result: str) -> bool:
@@ -1164,11 +1440,20 @@ class AgentLoop:
         self._grounding_results: List[tuple[str, str]] = []
         # Layer 1 hysteresis state (armed flag), carried across iterations.
         self._microcompact_state: Dict[str, Any] = {}
+        # Layer 2 fold-boundary state (stride batching), reset by Layer 3.
+        self._collapse_state: Dict[str, Any] = {}
+        # Provider input_tokens / local estimate, EMA over the attempt (None
+        # until a call reported usage), and the tool schemas' estimate.
+        self._token_ratio: Optional[float] = None
+        self._tools_tokens: Optional[int] = None
         # Circuit breaker: call_key -> consecutive failure count. Keyed the
         # same way as the duplicate guard, which only ever registered SUCCESSES
         # — so an identical failing call could repeat until the iteration cap.
         self._consecutive_failures: Dict[str, int] = {}
         self._session_id: str = ""
+        # Mean wall-clock seconds per completed iteration of the current run
+        # (None until one has completed); sizes the "one more round" reserve.
+        self._avg_iter_s: Optional[float] = None
 
     def cancel(self) -> None:
         """Cancel the current loop.
@@ -1206,9 +1491,32 @@ class AgentLoop:
         # an orphaned loop nobody can reach any more.
         if self._cancel_event.is_set():
             logger.info("AgentLoop cancelled before start")
-        # Expose the cancel signal to every tool thread (copy_context) so
-        # long polls (swarm wait, tool watchdog) can stop between ticks.
-        _cancel.bind_cancel_event(self._cancel_event)
+        # Attempt-scoped context: the cancel signal (so long polls in tool
+        # threads — swarm wait, tool watchdog — can stop between ticks), the
+        # fetch-stats collector and, when passed explicitly, the deadline.
+        # Tool threads see them through copy_context. Every binding made here
+        # is undone on the way out: a later run on the same thread (CLI,
+        # tests) must not inherit this attempt's set cancel event or expired
+        # deadline.
+        cancel_token = _cancel.bind_cancel_event(self._cancel_event)
+        collector_token = _fetch_stats.bind_collector(_fetch_stats.FetchStatsCollector())
+        deadline_token = _budget.bind_deadline(deadline) if deadline is not None else None
+        try:
+            return self._run_attempt(user_message, history, session_id, deadline)
+        finally:
+            if deadline_token is not None:
+                _budget.reset_deadline(deadline_token)
+            _fetch_stats.reset_collector(collector_token)
+            _cancel.reset_cancel_event(cancel_token)
+
+    def _run_attempt(
+        self,
+        user_message: str,
+        history: Optional[List[Dict[str, Any]]],
+        session_id: str,
+        deadline: Optional[float],
+    ) -> Dict[str, Any]:
+        """Body of :meth:`run`, inside the attempt-scoped context bindings."""
         self._called_ok = {}
         self._session_id = session_id or ""
         # Resume Layer 5 from the session's stored handoff summary instead
@@ -1219,13 +1527,14 @@ class AgentLoop:
         self._stats = _new_run_stats()
         self._grounding_results = []
         self._microcompact_state = {}
+        self._collapse_state = {}
+        self._token_ratio = None
+        self._tools_tokens = None
         self._consecutive_failures = {}
+        self._avg_iter_s = None
         run_t0 = _time.perf_counter()
-        _fetch_stats.start_collect()
         if deadline is None:
             deadline = _budget.get_deadline()
-        else:
-            _budget.bind_deadline(deadline)
         budget_total_s = (
             max(0.0, deadline - _time.monotonic()) if deadline is not None else None
         )
@@ -1302,12 +1611,31 @@ class AgentLoop:
         goal_last_progress: tuple[int, int] | None = None
         wrap_up_at = max(1, int(self.max_iterations * 0.8))
         force_final = False
+        # Set when the attempt deadline ends the run (a model turn cut at the
+        # deadline, or no time left to start another one).
+        deadline_exhausted = False
+
+        def _should_stop_stream() -> bool:
+            """Cancel, or the attempt deadline — polled per streamed chunk."""
+            return self._cancel_event.is_set() or (
+                deadline is not None and _time.monotonic() >= deadline
+            )
 
         try:
             while iteration < self.max_iterations:
                 if self._cancel_event.is_set():
                     trace.write({"type": "cancelled", "iter": self._run_iteration + 1})
                     logger.info("AgentLoop cancelled by user")
+                    break
+                if deadline is not None and _time.monotonic() >= deadline:
+                    # No model turn may start past the deadline: the caller
+                    # has stopped waiting, and the last turn was already the
+                    # forced final one.
+                    deadline_exhausted = True
+                    _best_effort(
+                        trace.write,
+                        {"type": "deadline_exhausted", "iter": self._run_iteration + 1},
+                    )
                     break
 
                 iteration += 1
@@ -1328,20 +1656,30 @@ class AgentLoop:
                 # ``reasoning_content`` counts only when the channel sends it.
                 count_reasoning = bool(getattr(self.llm, "sends_reasoning_content", False))
 
+                if self._tools_tokens is None:
+                    self._tools_tokens = _tool_schema_tokens(self.registry)
+                threshold = self._effective_threshold()
+
                 # Layer 1: microcompact (threshold-triggered + armed hysteresis)
                 _microcompact(
-                    messages, state=self._microcompact_state, count_reasoning=count_reasoning
+                    messages,
+                    token_threshold=threshold,
+                    state=self._microcompact_state,
+                    count_reasoning=count_reasoning,
                 )
 
                 # Layer 2: context collapse (fold long text, zero API cost)
                 tokens = estimate_tokens(messages, count_reasoning=count_reasoning)
-                if tokens > COLLAPSE_THRESHOLD:
-                    _context_collapse(messages)
+                collapse_at = (
+                    COLLAPSE_THRESHOLD if threshold >= TOKEN_THRESHOLD else int(threshold * 0.7)
+                )
+                if tokens > collapse_at:
+                    _context_collapse(messages, state=self._collapse_state)
                     tokens = estimate_tokens(messages, count_reasoning=count_reasoning)
 
                 # Layer 3: auto_compact (token threshold exceeded)
-                if tokens > TOKEN_THRESHOLD:
-                    logger.info(f"Auto compact triggered: {tokens} tokens > {TOKEN_THRESHOLD}")
+                if tokens > threshold:
+                    logger.info(f"Auto compact triggered: {tokens} tokens > {threshold}")
                     self._auto_compact(messages, run_dir, trace, iteration=current_iter)
 
                 logger.info(f"ReAct iteration {iteration}/{self.max_iterations}")
@@ -1374,9 +1712,11 @@ class AgentLoop:
                 remaining_s = (
                     deadline - _time.monotonic() if deadline is not None else None
                 )
+                if iteration > 1:
+                    self._avg_iter_s = (_time.perf_counter() - run_t0) / max(1, iteration - 1)
                 if remaining_s is not None and iteration > 1:
-                    avg_iter_s = (_time.perf_counter() - run_t0) / max(1, iteration - 1)
-                    if remaining_s < max(FINALIZE_RESERVE_S, avg_iter_s * 1.2):
+                    avg_iter_s = self._avg_iter_s or 0.0
+                    if remaining_s < self._round_reserve_s():
                         if not force_final:
                             # trace/emit once; the nudge line itself repeats
                             # with the status bar for as long as needed.
@@ -1471,6 +1811,12 @@ class AgentLoop:
                         }
                     )
 
+                # Estimate of this request (trajectory + tool schemas), paired
+                # with the provider's input_tokens below to calibrate.
+                sent_estimate = (
+                    estimate_tokens(messages, count_reasoning=count_reasoning)
+                    + (self._tools_tokens or 0)
+                )
                 llm_t0 = _time.perf_counter()
                 # In-place recovery for transient mid-stream failures
                 # (ReadTimeout, connection reset, relay hiccup, 5xx/429):
@@ -1485,13 +1831,23 @@ class AgentLoop:
                 for stream_attempt in range(1 + STREAM_RETRIES):
                     try:
                         self._stats["llm_calls"] += 1
+                        # The attempt deadline bounds the call itself: the
+                        # predicate stops the stream at the deadline (the
+                        # partial text is kept, see below), and ``timeout``
+                        # also tightens the SDK read timeout near the end.
+                        # Passed only when a deadline exists, so LLM
+                        # stand-ins without the parameter keep working.
+                        budget_kwargs: Dict[str, Any] = {}
+                        if deadline is not None:
+                            budget_kwargs["timeout"] = max(0.001, deadline - _time.monotonic())
                         response = self.llm.stream_chat(
                             messages,
                             tools=tool_defs,
                             on_text_chunk=_on_text_chunk,
                             on_reasoning_chunk=_on_reasoning_chunk,
-                            should_cancel=self._cancel_event.is_set,
+                            should_cancel=_should_stop_stream,
                             tool_choice=tool_choice,
+                            **budget_kwargs,
                         )
                         break
                     except ProviderStreamError as exc:
@@ -1559,6 +1915,8 @@ class AgentLoop:
                     usage,
                     current_iter,
                 )
+                if usage_delta and not getattr(response, "interrupted", None):
+                    self._observe_token_ratio(usage_delta.get("input_tokens", 0), sent_estimate)
                 if usage_delta:
                     self._emit(
                         "llm_usage",
@@ -1595,13 +1953,39 @@ class AgentLoop:
 
                 thinking_text = "".join(thinking_chunks)
                 if thinking_text:
-                    trace.write_text_entry(
+                    _best_effort(
+                        trace.write_text_entry,
                         {"type": "thinking", "iter": current_iter},
                         field="content",
                         value=thinking_text,
                         offload_kind=f"thinking-{current_iter}",
                     )
                     self._emit("thinking_done", {"iter": current_iter, "content": thinking_text[:500]})
+
+                if getattr(response, "interrupted", None):
+                    # Stopped at the attempt deadline (a cancel ended the run
+                    # above). Keep what was streamed: a text reply becomes the
+                    # answer, marked as cut; partial tool calls are dropped
+                    # unexecuted. Without a text reply the best earlier
+                    # fallback (a continued or goal-intermediate answer) stands.
+                    deadline_exhausted = True
+                    partial = response.content or ""
+                    self._stats["budget_truncated"] = True
+                    _best_effort(
+                        trace.write,
+                        {
+                            "type": "llm_deadline_cut",
+                            "iter": current_iter,
+                            "chars": len(partial),
+                            "discarded_tool_calls": len(response.tool_calls),
+                        },
+                    )
+                    if partial and not response.has_tool_calls:
+                        final_content = "".join(truncated_parts) + partial + BUDGET_TRUNCATED_MARK
+                        truncated_parts = []
+                    if final_content:
+                        self._write_answer_trace(trace, react_trace, current_iter, final_content)
+                    break
 
                 # Duck-typed: LLM stand-ins may omit finish_reason.
                 finish_reason = getattr(response, "finish_reason", "stop")
@@ -1616,6 +2000,35 @@ class AgentLoop:
                     self._stats["output_truncations"] = (
                         self._stats.get("output_truncations", 0) + 1
                     )
+
+                if finish_reason == "length" and response.has_tool_calls:
+                    # The calls' arguments were cut mid-stream: refuse all of
+                    # them (see TRUNCATED_TOOL_CALL_ERROR) and let the model
+                    # re-issue shorter ones. Counts as a length continuation.
+                    length_continuations += 1
+                    truncated_parts = []
+                    refused = [tc.name for tc in response.tool_calls]
+                    messages.extend(
+                        truncated_tool_call_messages(
+                            response.tool_calls,
+                            content=response.content,
+                            reasoning_content=response.reasoning_content or None,
+                        )
+                    )
+                    self._stats["truncated_tool_calls"] = (
+                        self._stats.get("truncated_tool_calls", 0) + len(refused)
+                    )
+                    trace.write(
+                        {
+                            "type": "tool_calls_truncated",
+                            "iter": current_iter,
+                            "tools": refused,
+                            "attempt": length_continuations,
+                            "max_continuations": LENGTH_CONTINUATIONS,
+                        }
+                    )
+                    react_trace.append({"type": "tool_calls_truncated", "tools": refused})
+                    continue
 
                 if not response.has_tool_calls:
                     final_content = response.content or ""
@@ -1648,8 +2061,8 @@ class AgentLoop:
                         messages.append({"role": "assistant", "content": final_content})
                         messages.append({"role": "user", "content": _LENGTH_CONTINUE_NUDGE})
                         # Fallback answer should the run end without another
-                        # text turn: the partial, marked as such.
-                        final_content += OUTPUT_TRUNCATED_MARK
+                        # text turn: everything written so far, marked as such.
+                        final_content = "".join(truncated_parts) + OUTPUT_TRUNCATED_MARK
                         continue
                     if truncated_parts:
                         # The continuation(s) complete the earlier partial text.
@@ -1708,6 +2121,24 @@ class AgentLoop:
                         except Exception as exc:  # noqa: BLE001
                             logger.debug("Goal continuation check skipped: %s", exc)
 
+                    if should_continue_goal and continuation_snapshot is not None and (
+                        is_last_iteration or not self._time_for_another_round(deadline)
+                    ):
+                        # A continuation would start after the forced final
+                        # turn or past what the budget can hold: answer now
+                        # and say the goal is not finished.
+                        should_continue_goal = False
+                        final_content += GOAL_UNFINISHED_MARK
+                        trace.write(
+                            {
+                                "type": "goal_continuation_suppressed",
+                                "iter": current_iter,
+                                "goal_id": active_goal_id,
+                                "reason": "budget",
+                                "continuations": goal_continuations,
+                            }
+                        )
+
                     if should_continue_goal and continuation_snapshot is not None:
                         current_progress = goal_progress_tuple(continuation_snapshot)
                         no_new_progress = (
@@ -1761,19 +2192,7 @@ class AgentLoop:
                             goal_continuations += 1
                             continue
 
-                    trace.write_text_entry(
-                        {"type": "answer", "iter": current_iter},
-                        field="content",
-                        value=final_content,
-                        offload_kind=f"answer-{current_iter}",
-                    )
-                    trace.write_text_entry(
-                        {"type": "message", "iter": current_iter, "role": "assistant"},
-                        field="content",
-                        value=final_content,
-                        offload_kind=f"assistant-message-{current_iter}",
-                    )
-                    react_trace.append({"type": "answer", "content": final_content[:500]})
+                    self._write_answer_trace(trace, react_trace, current_iter, final_content)
                     break
 
                 # A tool-calling turn after a length continuation restarts the
@@ -1849,10 +2268,14 @@ class AgentLoop:
         final_reason: str | None = None
         if self._cancel_event.is_set():
             final_reason = "cancelled by user"
-            state_store.mark_failure(run_dir, final_reason)
+            _best_effort(state_store.mark_failure, run_dir, final_reason)
             final_status = "cancelled"
-        elif (run_dir / "artifacts" / "metrics.csv").exists() or final_content:
-            state_store.mark_success(run_dir)
+        elif final_content:
+            # Success means an answer. A metrics.csv left by a backtest is an
+            # artifact, not an answer: a run that produced one but then no
+            # text (empty replies, iterations exhausted) fails with its real
+            # reason instead of passing with a template receipt.
+            _best_effort(state_store.mark_success, run_dir)
             final_status = "success"
             # F1: zero-LLM structural verification. Warnings never flip the
             # success status — they ride attempt_stats / trace / an event so
@@ -1877,6 +2300,13 @@ class AgentLoop:
                 except Exception:  # noqa: BLE001 - trace must never break the run
                     logger.debug("verify_warnings trace write failed", exc_info=True)
                 self._emit("verify_warnings", {"warnings": verify_warnings})
+        elif deadline_exhausted:
+            final_reason = (
+                "deadline_exhausted: the attempt's time budget ran out before "
+                f"a final answer (iteration {iteration})"
+            )
+            _best_effort(state_store.mark_failure, run_dir, final_reason)
+            final_status = "failed"
         elif empty_model_response_iter is not None:
             provider = os.getenv("LANGCHAIN_PROVIDER", "openai").strip().lower() or "openai"
             model = getattr(self.llm, "model_name", None) or os.getenv("LANGCHAIN_MODEL_NAME", "").strip() or "(unset)"
@@ -1885,13 +2315,13 @@ class AgentLoop:
                 f"provider={provider} model={model} iteration {empty_model_response_iter} "
                 "returned no content and no tool calls"
             )
-            state_store.mark_failure(run_dir, final_reason)
+            _best_effort(state_store.mark_failure, run_dir, final_reason)
             final_status = "failed"
         else:
             final_reason = (
                 f"reached max iterations ({self.max_iterations}) without final answer"
             )
-            state_store.mark_failure(run_dir, final_reason)
+            _best_effort(state_store.mark_failure, run_dir, final_reason)
             final_status = "failed"
 
         end_event: dict[str, Any] = {
@@ -1902,7 +2332,9 @@ class AgentLoop:
         }
         if final_reason is not None:
             end_event["reason"] = final_reason
-        trace.write(end_event)
+        # Bookkeeping only: a full or read-only disk must not turn an answer
+        # that already exists into a failed attempt.
+        _best_effort(trace.write, end_event)
         self._emit_attempt_stats(
             {"success": "ok", "cancelled": "cancelled"}.get(final_status, "failed"),
             iteration,
@@ -1911,7 +2343,7 @@ class AgentLoop:
             trace,
             reason=final_reason,
         )
-        trace.close()
+        _best_effort(trace.close)
 
         result: dict[str, Any] = {
             "status": final_status,
@@ -1925,6 +2357,76 @@ class AgentLoop:
         if final_reason is not None:
             result["reason"] = final_reason
         return result
+
+    def _effective_threshold(self) -> int:
+        """Compaction threshold for this turn (estimator units).
+
+        ``TOKEN_THRESHOLD``, capped by the model window when
+        ``VIBE_CONTEXT_WINDOW_TOKENS`` is set (see its comment).
+        """
+        threshold = TOKEN_THRESHOLD
+        if CONTEXT_WINDOW_TOKENS > 0:
+            ratio = self._token_ratio or 1.0
+            cap = int(CONTEXT_WINDOW_TOKENS * CONTEXT_WINDOW_SAFETY / ratio) - (
+                self._tools_tokens or 0
+            )
+            threshold = max(_MIN_EFFECTIVE_THRESHOLD, min(threshold, cap))
+        return threshold
+
+    def _observe_token_ratio(self, real_input_tokens: int, estimate: int) -> None:
+        """Fold one (provider input_tokens, local estimate) pair into the EMA.
+
+        The weighted estimator (ASCII /4, CJK ×0.6) is calibrated on
+        DeepSeek-like tokenizers; other tokenizers (Claude's CJK density in
+        particular) differ. The measured ratio feeds the window cap and is
+        reported as ``attempt_stats.token_estimate_ratio`` so the constants
+        can be recalibrated from production data.
+        """
+        if real_input_tokens <= 0 or estimate <= 0:
+            return
+        ratio = min(4.0, max(0.25, real_input_tokens / estimate))
+        self._token_ratio = (
+            ratio if self._token_ratio is None else 0.7 * self._token_ratio + 0.3 * ratio
+        )
+
+    def _round_reserve_s(self) -> float:
+        """Seconds one more full iteration is expected to need.
+
+        ``max(FINALIZE_RESERVE_S, 1.2 × mean iteration)`` — the early-finalize
+        line; before any iteration has completed only the fixed reserve.
+        """
+        return max(FINALIZE_RESERVE_S, (self._avg_iter_s or 0.0) * 1.2)
+
+    def _time_for_another_round(self, deadline: Optional[float]) -> bool:
+        """Whether the attempt budget still holds one more full iteration."""
+        if deadline is None:
+            return True
+        return deadline - _time.monotonic() >= self._round_reserve_s()
+
+    @staticmethod
+    def _write_answer_trace(
+        trace: TraceWriter, react_trace: list, iteration: int, content: str
+    ) -> None:
+        """Record the final answer (``answer`` + assistant ``message`` entries).
+
+        Best effort: the answer is returned even when the trace cannot be
+        written (full or read-only tenant disk).
+        """
+        _best_effort(
+            trace.write_text_entry,
+            {"type": "answer", "iter": iteration},
+            field="content",
+            value=content,
+            offload_kind=f"answer-{iteration}",
+        )
+        _best_effort(
+            trace.write_text_entry,
+            {"type": "message", "iter": iteration, "role": "assistant"},
+            field="content",
+            value=content,
+            offload_kind=f"assistant-message-{iteration}",
+        )
+        react_trace.append({"type": "answer", "content": content[:500]})
 
     def _emit_attempt_stats(
         self,
@@ -1963,6 +2465,13 @@ class AgentLoop:
                 "input": int(totals.get("input_tokens") or 0),
                 "output": int(totals.get("output_tokens") or 0),
                 "total": int(totals.get("total_tokens") or 0),
+                # Prompt-cache breakdown of ``input`` (only when non-zero):
+                # cache_read / input is the cache hit rate.
+                **{
+                    out_key.removesuffix("_tokens"): int(totals[out_key])
+                    for _source_key, out_key in _CACHE_USAGE_FIELDS
+                    if totals.get(out_key)
+                },
             },
             "tools": tools,
             "data_fetches": [],
@@ -1978,11 +2487,24 @@ class AgentLoop:
         if self._stats.get("verify_warnings"):
             stats["verify_warnings"] = self._stats["verify_warnings"]
         # Degradation counters (only present when non-zero): L3 summary call
-        # failures and oversized-result offload failures; counted into _stats
-        # and emitted here.
-        for counter in ("compact_failures", "offload_failures"):
+        # failures, oversized-result offload failures, replies cut by the
+        # output ceiling and the tool calls refused because of it; counted
+        # into _stats and emitted here.
+        for counter in (
+            "compact_failures",
+            "compact_skips",
+            "offload_failures",
+            "output_truncations",
+            "truncated_tool_calls",
+        ):
             if self._stats.get(counter):
                 stats[counter] = int(self._stats[counter])
+        # A model turn was cut at the attempt deadline (only present when so).
+        if self._stats.get("budget_truncated"):
+            stats["budget_truncated"] = True
+        # Provider input tokens per estimated token (only once measured).
+        if self._token_ratio is not None:
+            stats["token_estimate_ratio"] = round(self._token_ratio, 2)
         collector = _fetch_stats.current()
         if collector is not None:
             fetches, gaps = collector.snapshot()
@@ -2081,6 +2603,25 @@ class AgentLoop:
         for tc in tool_calls:
             # Layer 4: compact tool — mark then defer execution
             if tc.name == "compact":
+                current = estimate_tokens(
+                    messages,
+                    count_reasoning=bool(getattr(self.llm, "sends_reasoning_content", False)),
+                )
+                floor = int(self._effective_threshold() * COMPACT_TOOL_MIN_RATIO)
+                if current < floor:
+                    # A summary of a small context loses detail and costs a
+                    # model call for nothing.
+                    messages.append(context.format_tool_result(tc.id, "compact", json.dumps({
+                        "status": "ok",
+                        "skipped": True,
+                        "message": (
+                            f"Context is small (~{current} tokens, compaction "
+                            f"starts around {floor}); nothing was compressed."
+                        ),
+                    })))
+                    trace.write({"type": "compact_skipped", "iter": iteration,
+                                 "reason": "context_small", "tokens": current})
+                    continue
                 compact_requested = True
                 focus_topic = tc.arguments.get("focus_topic", "")
                 messages.append(context.format_tool_result(tc.id, "compact", '{"status":"ok","message":"Compressing..."}'))
@@ -2482,22 +3023,68 @@ class AgentLoop:
             iteration: Current trace iteration.
         """
         del run_dir
+        # The summary is one more model call. With less than two rounds of
+        # budget left it would eat the time the answer needs; the trajectory
+        # simply stays long (the provider window is far larger than the
+        # compaction threshold). Otherwise the call may use what exceeds one
+        # round's reserve, and no more.
+        remaining = _budget.remaining_s()
+        summary_timeout: Optional[float] = None
+        if remaining is not None:
+            round_s = self._round_reserve_s()
+            if remaining < 2 * round_s:
+                self._stats["compact_skips"] = self._stats.get("compact_skips", 0) + 1
+                _best_effort(
+                    trace.write,
+                    {
+                        "type": "compact_skipped",
+                        "iter": iteration,
+                        "reason": "budget",
+                        "remaining_s": round(remaining, 1),
+                    },
+                )
+                return
+            summary_timeout = remaining - round_s
         # Save full transcript before compressing next to the active trace.
+        # It is what the summary header and a clipped request point at, so
+        # when it cannot be written (full / read-only disk) nothing is
+        # compressed this turn — the run goes on with the longer context.
         transcript_path = trace.dir_path / f"transcript_{int(_time.time())}.jsonl"
-        with open(transcript_path, "w", encoding="utf-8") as f:
-            for msg in messages:
-                f.write(json.dumps(msg, default=str, ensure_ascii=False) + "\n")
+        try:
+            with open(transcript_path, "w", encoding="utf-8") as f:
+                for msg in messages:
+                    f.write(json.dumps(msg, default=str, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            self._stats["compact_failures"] = self._stats.get("compact_failures", 0) + 1
+            payload = {"iter": iteration, "error": f"transcript write failed: {exc}"[:300]}
+            _best_effort(trace.write, {"type": "compact_failed", **payload})
+            self._emit("compact_failed", payload)
+            return
 
         system_msg = messages[0]
         body = messages[1:]
+        count_reasoning = bool(getattr(self.llm, "sends_reasoning_content", False))
 
-        # Token-budget tail: walk backward to find how many recent messages to preserve
+        # The current request survives compaction verbatim (see
+        # REQUEST_PIN_MAX_TOKENS); the tail makes room for it.
+        request_msg = next((m for m in body if is_request_message(m)), None)
+        pinned_request: Optional[Dict[str, Any]] = None
+        tail_budget = TAIL_TOKEN_BUDGET
+        if request_msg is not None:
+            pinned_request = self._pinned_request(request_msg, transcript_path)
+            tail_budget = max(
+                TAIL_TOKEN_FLOOR,
+                TAIL_TOKEN_BUDGET - estimate_messages_tokens([pinned_request]),
+            )
+
+        # Token-budget tail: walk backward to find how many recent messages to
+        # preserve. Whole messages are measured — tool-call arguments (a
+        # written script, a long file) count as much as content does.
         accumulated = 0
         cut_idx = len(body)
         for i in range(len(body) - 1, -1, -1):
-            content = body[i].get("content", "")
-            msg_tokens = estimate_text_tokens(str(content)) + 10
-            if accumulated + msg_tokens > TAIL_TOKEN_BUDGET:
+            msg_tokens = estimate_messages_tokens([body[i]], count_reasoning=count_reasoning)
+            if accumulated + msg_tokens > tail_budget:
                 cut_idx = i + 1
                 break
             accumulated += msg_tokens
@@ -2510,18 +3097,33 @@ class AgentLoop:
         head = body[:cut_idx]
         tail = body[cut_idx:]
 
-        if not head:
-            # All body fits in tail budget — force a split to avoid infinite loop
-            if len(body) > 2:
+        if not any(m is not request_msg for m in head):
+            # Nothing but (at most) the request would be summarised — force a
+            # split to avoid an infinite loop.
+            if len(body) - (1 if request_msg is not None else 0) > 2:
                 cut_idx = max(1, len(body) // 2)
+                if request_msg is not None and all(m is request_msg for m in body[:cut_idx]):
+                    cut_idx += 1
                 head = body[:cut_idx]
                 tail = body[cut_idx:]
             else:
                 logger.warning("Auto compact: nothing to compress (body too small)")
                 return
+        request_in_head = request_msg is not None and any(m is request_msg for m in head)
 
         # Build focus section
         focus_section = _FOCUS_SECTION.format(topic=focus_topic) if focus_topic else ""
+        request_section = ""
+        if request_in_head:
+            request_section = _REQUEST_IN_INPUT_SECTION
+        elif request_msg is not None:
+            request_section = _REQUEST_QUOTED_SECTION.format(
+                request=_clip_middle(
+                    str(request_msg.get("content") or ""),
+                    REQUEST_QUOTE_MAX_TOKENS,
+                    " of the request in this quote",
+                )
+            )
 
         # Build summary prompt (structured template or iterative update)
         conv_text, dropped_msgs = _select_summary_input(head)
@@ -2531,9 +3133,15 @@ class AgentLoop:
                 previous_summary=self._previous_summary,
                 new_turns=conv_text,
                 focus_section=focus_section,
+                request_section=request_section,
             )
         else:
-            prompt = _STRUCTURED_SUMMARY_PROMPT.format(focus_section=focus_section) + conv_text
+            prompt = (
+                _STRUCTURED_SUMMARY_PROMPT.format(
+                    focus_section=focus_section, request_section=request_section
+                )
+                + conv_text
+            )
 
         compact_t0 = _time.perf_counter()
         # Compaction is a CORRECT mechanism — it must never be the thing that
@@ -2543,7 +3151,7 @@ class AgentLoop:
         # layers (L1/L2 already ran this iteration) and leave the trajectory
         # untouched; the next iteration retries compaction.
         try:
-            summary_resp = self.llm.chat([{"role": "user", "content": prompt}])
+            summary_resp = self._summary_call(prompt, summary_timeout)
             summary = summary_resp.content or ""
         except Exception as exc:  # noqa: BLE001 - degrade, never fail the run
             self._stats["llm_ms"] += int((_time.perf_counter() - compact_t0) * 1000)
@@ -2597,11 +3205,24 @@ class AgentLoop:
 
         messages.clear()
         messages.append(system_msg)
-        messages.append({"role": "user", "content": f"{compressed}\n\n<system>Continue from the summary above.</system>"})
+        if request_in_head:
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"{compressed}\n\n<system>Continue from the summary above; "
+                    "the current request follows.</system>"
+                ),
+            })
+            messages.append(pinned_request)
+        else:
+            messages.append({"role": "user", "content": f"{compressed}\n\n<system>Continue from the summary above.</system>"})
         messages.extend(tail)
 
         # Fix orphaned tool pairs in the reconstructed message list
         _fix_tool_pairs(messages)
+        # The rebuilt list starts a new fold / prune history.
+        self._collapse_state = {}
+        self._microcompact_state = {}
 
         # The duplicate-call guard keys on the tool-result
         # message OBJECT. Results compressed into the summary are gone from
@@ -2613,6 +3234,48 @@ class AgentLoop:
         self._called_ok = {
             key: msg for key, msg in self._called_ok.items() if id(msg) in live
         }
+
+    @staticmethod
+    def _pinned_request(request: Dict[str, Any], transcript_path: Path) -> Dict[str, Any]:
+        """The request as re-inserted after a Layer 3 summary.
+
+        The message itself when it fits ``REQUEST_PIN_MAX_TOKENS``; otherwise
+        a marked copy keeping its beginning and end plus a pointer to the
+        pre-compaction transcript that holds the full text.
+        """
+        content = request.get("content")
+        if not isinstance(content, str) or estimate_text_tokens(content) <= REQUEST_PIN_MAX_TOKENS:
+            return request
+        clipped = _clip_middle(
+            content,
+            REQUEST_PIN_MAX_TOKENS,
+            f" — the full request is in the pre-compaction transcript {transcript_path}",
+        )
+        return mark_request_message({"role": "user", "content": clipped})
+
+    def _summary_call(self, prompt: str, timeout: Optional[float]) -> Any:
+        """Run the Layer 3 summary request.
+
+        Uses ``ChatLLM.summarize`` — streamed, cancellable per chunk, bounded
+        by ``timeout``, no SDK retries — when the client has it; plain
+        ``chat`` otherwise (LLM stand-ins). An interrupted summary is a
+        failure: half a summary must never replace the trajectory head.
+
+        Raises:
+            RuntimeError: When the summary stream was cancelled or ran out
+                of time.
+        """
+        messages = [{"role": "user", "content": prompt}]
+        summarize = getattr(self.llm, "summarize", None)
+        if not callable(summarize):
+            return self.llm.chat(messages)
+        response = summarize(
+            messages, timeout=timeout, should_cancel=self._cancel_event.is_set
+        )
+        interrupted = getattr(response, "interrupted", None)
+        if interrupted:
+            raise RuntimeError(f"summary call interrupted ({interrupted})")
+        return response
 
     def _emit(self, event_type: str, data: Dict[str, Any]) -> None:
         """Fire an event via the callback."""

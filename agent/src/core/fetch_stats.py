@@ -203,6 +203,16 @@ def start_collect() -> FetchStatsCollector:
     return collector
 
 
+def bind_collector(collector: Optional[FetchStatsCollector]) -> contextvars.Token:
+    """Bind ``collector`` and return the token :func:`reset_collector` takes."""
+    return _COLLECTOR.set(collector)
+
+
+def reset_collector(token: contextvars.Token) -> None:
+    """Restore the binding :func:`bind_collector` replaced."""
+    _COLLECTOR.reset(token)
+
+
 def current() -> Optional[FetchStatsCollector]:
     return _COLLECTOR.get()
 

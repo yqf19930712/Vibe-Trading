@@ -21,9 +21,20 @@ _DEADLINE: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
 )
 
 
-def bind_deadline(deadline_monotonic: Optional[float]) -> None:
-    """Bind the attempt's absolute ``time.monotonic()`` deadline (None = unbounded)."""
-    _DEADLINE.set(deadline_monotonic)
+def bind_deadline(deadline_monotonic: Optional[float]) -> contextvars.Token:
+    """Bind the attempt's absolute ``time.monotonic()`` deadline (None = unbounded).
+
+    Returns:
+        The token :func:`reset_deadline` takes to restore the previous
+        binding — a scope that binds must restore, or a later attempt run
+        on the same thread (CLI, tests) inherits an expired deadline.
+    """
+    return _DEADLINE.set(deadline_monotonic)
+
+
+def reset_deadline(token: contextvars.Token) -> None:
+    """Restore the binding :func:`bind_deadline` replaced."""
+    _DEADLINE.reset(token)
 
 
 def get_deadline() -> Optional[float]:
