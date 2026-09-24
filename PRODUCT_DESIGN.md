@@ -90,7 +90,7 @@ stateDiagram-v2
 
 ### 2.3 隔离边界
 
-三层，由外到内：
+由外到内：
 
 1. **MicroVM 硬边界**：guest 独立内核 + 独立 rootfs（模板镜像 + 4G writable layer）。shell 工具（`bash` / `background_run`）的任意命令执行落在 guest 内，宿主机不暴露；跨租户无共享文件系统、无共享进程空间。宿主侧唯一与 guest 共享的路径是该租户自己的 bind-mount 目录，其他租户的目录不可见。
 2. **HOME 收口**：镜像内以用户 `vibe` 运行，`HOME=/home/vibe`，`~/.vibe-trading` 是宿主 `/data/shared/vibe/<tk>` 的 bind-mount → 长期记忆、搜索索引、oauth、shadow 账户、GoalStore 等一切 `Path.home()` 派生状态都在宿主的租户目录里，跨 pause/resume、跨沙箱重建持久。guest 内以 uid 1000 可在该目录任意建文件（含 symlink），因此 router 侧凡是宿主直读直写这些路径的端点都拒绝 symlink 与目录外解析（见 §3.4）。**HOME 之外 guest 里没有租户可写、又会被引擎读进来的位置**：镜像内 `/app`（引擎代码）归 root、对 `vibe` 只读（构建期预编译字节码后 `chmod -R go-w`），镜像 `ENV` 固定 `VIBE_DATA_DIR`、`PYTHONDONTWRITEBYTECODE=1`、`PYTHONNOUSERSITE=1`（后者让引擎与 launcher 不 import 租户在 `~/.local` 里放的 `.pth` / `sitecustomize`）——否则租户代码改写引擎源码或 site-packages，下一次 `/boot` 就以带全租户共享凭据的 env 运行它。
@@ -178,7 +178,7 @@ stateDiagram-v2
 
 ```jsonc
 {"t":"progress","ev":"attempt_meta","data":{"attempt_id":"…","vibe_session_id":"…",
- "answer_deadline_s":881.2,"engine_deadline_s":878.9}}      // router 自己合成的帧，恰好 1 帧：拿到 attempt_id 后、
+ "answer_deadline_s":881.2,"engine_deadline_s":878.9}}      // router 自己合成的帧，至多 1 帧：拿到 attempt_id 后、
                                                             // 转发任何引擎事件之前（见下文）
 {"t":"progress","ev":"<引擎 SSE 事件名>","data":<payload>}   // 0..n 帧，实时转发引擎
                                                             // /sessions/<sid>/events（replay=active），按 attempt 过滤
