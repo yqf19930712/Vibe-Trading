@@ -198,6 +198,27 @@ def launcher_token(sandbox_id: str) -> str:
     ).hexdigest()
 
 
+def _launcher_auth_warning() -> Optional[str]:
+    """Startup warning for multi-tenant engines behind an open launcher.
+
+    The engines drop loopback trust in the multi-tenant tier, but the guest's
+    shell can still POST the launcher's /boot over loopback with a key of its
+    own choosing and then reach the engine with it — unless the launcher
+    holds a token (VIBE_LAUNCHER_AUTH=1).
+    """
+    if LAUNCHER_AUTH:
+        return None
+    env, _key = engine_env(None, None)
+    if env.get("VIBE_MULTITENANT") != "1":
+        return None
+    return (
+        "VIBE_LAUNCHER_AUTH is off while tenant engines run multi-tenant: guest "
+        "code can re-boot its engine through the launcher over loopback with a "
+        "key it chose. Turn it on once rollback to a router without launcher "
+        "auth is no longer needed (see the VIBE_LAUNCHER_AUTH notes in router.py)"
+    )
+
+
 # In-guest egress tunnel credentials (optional): private key file on the host
 # + ssh destination (server B). Injected into each sandbox via launcher /boot.
 EGRESS_KEY_FILE = os.environ.get("VIBE_EGRESS_KEY_FILE", "")
@@ -2734,6 +2755,9 @@ async def _startup():
     pruned = _prune_tombstones()
     if pruned:
         log.info("pruned %d expired /forget tombstones", pruned)
+    warning = _launcher_auth_warning()
+    if warning:
+        log.warning(warning)
     _spawn(_reaper())
     if SWEEP_STALE:
         _spawn(_sweep_stale_templates())
