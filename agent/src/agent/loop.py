@@ -58,6 +58,7 @@ from src.tools.redaction import redact_payload, redact_secret_values
 from src.core import budget as _budget
 from src.core import cancel as _cancel
 from src.core import fetch_stats as _fetch_stats
+from src.core.market_clock import clock_lines
 from src.core.paths import data_root, runs_root
 from src.core.token_estimate import (
     estimate_messages_tokens,
@@ -617,10 +618,12 @@ def _build_status_message(state_summary: str, nudge_lines: list[str]) -> dict[st
     Returns:
         OpenAI-format user message dict.
     """
-    now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
+    # Beijing and US Eastern time plus per-market session state, never the
+    # container's local clock (UTC): see src/core/market_clock.py.
+    clock = "\n".join(clock_lines())
     content = (
         f"{_STATUS_PREFIX}\n"
-        f"Now: {now_iso}\n"
+        f"{clock}\n"
         f"State: {state_summary}\n"
         "</agent_status>"
     )

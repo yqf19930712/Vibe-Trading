@@ -20,6 +20,7 @@ from src.agent.progress import HeartbeatTimer
 from src.agent.skills import SkillsLoader
 from src.agent.tools import ToolRegistry
 from src.config.schema import AgentConfig
+from src.core.market_clock import clock_lines
 from src.core.token_estimate import estimate_messages_tokens, estimate_text_tokens
 from src.providers.chat import ChatLLM, LLMResponse, ProviderStreamError
 from src.swarm.models import (
@@ -303,11 +304,9 @@ def build_worker_prompt(
         "- Respond in the same language as the task prompt."
     )
 
-    now = datetime.now()
-    prompt_parts.append(
-        f"## Current Date & Time\n\n"
-        f"Today is {now.strftime('%A, %B %d, %Y %H:%M (local)')}."
-    )
+    # Same clock as the main loop's status bar: Beijing and US Eastern time
+    # with market session state — the container clock is UTC.
+    prompt_parts.append("## Current Date & Time\n\n" + "\n".join(clock_lines()))
 
     return "\n\n".join(prompt_parts)
 

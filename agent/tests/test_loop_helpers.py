@@ -273,8 +273,10 @@ class TestStatusBar:
         content = msg["content"]
         assert content.startswith(_STATUS_PREFIX)
         assert "</agent_status>" in content
-        # ISO timestamp with timezone (session time-awareness must not be lost)
-        assert "Now: 2" in content and "T" in content
+        # Explicit zones, never the container's UTC clock (session
+        # time-awareness must not be lost).
+        assert "Now: 2" in content and "Beijing time (UTC+8" in content
+        assert "US Eastern" in content and "Markets (regular hours only" in content
         assert "State: run_dir=/tmp/r1" in content
         assert "[SYSTEM] wrap up" in content
 
