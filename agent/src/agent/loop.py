@@ -346,6 +346,15 @@ CONTEXT_WINDOW_SAFETY = 0.8
 # Lowest threshold the window cap may produce (below it Layer 3 would fire
 # on every turn).
 _MIN_EFFECTIVE_THRESHOLD = 4000
+# Layer 3 cooldown. A window-capped threshold can sit below what a rebuilt
+# trajectory needs (system prompt + summary + pinned request + protected
+# tail); summarising again on the next turn would produce the same size at
+# the cost of one more model call every turn. When the rebuild is still
+# above the threshold, Layer 3 next fires only once the context has grown by
+# this share of the threshold past the rebuilt size — and, with the window
+# cap on, no later than ``threshold / CONTEXT_WINDOW_SAFETY`` (the window the
+# cap keeps its reserve from).
+L3_REGROW_RATIO = 0.25
 
 logger = logging.getLogger(__name__)
 
@@ -1491,6 +1500,9 @@ class AgentLoop:
         self._microcompact_state: Dict[str, Any] = {}
         # Layer 2 fold-boundary state (stride batching), reset by Layer 3.
         self._collapse_state: Dict[str, Any] = {}
+        # Size of the last Layer 3 rebuild when it stayed above the
+        # threshold (None otherwise); see L3_REGROW_RATIO.
+        self._l3_floor: Optional[int] = None
         # Provider input_tokens / local estimate, EMA over the attempt (None
         # until a call reported usage), and the tool schemas' estimate.
         self._token_ratio: Optional[float] = None
@@ -1577,6 +1589,7 @@ class AgentLoop:
         self._grounding_results = []
         self._microcompact_state = {}
         self._collapse_state = {}
+        self._l3_floor = None
         self._token_ratio = None
         self._tools_tokens = None
         self._consecutive_failures = {}
@@ -1727,9 +1740,21 @@ class AgentLoop:
                     tokens = estimate_tokens(messages, count_reasoning=count_reasoning)
 
                 # Layer 3: auto_compact (token threshold exceeded)
-                if tokens > threshold:
-                    logger.info(f"Auto compact triggered: {tokens} tokens > {threshold}")
+                l3_trigger = self._l3_trigger(threshold)
+                if tokens > l3_trigger:
+                    logger.info(f"Auto compact triggered: {tokens} tokens > {l3_trigger}")
                     self._auto_compact(messages, run_dir, trace, iteration=current_iter)
+                elif tokens > threshold:
+                    _best_effort(
+                        trace.write,
+                        {
+                            "type": "compact_skipped",
+                            "iter": current_iter,
+                            "reason": "cooldown",
+                            "tokens": tokens,
+                            "rearm_at": l3_trigger,
+                        },
+                    )
 
                 logger.info(f"ReAct iteration {iteration}/{self.max_iterations}")
 
@@ -2441,6 +2466,16 @@ class AgentLoop:
             )
             threshold = max(_MIN_EFFECTIVE_THRESHOLD, min(threshold, cap))
         return threshold
+
+    def _l3_trigger(self, threshold: int) -> int:
+        """Context size above which Layer 3 runs this turn (see L3_REGROW_RATIO)."""
+        floor = self._l3_floor
+        if floor is None or floor <= threshold:
+            return threshold
+        trigger = floor + int(threshold * L3_REGROW_RATIO)
+        if CONTEXT_WINDOW_TOKENS > 0:
+            trigger = min(trigger, int(threshold / CONTEXT_WINDOW_SAFETY))
+        return max(threshold, trigger)
 
     def _observe_token_ratio(self, real_input_tokens: int, estimate: int) -> None:
         """Fold one (provider input_tokens, local estimate) pair into the EMA.
@@ -3296,6 +3331,9 @@ class AgentLoop:
         # The rebuilt list starts a new fold / prune history.
         self._collapse_state = {}
         self._microcompact_state = {}
+        # Still above the threshold: hold Layer 3 until the context grows.
+        rebuilt = estimate_tokens(messages, count_reasoning=count_reasoning)
+        self._l3_floor = rebuilt if rebuilt > self._effective_threshold() else None
 
         # The duplicate-call guard keys on the tool-result
         # message OBJECT. Results compressed into the summary are gone from

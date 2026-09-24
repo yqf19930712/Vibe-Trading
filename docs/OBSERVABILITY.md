@@ -154,7 +154,7 @@ AgentLoop 在 **attempt 结束时**（成功/失败/取消/异常四条路径都
 - `tool_calls_truncated`：`{iter, tools, attempt, max_continuations}` —— 被输出上限截断的那一轮带着工具调用：参数已被截坏，全部不执行，每个调用回 `tool_call_truncated` 结构化错误（提示拆小重发、长文用 `write_file` 的 `mode="append"` 分段写），计入续写次数；轨迹里保留 tool_use / tool_result 配对，超长字符串参数缩为首尾两段；
 - `llm_deadline_cut`：`{iter, chars, discarded_tool_calls}` —— 模型输出流在 attempt deadline 处被截断：已流出的正文成为答案（末尾「（时间预算耗尽，输出被截断）」），部分工具调用丢弃不执行；
 - `deadline_exhausted`：`{iter}` —— deadline 已过、不再开新一轮；此时没有任何答案则 attempt 以 `deadline_exhausted` 失败收口；
-- `compact_skipped`：`{iter, reason, …}` —— `reason=budget`（剩余不足两轮，跳过 L3，带 `remaining_s`）或 `reason=context_small`（模型调 `compact` 时上下文不足阈值一半，带 `tokens`）；
+- `compact_skipped`：`{iter, reason, …}` —— `reason=budget`（剩余不足两轮，跳过 L3，带 `remaining_s`）、`reason=context_small`（模型调 `compact` 时上下文不足阈值一半，带 `tokens`）或 `reason=cooldown`（上一次 L3 重建后仍超阈值，上下文还没长到再压的点，带 `tokens` 与 `rearm_at`，见 PRODUCT_DESIGN §7；不计入 `attempt_stats.compact_skips`）；
 - `goal_continuation_suppressed`：`{iter, goal_id, continuations, reason?|progress?}` —— 研究目标续跑被抑制：`reason=budget` 表示下一轮会越过收尾轮或预算（答案末尾附「研究目标尚未完成」），否则是次数用尽或没有新进展。
 
 既有事件的字段增量：
