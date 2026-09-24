@@ -1,14 +1,14 @@
-"""Pure-logic tests for cube-router's review-3 remediation (2026-09-04).
+"""Pure-logic tests for cube-router's tenant-boundary and failure-reporting rules.
 
 Run: VIBE_ROUTER_SECRET=x VIBE_ROUTER_TOKEN=y VIBE_CUBE_TEMPLATE_ID=tpl-test \
      python -m pytest test_router_security.py
 
 Covered (no CubeAPI, no sandbox — endpoints are awaited directly):
-  · A1  tenant symlink escape: /memory list / delete, /obs/*, _dir_bytes
-  · A4  a failed engine attempt is an error frame, never an answer frame
-  · A6  engine 422 (input length cap) becomes a readable 400 detail
-  · A7  /forget answers ok=false when the sandbox or the dir is not gone
-  · A10 POST /sessions/delete offline mode + watermark/disk fields
+  · tenant symlink escape: /memory list / delete, /obs/*, _dir_bytes
+  · a failed engine attempt is an error frame, never an answer frame
+  · engine 422 (input length cap) becomes a readable 400 detail
+  · /forget answers ok=false when the sandbox or the dir is not gone
+  · POST /sessions/delete offline mode + watermark/disk fields
 """
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def tenant(tmp_path, monkeypatch) -> Path:
     router.state.clear()
 
 
-# ── A1: symlink escape ───────────────────────────────────────────────────────
+# ── symlink escape ───────────────────────────────────────────────────────────
 
 
 class TestSafeTenantPath:
@@ -183,7 +183,7 @@ class TestDirBytesDoesNotFollowLinks:
         assert router._dir_bytes(tmp_path / "tk") == 0
 
 
-# ── A4: failed attempt → error frame ─────────────────────────────────────────
+# ── failed attempt → error frame ─────────────────────────────────────────────
 
 
 class TestFailedAttemptClassification:
@@ -297,7 +297,7 @@ class TestFailedAttemptClassification:
         assert recorded[0]["engine_cancelled"] is True
 
 
-# ── A6: engine 422 → readable 400 ────────────────────────────────────────────
+# ── engine 422 → readable 400 ────────────────────────────────────────────────
 
 
 class TestEngine422Detail:
@@ -333,7 +333,7 @@ class TestEngine422Detail:
         assert "问题过长" in ei.value.detail
 
 
-# ── A7: /forget reports failure ──────────────────────────────────────────────
+# ── /forget reports failure ──────────────────────────────────────────────────
 
 
 class TestForgetReportsFailure:
@@ -401,7 +401,7 @@ class TestForgetReportsFailure:
         assert (host_dir / "keep").exists()
 
 
-# ── A10: per-session delete + watermark fields ───────────────────────────────
+# ── per-session delete + watermark fields ────────────────────────────────────
 
 
 class TestSessionsDelete:

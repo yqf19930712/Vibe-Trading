@@ -1,9 +1,10 @@
 """cube-router — multi-tenant orchestrator for Vibe-Trading on CubeSandbox.
 
-Same public API as the retired ops/vibe-router (`/ask` NDJSON, `/forget`,
-`/healthz`, same bearer auth), but tenant instances are KVM MicroVM sandboxes
-rather than host processes: each tenant gets a KVM MicroVM sandbox created from a
-CubeSandbox template (image: python + vibe-trading + in-guest launcher).
+Public API (Bearer auth on every endpoint): `/ask` (NDJSON stream),
+`/forget`, `/sessions/delete`, `/healthz`, `/tenants/usage`, the read-only
+`/obs/*` tail endpoints and `/memory` + `/memory/delete`. Each tenant gets a
+KVM MicroVM sandbox created from a CubeSandbox template (image: python +
+vibe-trading + in-guest launcher).
 
 Per-tenant layout inside the sandbox (template default):
   - launcher on :8898 — `GET /health`, `POST /boot {env}`, `POST /stop`
@@ -15,15 +16,16 @@ Per-tenant layout inside the sandbox (template default):
     sandbox rebuilds (template switch). The sandbox's writable layer holds
     nothing tenant-specific.
 
-Lifecycle mapping (v1 → v2):
-  spawn process   → create sandbox (E2B-compatible CubeAPI) + POST /boot
+Lifecycle:
+  first ask       → create sandbox (E2B-compatible CubeAPI) + POST /boot
   kill idle       → pause sandbox (disk + memory state kept; resume is fast)
   LLM switch      → POST /boot with new env (engine restart inside the guest;
                     no sandbox respawn, sessions untouched)
   template switch → delete sandbox, recreate from the new template on the
                     next /ask (data dir is host-mounted: lossless)
-  forget          → delete sandbox + rmtree the host data dir + drop state row
-                    (500 {ok:false} if either fails so laicai retries)
+  forget          → tombstone the tenant, delete sandbox + rmtree the host
+                    data dir + drop the sandbox mapping (500 {ok:false} if
+                    either fails so laicai retries)
   session delete  → POST /sessions/delete: DELETE on the engine when the
                     sandbox is up, else remove the host session dir
 
@@ -31,8 +33,9 @@ Sandbox data-plane access goes through cube-proxy's E2B-style host routing:
   http://<port>-<sandbox_id>.<SANDBOX_DOMAIN>/   (host DNS resolves *.cube.app
   to the node; plain HTTP on the proxy's HTTP port).
 
-State (tenant_key → sandbox_id / llm fingerprint) lives in a JSON file so a
-router restart re-attaches to existing sandboxes instead of leaking them.
+State (tenant_key → sandbox / template / engine key / fingerprint, or a
+/forget tombstone) lives in a JSON file so a router restart re-attaches to
+existing sandboxes instead of leaking them.
 """
 from __future__ import annotations
 
@@ -345,8 +348,8 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
         # ddgs 9.x has no google/bing; "auto" rotates every engine it has.
         ("VIBE_TRADING_SEARCH_BACKENDS", "auto"),
         # Models habitually download files to /tmp then read_document them;
-        # the sandbox is hardware-isolated so /tmp is safe to allow (run #10:
-        # a Meituan filing PDF at /tmp got rejected and cost a detour).
+        # the sandbox is hardware-isolated so /tmp is safe to allow, and
+        # refusing it only sends the run on a detour.
         ("VIBE_TRADING_ALLOWED_FILE_ROOTS", "/tmp"),
     ):
         env[key] = os.environ.get(key, default)
@@ -915,7 +918,7 @@ async def _evict_for_capacity() -> None:
             refused.add(id(victim))
 
 
-# ── Vibe session helpers (unchanged semantics from v1) ───────────────────────
+# ── Vibe session helpers ─────────────────────────────────────────────────────
 def _engine_headers(inst: Instance) -> dict:
     return {"Authorization": f"Bearer {inst.api_key}"} if inst.api_key else {}
 
@@ -2097,9 +2100,10 @@ async def obs_swarm_events(
 # The engine's remember/auto-recall store lives on the host bind-mount at
 # <tenant>/memory/*.md (one markdown file per memory + a MEMORY.md index the
 # engine maintains). Host-side read/delete needs no running sandbox. Deleting
-# also drops the file's line from MEMORY.md; a concurrent engine write may
-# race, but the engine tolerates dangling index lines (treats them as
-# to-be-written markers), so no locking is needed.
+# also drops the file's line from MEMORY.md under a bounded flock on the
+# engine's .MEMORY.lock (see memory_delete: the lock does not reliably span
+# the MicroVM boundary; the engine rebuilds the index from the entry files,
+# so index drift heals on its own).
 
 _MEM_FILE_MAX = 64_000
 
@@ -2255,11 +2259,10 @@ async def memory_delete(body: dict, authorization: Optional[str] = Header(None))
 
 
 # ── Tenant disk usage (read-only water-mark exposure) ────────────────────────
-# Each tenant's writable data lives under DATA_ROOT/<tenant_key>/ and is capped
-# at TENANT_QUOTA_BYTES. Before this, hitting the cap had **no defined failure
-# mode**: the engine's memory writes and trace writes call write_text with no
-# try, so a full disk surfaced as an exception mid-attempt with nothing pointing
-# at "the tenant is out of space".
+# Each tenant's writable data lives under DATA_ROOT/<tenant_key>/. There is no
+# filesystem quota: TENANT_QUOTA_BYTES is only the denominator for the usage
+# percentage and watermark reported here, so operators see a tenant (or the
+# disk) filling up before engine writes start failing mid-attempt.
 #
 # This is deliberately the READ-ONLY half of the retention design. The actual
 # sweeper (deleting old sessions/runs/uploads) is NOT here — deleting user data
@@ -2288,9 +2291,8 @@ def _dir_bytes(path: Path) -> int:
     """Apparent size of one tenant dir. Returns 0 for a missing/unreadable dir.
 
     Walks with ``followlinks=False`` and skips symlinked files: a tenant can
-    plant ``big -> /`` inside its bind-mount and the old ``rglob`` (which
-    descends into symlinked directories) would have walked the whole host
-    filesystem as root.
+    plant ``big -> /`` inside its bind-mount, and a walk that descends into
+    symlinked directories would cover the whole host filesystem as root.
     """
     if path.is_symlink() or not path.is_dir():
         return 0
@@ -2391,7 +2393,7 @@ async def tenants_usage(
 
 @app.get("/healthz")
 async def healthz(authorization: Optional[str] = Header(None)):
-    _auth(authorization)  # docs always said Bearer; the check was simply missing
+    _auth(authorization)
     ok_ms = list(recent_ask_ms)
     # Disk usage per tenant (5-min cached `du`; a cold cache costs one walk).
     # `tenants[]` only lists tenants with a live instance, so the disk totals
@@ -2416,8 +2418,8 @@ async def healthz(authorization: Optional[str] = Header(None)):
             "quota_bytes": TENANT_QUOTA_BYTES,
             "watermark": TENANT_WATERMARK,
             "tenants_total": len(usage),
-            # tk8 list of tenants past the watermark (was a count; the list
-            # is what an operator / laicai ops page can actually act on).
+            # tk8 list of tenants past the watermark: who, not just how
+            # many, so an operator / the laicai ops page can act on it.
             "over_watermark": _over_watermark_tk8s(usage),
             # Host filesystem fill level of the volume holding DATA_ROOT —
             # per-tenant quotas are meaningless once the disk itself is full.

@@ -4,11 +4,10 @@ Run: VIBE_ROUTER_SECRET=x VIBE_ROUTER_TOKEN=y VIBE_CUBE_TEMPLATE_ID=tpl-test \
      python -m pytest test_router_budget.py
 
 Why these two areas specifically:
-  · **Budget** — the 2026-08-24 incident and the F2/run_swarm P0 both came from
-    the two-hour swarm budget being written out in several places that then
-    drifted. `BUDGET_BY_INTENT` is now the single source; these tests pin both
-    the derivation AND the `timeoutS`-wins precedence that makes a laicai-only
-    rollback safe.
+  · **Budget** — the two-hour swarm budget written out in several places
+    drifts apart. `BUDGET_BY_INTENT` is the single source; these tests pin
+    both the derivation AND the `timeoutS`-wins precedence that makes a
+    laicai-only rollback safe.
   · **Disk accounting** — `/healthz` and `/tenants/usage` are the read-only half
     of the retention plan. They must never throw on a missing/racing tenant dir,
     or a full disk takes the health endpoint down with it.
