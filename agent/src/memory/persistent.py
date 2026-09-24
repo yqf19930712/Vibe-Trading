@@ -37,9 +37,9 @@ logger = logging.getLogger(__name__)
 class MemoryWriteError(RuntimeError):
     """Raised when a memory entry cannot be persisted (full / read-only disk).
 
-    Every tenant volume has a hard size cap, and the failure mode past it used
-    to be an unhandled ``OSError`` from ``Path.write_text`` that propagated all
-    the way up and failed the attempt. Callers catch this and return a
+    Tenant data has no filesystem quota, but the host disk can still fill up
+    or go read-only; an unhandled ``OSError`` from the write would propagate
+    all the way up and fail the attempt. Callers catch this and return a
     structured tool error: losing one memory write must not lose the answer.
     """
 
