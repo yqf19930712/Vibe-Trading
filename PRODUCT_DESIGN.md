@@ -74,10 +74,10 @@ stateDiagram-v2
     无沙箱 --> RUNNING : 首次 /ask<br/>POST /sandboxes（不带 timeout=永不过期）<br/>+ launcher /boot
     RUNNING --> PAUSED : 空闲 > IDLE_TTL（20min，reaper 每分钟扫）<br/>或 RUNNING 数达上限时 LRU 换出
     PAUSED --> RUNNING : 下次 /ask 探活失败 → 显式 resume（秒级）
-    RUNNING --> RUNNING : LLM 指纹变化 → 仅 launcher /boot 重启引擎<br/>（沙箱与会话数据不动）
+    RUNNING --> RUNNING : LLM 指纹（请求的模型选择 + boot env 摘要）变化<br/>→ 仅 launcher /boot 重启引擎（沙箱与会话数据不动）
     PAUSED --> 无沙箱 : 模板切换（state 记的 template_id ≠ VIBE_CUBE_TEMPLATE_ID，<br/>router 重启后所有沙箱都经此判定）→ 删旧沙箱，下次 /ask 按新模板重建；<br/>数据在宿主 bind-mount，无损
-    RUNNING --> [*] : /forget → delete sandbox + 删宿主租户目录
-    PAUSED --> [*] : /forget → delete sandbox + 删宿主租户目录
+    RUNNING --> [*] : /forget → 写墓碑 + delete sandbox + 删宿主租户目录
+    PAUSED --> [*] : /forget → 写墓碑 + delete sandbox + 删宿主租户目录
 ```
 
 - **懒建**：沙箱在租户第一次 `/ask` 时创建；创建必须走裸 CubeAPI 且不带 timeout（E2B SDK 默认 5 分钟 TTL 会杀沙箱）。建沙箱时把宿主目录 `VIBE_HOST_DATA_ROOT/<tenant_key>`（默认 `/data/shared/vibe/<tk>`，owner 1000:1000）以 `host-mount` 挂到 guest 的 `/home/vibe/.vibe-trading`——租户全部落盘状态都在宿主上，沙箱可写层只承载引擎代码与临时文件。
@@ -93,8 +93,8 @@ stateDiagram-v2
 三层，由外到内：
 
 1. **MicroVM 硬边界**：guest 独立内核 + 独立 rootfs（模板镜像 + 4G writable layer）。shell 工具（`bash` / `background_run`）的任意命令执行落在 guest 内，宿主机不暴露；跨租户无共享文件系统、无共享进程空间。宿主侧唯一与 guest 共享的路径是该租户自己的 bind-mount 目录，其他租户的目录不可见。
-2. **HOME 收口**：镜像内以用户 `vibe` 运行，`HOME=/home/vibe`，`~/.vibe-trading` 是宿主 `/data/shared/vibe/<tk>` 的 bind-mount → 长期记忆、搜索索引、oauth、shadow 账户、GoalStore 等一切 `Path.home()` 派生状态都在宿主的租户目录里，跨 pause/resume、跨沙箱重建持久。guest 内以 uid 1000 可在该目录任意建文件（含 symlink），因此 router 侧凡是宿主直读直写这些路径的端点都拒绝 symlink 与目录外解析（见 §3.4）。
-3. **子进程最小 env**（`agent/src/tools/subprocess_env.py`）：引擎替模型拉起的每个子进程都不继承引擎进程 env。`bash` / `background_run` 与 MCP stdio 服务端子进程（`tools/mcp.py`）只带白名单（`PATH`/`HOME`/locale/`TZ`/`TMPDIR`/python venv 变量 + 全部 `VIBE_*`；MCP 再叠加操作员写在该 server `env` 块里的变量），`backtest` 的 Runner 子进程（`core/runner.py`，会 import 模型写的 `signal_engine.py`，AST 扫描只拦 import 期语句、拦不住方法体里的 `os.environ`）带 `backtest_subprocess_env()` = 同一白名单 + loader 在子进程内认证用的三个数据 token（`TUSHARE_TOKEN`/`TICKFLOW_API_KEY`/`IFIND_MCP_TOKEN`）+ 代理/CA 变量（`HTTP(S)_PROXY`/`NO_PROXY` 等）与 `TUSHARE_`/`TICKFLOW_`/`IFIND_`/`CCXT_`/`OKX_`/`FUTU_`/`RSSHUB_` 前缀的调参项。名字含 `_KEY`/`_TOKEN`/`_SECRET`/`_PASSWORD` 段或以 `OPENAI_`/`ANTHROPIC_`/`LANGCHAIN_` 开头者一律剔除，`API_AUTH_KEY`/`JINA_API_KEY`/`ROUTER_*` 不进任何子进程——`env`、`cat .env`、回测策略里 `open("artifacts/x").write(os.environ)` 之类都拿不到全租户共享的 LLM 凭据。配套**按值脱敏**（`redaction.redact_secret_values`）：引擎进程 env 里凭据形名字、长度 ≥12 的值，在任何工具结果进入轨迹/trace/校验器之前替换为 `[redacted:<KEYNAME>]`。引擎自身的 LLM 调用是进程内 httpx，不受影响。同一边界的配置面：租户档位（`VIBE_TRADING_TENANT_SAFE=1`）下 `src/config/loader.py` 不读 `~/.vibe-trading/agent.json` / `swarm-agent.json`（那是租户可写的 bind-mount，bash 写一个文件就能让下一次 attempt 以引擎身份拉起任意 stdio 命令），MCP 服务端只认 `VIBE_TRADING_AGENT_CONFIG` / `VIBE_TRADING_SWARM_AGENT_CONFIG` 指向的镜像内只读路径（生产模板不放这两个文件，即租户引擎无 MCP 服务端）。
+2. **HOME 收口**：镜像内以用户 `vibe` 运行，`HOME=/home/vibe`，`~/.vibe-trading` 是宿主 `/data/shared/vibe/<tk>` 的 bind-mount → 长期记忆、搜索索引、oauth、shadow 账户、GoalStore 等一切 `Path.home()` 派生状态都在宿主的租户目录里，跨 pause/resume、跨沙箱重建持久。guest 内以 uid 1000 可在该目录任意建文件（含 symlink），因此 router 侧凡是宿主直读直写这些路径的端点都拒绝 symlink 与目录外解析（见 §3.4）。**HOME 之外 guest 里没有租户可写、又会被引擎读进来的位置**：镜像内 `/app`（引擎代码）归 root、对 `vibe` 只读（构建期预编译字节码后 `chmod -R go-w`），镜像 `ENV` 固定 `VIBE_DATA_DIR`、`PYTHONDONTWRITEBYTECODE=1`、`PYTHONNOUSERSITE=1`（后者让引擎与 launcher 不 import 租户在 `~/.local` 里放的 `.pth` / `sitecustomize`）——否则租户代码改写引擎源码或 site-packages，下一次 `/boot` 就以带全租户共享凭据的 env 运行它。
+3. **子进程最小 env**（`agent/src/tools/subprocess_env.py`）：引擎替模型拉起的每个子进程都不继承引擎进程 env。`bash` / `background_run` 与 MCP stdio 服务端子进程（`tools/mcp.py`）只带白名单（`PATH`/`HOME`/locale/`TZ`/`TMPDIR`/python venv 变量 + 全部 `VIBE_*`；MCP 再叠加操作员写在该 server `env` 块里的变量），`backtest` 的 Runner 子进程（`core/runner.py`，会 import 模型写的 `signal_engine.py`，AST 扫描只拦 import 期语句、拦不住方法体里的 `os.environ`）带 `backtest_subprocess_env()` = 同一白名单 + loader 在子进程内认证用的三个数据 token（`TUSHARE_TOKEN`/`TICKFLOW_API_KEY`/`IFIND_MCP_TOKEN`）+ 代理/CA 变量（`HTTP(S)_PROXY`/`NO_PROXY` 等）与 `TUSHARE_`/`TICKFLOW_`/`IFIND_`/`CCXT_`/`OKX_`/`FUTU_`/`RSSHUB_` 前缀的调参项。名字含 `_KEY`/`_TOKEN`/`_SECRET`/`_PASSWORD` 段或以 `OPENAI_`/`ANTHROPIC_`/`LANGCHAIN_` 开头者一律剔除，`API_AUTH_KEY`/`JINA_API_KEY`/`ROUTER_*` 不进任何子进程——`env`、`cat .env`、回测策略里 `open("artifacts/x").write(os.environ)` 之类都拿不到全租户共享的 LLM 凭据。配套**按值脱敏**（`redaction.redact_secret_values`）：引擎进程 env 里凭据形名字、长度 ≥12 的值，在任何工具结果进入轨迹/trace/校验器之前替换为 `[redacted:<KEYNAME>]`；出境隧道私钥不在引擎 env 里（launcher 把它从 boot env 弹出、写到 `~/.ssh/egress_key`），脱敏集额外读这个文件，全文、每行正文（PEM 头尾行除外）与整体 base64 都替换为 `[redacted:VIBE_EGRESS_SSH_KEY]`——这只是按字符串匹配的纵深防御，换一种编码（如 `xxd`）就能绕过，见 §2.5 残余面。引擎自身的 LLM 调用是进程内 httpx，不受影响。同一边界的配置面：租户档位（`VIBE_TRADING_TENANT_SAFE=1`）下 `src/config/loader.py` 不读 `~/.vibe-trading/agent.json` / `swarm-agent.json`（那是租户可写的 bind-mount，bash 写一个文件就能让下一次 attempt 以引擎身份拉起任意 stdio 命令），MCP 服务端只认 `VIBE_TRADING_AGENT_CONFIG` / `VIBE_TRADING_SWARM_AGENT_CONFIG` 指向的镜像内只读路径（生产模板不放这两个文件，即租户引擎无 MCP 服务端）。同理，租户档（`TENANT_SAFE` 或 `MULTITENANT` 任一）下 `providers/llm.py::_ensure_dotenv` 整段跳过、不读任何 `.env`：三个候选路径里 `~/.vibe-trading/.env` 就在租户可写的 bind-mount 上，文件里的名字会补进持有共享凭据的引擎进程；租户引擎的配置只来自 router 的 `/boot` env。
 4. **引擎 env 档位**（router 经 `/boot` 注入每个租户引擎）：
 
 | env | 作用 |
@@ -103,7 +103,7 @@ stateDiagram-v2
 | `VIBE_MULTITENANT=1` | fail-loud 标记：缺 `VIBE_DATA_DIR` 时引擎拒绝启动，杜绝静默写共享安装目录 |
 | `VIBE_TRADING_TENANT_SAFE=1` | `build_registry` 排除**动钱红线**：`trading_*` 前缀全部工具 + `propose_mandate_profiles`。只读分析产品在任何配置下都不得触发真实下单/资金授权。同时 `config/loader.py` 忽略 `~/.vibe-trading` 下的 `agent.json` / `swarm-agent.json`（见 §2.3 第 3 条） |
 | `VIBE_TRADING_ENABLE_SHELL_TOOLS=1` | 放开 shell 类工具（上游默认关）——任意命令执行已被 MicroVM 圈住，视为安全 |
-| `API_AUTH_KEY=<随机>` | 引擎对非 loopback 调用方的 Bearer 鉴权 key，见 §5 |
+| `API_AUTH_KEY=<随机>` | 引擎的 Bearer 鉴权 key，多租户档对**所有**调用方生效（含 guest 内 loopback），见本节第 5 条与 §5 |
 | `VIBE_MAX_ITERATIONS=50` | 租户档位：ReAct 迭代上限（与引擎默认一致；router env 可覆盖） |
 | `VIBE_TRADING_TOOL_TIMEOUT_SECONDS=300` `SWARM_TIMEOUT=7200` | 租户档位：单工具/swarm 超时（引擎默认分别 1800/7200；另被剩余预算动态钳制，见 §9）。`SWARM_TIMEOUT` 由 router 的 `VIBE_SWARM_ASK_TIMEOUT_S` 派生 |
 | `TIMEOUT_SECONDS=300` | LLM 流式读超时（httpx；引擎默认 120）。opus 级长上下文思考停顿可超 120s，300 既能熬过停顿、真死上游仍在一个 worker 迭代内失败 |
@@ -111,18 +111,46 @@ stateDiagram-v2
 | `VIBE_TRADING_DATA_CACHE=1` | 开启 loader parquet 缓存（落租户数据目录，跨会话/重建持久） |
 | `VIBE_TRADING_SEARCH_BACKENDS=auto` | ddgs 搜索后端（9.x 已无 google/bing，auto 轮询全部引擎） |
 | `VIBE_TRADING_EGRESS_PROXY=http://127.0.0.1:8118` | 仅配置了 egress key 时注入；web_search / read_url（r.jina.ai）/ yfinance 专用出境代理（沙箱内加密隧道，见 §9） |
+| `VIBE_LAUNCHER_AUTH=1` + `VIBE_LAUNCHER_TOKEN` | 仅 router 开了 `VIBE_LAUNCHER_AUTH` 时出现在 boot env 里；launcher 消费后弹出，不进引擎（见 §4） |
 
-`run_swarm` / `session_search` / `background_*` 不裁剪：其状态已被 HOME + 租户目录限定在本租户内（如 `session_search` 索引 = 本租户自己的 `~/.vibe-trading/sessions.db`，只搜本人跨线程历史）。
+`run_swarm` / `session_search` / `background_*` 不裁剪：其状态已被 HOME + 租户目录限定在本租户内（如 `session_search` 索引 = 本租户自己的 `~/.vibe-trading/sessions.db`，只搜本人跨线程历史）；后台任务另按会话归属（通知与 `check` 只看本会话，全局最多 4 个、每会话最多 2 个在跑）。
+
+5. **引擎 API 边界**（`agent/src/config/tenant.py` 的 `multitenant_enabled` / `tenant_profile_active` 是唯一判定）：guest 内经 loopback 访问引擎的只可能是模型自己的 shell / 后台子进程，所以 `VIBE_MULTITENANT=1` 时 `api_server` **不再信任 loopback**（`_loopback_trusted` 恒 False；上游单机模式下 loopback 免 key），所有端点都要 `API_AUTH_KEY`；launcher 只探 `/health`，该端点本就不鉴权。同时引擎进程启动时 `prctl(PR_SET_DUMPABLE, 0)`（Linux，失败只告警）：`/proc/<engine>/*` 归 root、禁止 ptrace，同 uid 的工具子进程读不到 `environ` 里的 `API_AUTH_KEY` 与共享凭据；子进程 exec 后恢复，工具不受影响。租户档下 `POST /swarm/runs`、`/swarm/runs/{id}/retry`（绕过 router 的预算与计量直起 swarm）与 `/mandate/commit`、`/live/{halt,resume,authorize,runner/start,runner/stop}`（动钱红线在执行层的对应物）一律 403，已通过鉴权的调用方也不例外。messages 请求缺 `deadline_s` 时按 `VIBE_DEFAULT_DEADLINE_S` 兜底（租户档缺省 900s，单机缺省不设；router 总会带 `deadline_s`）。launcher 本身的鉴权见 §4。
 
 ### 2.4 router 状态文件
 
 `/var/lib/cube-router/state.json`（`VIBE_STATE_FILE`），原子写（tmp + replace）：
 
-```json
-{ "<tenant_key>": { "sandbox_id": "...", "template_id": "tpl-...", "llm_fp": "builtin:... | byok:<sha16> | null", "api_key": "<引擎 Bearer key>" } }
+```jsonc
+{ "<tenant_key>": { "sandbox_id": "...", "template_id": "tpl-...",
+                    "llm_fp": "<byok:<sha16> | builtin:<model> | default>|env:<sha16>",
+                    "api_key": "<引擎 Bearer key>" },
+  "<被注销的 tenant_key>": { "forgotten_at": 1790000000.0 } }   // /forget 墓碑，见 §3.2
 ```
 
 这是租户 → 沙箱映射的唯一持久化真源；router 重启靠它重挂沙箱不泄漏。删除某行 + 删沙箱 = 该租户彻底重置。
+
+- `llm_fp` 另有两种过渡值：`boot-pending:<fp>`——`_boot_engine` 在调 launcher **之前**就把新 key 与这个值写进实例和 state（冷启时 state 行因此先于 `/boot` 出现），拿到 200 才改成正式指纹，所以 `/boot` 中途断连或超时后 router 手里仍是引擎实际拿到的那把 key；`stale`——引擎拒绝了 router 的 key（被绕过 router 重启过），下次使用前重启。两者都不等于任何真实指纹。
+- 墓碑行：删沙箱失败时同一行还保留 `sandbox_id` 等字段，供夜间重试与启动清扫再删；所有清 state 行的路径（`_drop_state_row`）都保留墓碑。
+- 旧版 router 能读新文件：不认识的指纹只会让该租户多重启一次，墓碑被忽略。
+
+### 2.5 威胁模型与缓解（现行）
+
+资产：租户数据（长期记忆、含持仓的 prompt 与 trace、上传的交割单）、全租户共享的凭据（内置 LLM 凭据、数据源 token、出境隧道私钥）、宿主（router 以 root 运行）、动钱能力、计费与预算。攻击者按能力分三类：**其他租户**；**本租户里的模型**——外部内容（网页、公告、上传文件、MCP 结果）的提示注入可以驱动它调工具、在 guest 里跑任意 shell；**本租户用户**自己。
+
+| 攻击面 | 缓解 | 见 |
+|---|---|---|
+| 跨租户读写 | 每租户一台 MicroVM + 独立 HOME bind-mount；租户键 HMAC 派生、不可逆 | §2.1–2.3 |
+| guest 内代码拿共享凭据 | 子进程白名单 env + 按值脱敏（含出境私钥）；引擎 non-dumpable；`/app` 只读、`PYTHONNOUSERSITE`；租户档不读 `.env` / `agent.json` | §2.3 |
+| guest 内代码绕过 router 直接驱动引擎 | 多租户档不信任 loopback；租户档关闭 swarm 直起与动钱端点；launcher 可选 token 鉴权 | §2.3 第 5 条、§4 |
+| 借 router（root）读写宿主文件 | 所有宿主直读直写的租户路径过 `_safe_tenant_path`（拒 symlink 与目录外解析）；会话 tombstone 按目录 fd 逐级 `O_NOFOLLOW` 写 | §3.2.1、§3.4 |
+| 动钱 | tenant-safe 档 registry 排除 `trading_*` / `propose_mandate_profiles`，API 层 403 | §2.3 |
+| 提示注入与记忆投毒 | 外部内容包进 `<external-content trust="untrusted">` + 中英注入扫描；记忆索引段 `<memory-index>` 声明为数据；`remember` 拒写命中 high 级规则的内容；用户可在 laicai 记忆页查看、删除 | §7、[docs/SYSTEM-PROMPT.md](docs/SYSTEM-PROMPT.md) §3 |
+| prompt 外泄到第三方 tracing | LangSmith 同名空间不转发 | README_CUSTOM env 表 |
+| 数据残留 | `/forget` 整租户清除 + 墓碑；`/sessions/delete` + 会话 tombstone | §3.2、§3.2.1 |
+| 出境 | 私钥在 B 端 `restrict,permitopen` 只能转发到白名单代理；代理按域名白名单放行 | §4、[docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) §6 |
+
+**残余面**（已知、未修）：launcher 与 bash 同为 uid 1000——non-dumpable 挡不住同 uid 的 `kill`，launcher 被杀后若 `:8898` 能被租户进程重新监听，伪造的 launcher 会在下一次 `/boot` 拿到完整 boot env；出境私钥文件对 uid 1000 可读（脱敏可被换编码绕过，B 端约束把爆炸半径限在「借用白名单代理」）；沙箱出网全量放行（CubeEgress 未启用）；router 以 root 运行。前两项的根治是同一个进程模型改造（launcher 以 root 运行、降权后再拉起引擎，私钥放 root 专属目录或交给 non-dumpable 的 agent 托管），列在放量前的收紧清单里。设计期的共享状态审计与评审沿革见 [docs/HISTORY.md](docs/HISTORY.md) §1。
 
 ## 3. router 契约（对 laicai）
 
