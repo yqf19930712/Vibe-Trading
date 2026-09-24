@@ -27,9 +27,19 @@ _CANCEL: contextvars.ContextVar[Optional[threading.Event]] = contextvars.Context
 CANCEL_POLL_S = 1.0
 
 
-def bind_cancel_event(event: Optional[threading.Event]) -> None:
-    """Bind the attempt's cancel event (None = unbound)."""
-    _CANCEL.set(event)
+def bind_cancel_event(event: Optional[threading.Event]) -> contextvars.Token:
+    """Bind the attempt's cancel event (None = unbound).
+
+    Returns:
+        The token :func:`reset_cancel_event` takes to restore the previous
+        binding, so a set event does not outlive its attempt on this thread.
+    """
+    return _CANCEL.set(event)
+
+
+def reset_cancel_event(token: contextvars.Token) -> None:
+    """Restore the binding :func:`bind_cancel_event` replaced."""
+    _CANCEL.reset(token)
 
 
 def get_cancel_event() -> Optional[threading.Event]:

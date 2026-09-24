@@ -399,6 +399,18 @@ def max_output_tokens(channel: str) -> Optional[int]:
 _dotenv_loaded: bool = False
 
 
+def _sdk_max_retries(override: Optional[int] = None) -> int:
+    """SDK-level retry count for a client: ``override`` or ``MAX_RETRIES``.
+
+    The Layer 3 summary call builds its client with ``0`` — its failure is
+    already a handled degradation, and SDK retries of a long summary request
+    would multiply its wall-clock cost by up to ``MAX_RETRIES + 1``.
+    """
+    if override is not None:
+        return max(0, int(override))
+    return int(os.getenv("MAX_RETRIES", "2"))
+
+
 def _redact_env_source(loaded: Path | None) -> str:
     """Map a resolved `.env` candidate to a stable, leak-free label.
 
@@ -483,6 +495,7 @@ def _build_native_deepseek(
     model: str,
     temperature: float,
     callbacks: Any = None,
+    max_retries: Optional[int] = None,
 ) -> Any | None:
     """Build the optional native DeepSeek adapter when installed.
 
@@ -504,7 +517,7 @@ def _build_native_deepseek(
         model=model,
         temperature=temperature,
         timeout=int(os.getenv("TIMEOUT_SECONDS", "120")),
-        max_retries=int(os.getenv("MAX_RETRIES", "2")),
+        max_retries=_sdk_max_retries(max_retries),
         # None = no ceiling field in the request (ChatDeepSeek sends the
         # legacy ``max_tokens`` name when one is set).
         max_tokens=max_output_tokens("openai"),
@@ -708,7 +721,9 @@ def _apply_anthropic_cache_breakpoints(payload: dict) -> None:
     _mark_newest_stable_block(msgs)
 
 
-def _build_native_anthropic(model: str, callbacks: Any = None) -> Any:
+def _build_native_anthropic(
+    model: str, callbacks: Any = None, max_retries: Optional[int] = None
+) -> Any:
     """Build a native Anthropic Messages API client (LANGCHAIN_PROVIDER=anthropic).
 
     Motivation: the OpenAI-compat conversion path swallows Anthropic's SSE
@@ -799,7 +814,7 @@ def _build_native_anthropic(model: str, callbacks: Any = None) -> Any:
         "model": model,
         "max_tokens": max_output_tokens("anthropic"),
         "timeout": int(os.getenv("TIMEOUT_SECONDS", "120")),
-        "max_retries": int(os.getenv("MAX_RETRIES", "2")),
+        "max_retries": _sdk_max_retries(max_retries),
         "api_key": api_key,
         "callbacks": callbacks,
     }
@@ -926,12 +941,19 @@ def provider_diagnostics() -> dict[str, Any]:
     }
 
 
-def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any:
+def build_llm(
+    *,
+    model_name: Optional[str] = None,
+    callbacks: Any = None,
+    max_retries: Optional[int] = None,
+) -> Any:
     """Construct a ChatOpenAI instance.
 
     Args:
         model_name: Model name; defaults to LANGCHAIN_MODEL_NAME.
         callbacks: Optional LangChain callbacks.
+        max_retries: SDK-level retries for this client; ``None`` = the
+            ``MAX_RETRIES`` env default.
 
     Returns:
         ChatOpenAI instance.
@@ -958,7 +980,7 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         )
 
     if provider == "anthropic":
-        return _build_native_anthropic(name, callbacks=callbacks)
+        return _build_native_anthropic(name, callbacks=callbacks, max_retries=max_retries)
 
     if provider == "deepseek":
         adapter_mode = _deepseek_adapter_mode()
@@ -967,6 +989,7 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
                 model=name,
                 temperature=temperature,
                 callbacks=callbacks,
+                max_retries=max_retries,
             )
             if native_llm is not None:
                 return native_llm
@@ -1002,7 +1025,7 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         "model": name,
         "temperature": temperature_param,
         "timeout": int(os.getenv("TIMEOUT_SECONDS", "120")),
-        "max_retries": int(os.getenv("MAX_RETRIES", "2")),
+        "max_retries": _sdk_max_retries(max_retries),
         # None = no ceiling field in the request; a value goes out as
         # ``max_completion_tokens`` (ChatOpenAI renames it, see max_output_tokens).
         "max_tokens": max_output_tokens("openai"),

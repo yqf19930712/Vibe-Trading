@@ -480,6 +480,26 @@ def run_worker(
             tool_ms=total_tool_ms,
         )
 
+    def _timeout_result(at_iteration: int) -> WorkerResult:
+        elapsed = time.monotonic() - t0
+        summary = _best_summary(messages, last_assistant_content) or (
+            f"Worker timed out after {elapsed:.0f}s ({at_iteration} iterations)"
+        )
+        summary = _resolve_summary(artifact_dir, summary)
+        _emit(event_callback, "worker_timeout", agent_id, task_id, {"elapsed": elapsed})
+        _write_summary(artifact_dir, summary)
+        _persist_messages(artifact_dir, messages)
+        return WorkerResult(
+            status="timeout",
+            summary=summary,
+            artifact_paths=_collect_artifacts(artifact_dir),
+            iterations=at_iteration,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            llm_ms=total_llm_ms,
+            tool_ms=total_tool_ms,
+        )
+
     for iteration in range(max_iterations):
         if cancel_event is not None and cancel_event.is_set():
             return _cancelled_result(iteration)
@@ -494,23 +514,8 @@ def run_worker(
         )
 
         # Check timeout
-        elapsed = time.monotonic() - t0
-        if elapsed > timeout:
-            summary = _best_summary(messages, last_assistant_content) or f"Worker timed out after {elapsed:.0f}s ({iteration} iterations)"
-            summary = _resolve_summary(artifact_dir, summary)
-            _emit(event_callback, "worker_timeout", agent_id, task_id, {"elapsed": elapsed})
-            _write_summary(artifact_dir, summary)
-            _persist_messages(artifact_dir, messages)
-            return WorkerResult(
-                status="timeout",
-                summary=summary,
-                artifact_paths=_collect_artifacts(artifact_dir),
-                iterations=iteration,
-                input_tokens=total_input_tokens,
-                output_tokens=total_output_tokens,
-                llm_ms=total_llm_ms,
-                tool_ms=total_tool_ms,
-            )
+        if time.monotonic() - t0 > timeout:
+            return _timeout_result(iteration)
 
         # Check token estimate (CJK-weighted, see src.core.token_estimate)
         token_estimate = estimate_messages_tokens(messages, count_reasoning=count_reasoning)
@@ -587,9 +592,11 @@ def run_worker(
             def _stream_once() -> LLMResponse:
                 """Run one heartbeat-wrapped streaming LLM call.
 
-                Recomputes the remaining time budget at call time so the
-                single retry after a stream failure never reuses a stale
-                timeout.
+                Recomputes the remaining time budget at call time so a retry
+                after a stream failure never reuses a stale timeout. The
+                value is the call's wall-clock budget (``stream_chat`` stops
+                the stream at it and returns ``interrupted="deadline"``) and
+                tightens the SDK read timeout once it is the smaller one.
 
                 Returns:
                     Parsed ``LLMResponse`` from ``ChatLLM.stream_chat``.
@@ -672,6 +679,10 @@ def run_worker(
             )
         except Exception as exc:
             total_llm_ms += int((time.monotonic() - llm_t0) * 1000)
+            if time.monotonic() - t0 > timeout:
+                # The failure came from the worker's own budget running out
+                # (retries stop there too): a timeout, not an LLM fault.
+                return _timeout_result(iteration)
             error_msg = f"LLM call failed at iteration {iteration}: {exc}"
             logger.warning(error_msg)
             _emit(event_callback, "worker_failed", agent_id, task_id, {"error": error_msg})
@@ -691,6 +702,14 @@ def run_worker(
         iter_in, iter_out = _estimate_tokens(messages, response, count_reasoning=count_reasoning)
         total_input_tokens += iter_in
         total_output_tokens += iter_out
+
+        # A stream stopped early is partial: its tool calls may carry
+        # half-written arguments, so nothing of it is executed or kept.
+        interrupted = getattr(response, "interrupted", None)
+        if interrupted == "cancelled" or (cancel_event is not None and cancel_event.is_set()):
+            return _cancelled_result(iteration)
+        if interrupted:
+            return _timeout_result(iteration)
 
         # Track last meaningful assistant content
         if response.content and len(response.content.strip()) > 20:

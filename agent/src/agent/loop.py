@@ -184,6 +184,11 @@ _LENGTH_CONTINUE_NUDGE = (
     "in the remaining part."
 )
 OUTPUT_TRUNCATED_MARK = "\n\n（输出被截断）"
+# Appended to an answer whose stream the attempt deadline cut short.
+BUDGET_TRUNCATED_MARK = "\n\n（时间预算耗尽，输出被截断）"
+# Appended when a research goal would need another round the budget (or the
+# forced final turn) no longer allows.
+GOAL_UNFINISHED_MARK = "\n\n（研究目标尚未完成：本次时间预算不足以继续推进。）"
 
 # A tool call whose arguments were still streaming when the output ceiling
 # hit is NOT executed: LangChain completes the cut JSON (``parse_partial_json``)
@@ -1289,6 +1294,9 @@ class AgentLoop:
         # — so an identical failing call could repeat until the iteration cap.
         self._consecutive_failures: Dict[str, int] = {}
         self._session_id: str = ""
+        # Mean wall-clock seconds per completed iteration of the current run
+        # (None until one has completed); sizes the "one more round" reserve.
+        self._avg_iter_s: Optional[float] = None
 
     def cancel(self) -> None:
         """Cancel the current loop.
@@ -1326,9 +1334,32 @@ class AgentLoop:
         # an orphaned loop nobody can reach any more.
         if self._cancel_event.is_set():
             logger.info("AgentLoop cancelled before start")
-        # Expose the cancel signal to every tool thread (copy_context) so
-        # long polls (swarm wait, tool watchdog) can stop between ticks.
-        _cancel.bind_cancel_event(self._cancel_event)
+        # Attempt-scoped context: the cancel signal (so long polls in tool
+        # threads — swarm wait, tool watchdog — can stop between ticks), the
+        # fetch-stats collector and, when passed explicitly, the deadline.
+        # Tool threads see them through copy_context. Every binding made here
+        # is undone on the way out: a later run on the same thread (CLI,
+        # tests) must not inherit this attempt's set cancel event or expired
+        # deadline.
+        cancel_token = _cancel.bind_cancel_event(self._cancel_event)
+        collector_token = _fetch_stats.bind_collector(_fetch_stats.FetchStatsCollector())
+        deadline_token = _budget.bind_deadline(deadline) if deadline is not None else None
+        try:
+            return self._run_attempt(user_message, history, session_id, deadline)
+        finally:
+            if deadline_token is not None:
+                _budget.reset_deadline(deadline_token)
+            _fetch_stats.reset_collector(collector_token)
+            _cancel.reset_cancel_event(cancel_token)
+
+    def _run_attempt(
+        self,
+        user_message: str,
+        history: Optional[List[Dict[str, Any]]],
+        session_id: str,
+        deadline: Optional[float],
+    ) -> Dict[str, Any]:
+        """Body of :meth:`run`, inside the attempt-scoped context bindings."""
         self._called_ok = {}
         self._session_id = session_id or ""
         # Resume Layer 5 from the session's stored handoff summary instead
@@ -1340,12 +1371,10 @@ class AgentLoop:
         self._grounding_results = []
         self._microcompact_state = {}
         self._consecutive_failures = {}
+        self._avg_iter_s = None
         run_t0 = _time.perf_counter()
-        _fetch_stats.start_collect()
         if deadline is None:
             deadline = _budget.get_deadline()
-        else:
-            _budget.bind_deadline(deadline)
         budget_total_s = (
             max(0.0, deadline - _time.monotonic()) if deadline is not None else None
         )
@@ -1422,12 +1451,31 @@ class AgentLoop:
         goal_last_progress: tuple[int, int] | None = None
         wrap_up_at = max(1, int(self.max_iterations * 0.8))
         force_final = False
+        # Set when the attempt deadline ends the run (a model turn cut at the
+        # deadline, or no time left to start another one).
+        deadline_exhausted = False
+
+        def _should_stop_stream() -> bool:
+            """Cancel, or the attempt deadline — polled per streamed chunk."""
+            return self._cancel_event.is_set() or (
+                deadline is not None and _time.monotonic() >= deadline
+            )
 
         try:
             while iteration < self.max_iterations:
                 if self._cancel_event.is_set():
                     trace.write({"type": "cancelled", "iter": self._run_iteration + 1})
                     logger.info("AgentLoop cancelled by user")
+                    break
+                if deadline is not None and _time.monotonic() >= deadline:
+                    # No model turn may start past the deadline: the caller
+                    # has stopped waiting, and the last turn was already the
+                    # forced final one.
+                    deadline_exhausted = True
+                    _best_effort(
+                        trace.write,
+                        {"type": "deadline_exhausted", "iter": self._run_iteration + 1},
+                    )
                     break
 
                 iteration += 1
@@ -1494,9 +1542,11 @@ class AgentLoop:
                 remaining_s = (
                     deadline - _time.monotonic() if deadline is not None else None
                 )
+                if iteration > 1:
+                    self._avg_iter_s = (_time.perf_counter() - run_t0) / max(1, iteration - 1)
                 if remaining_s is not None and iteration > 1:
-                    avg_iter_s = (_time.perf_counter() - run_t0) / max(1, iteration - 1)
-                    if remaining_s < max(FINALIZE_RESERVE_S, avg_iter_s * 1.2):
+                    avg_iter_s = self._avg_iter_s or 0.0
+                    if remaining_s < self._round_reserve_s():
                         if not force_final:
                             # trace/emit once; the nudge line itself repeats
                             # with the status bar for as long as needed.
@@ -1605,13 +1655,23 @@ class AgentLoop:
                 for stream_attempt in range(1 + STREAM_RETRIES):
                     try:
                         self._stats["llm_calls"] += 1
+                        # The attempt deadline bounds the call itself: the
+                        # predicate stops the stream at the deadline (the
+                        # partial text is kept, see below), and ``timeout``
+                        # also tightens the SDK read timeout near the end.
+                        # Passed only when a deadline exists, so LLM
+                        # stand-ins without the parameter keep working.
+                        budget_kwargs: Dict[str, Any] = {}
+                        if deadline is not None:
+                            budget_kwargs["timeout"] = max(0.001, deadline - _time.monotonic())
                         response = self.llm.stream_chat(
                             messages,
                             tools=tool_defs,
                             on_text_chunk=_on_text_chunk,
                             on_reasoning_chunk=_on_reasoning_chunk,
-                            should_cancel=self._cancel_event.is_set,
+                            should_cancel=_should_stop_stream,
                             tool_choice=tool_choice,
+                            **budget_kwargs,
                         )
                         break
                     except ProviderStreamError as exc:
@@ -1723,6 +1783,31 @@ class AgentLoop:
                     )
                     self._emit("thinking_done", {"iter": current_iter, "content": thinking_text[:500]})
 
+                if getattr(response, "interrupted", None):
+                    # Stopped at the attempt deadline (a cancel ended the run
+                    # above). Keep what was streamed: a text reply becomes the
+                    # answer, marked as cut; partial tool calls are dropped
+                    # unexecuted. Without a text reply the best earlier
+                    # fallback (a continued or goal-intermediate answer) stands.
+                    deadline_exhausted = True
+                    partial = response.content or ""
+                    self._stats["budget_truncated"] = True
+                    _best_effort(
+                        trace.write,
+                        {
+                            "type": "llm_deadline_cut",
+                            "iter": current_iter,
+                            "chars": len(partial),
+                            "discarded_tool_calls": len(response.tool_calls),
+                        },
+                    )
+                    if partial and not response.has_tool_calls:
+                        final_content = "".join(truncated_parts) + partial + BUDGET_TRUNCATED_MARK
+                        truncated_parts = []
+                    if final_content:
+                        self._write_answer_trace(trace, react_trace, current_iter, final_content)
+                    break
+
                 # Duck-typed: LLM stand-ins may omit finish_reason.
                 finish_reason = getattr(response, "finish_reason", "stop")
                 if finish_reason == "length":
@@ -1797,8 +1882,8 @@ class AgentLoop:
                         messages.append({"role": "assistant", "content": final_content})
                         messages.append({"role": "user", "content": _LENGTH_CONTINUE_NUDGE})
                         # Fallback answer should the run end without another
-                        # text turn: the partial, marked as such.
-                        final_content += OUTPUT_TRUNCATED_MARK
+                        # text turn: everything written so far, marked as such.
+                        final_content = "".join(truncated_parts) + OUTPUT_TRUNCATED_MARK
                         continue
                     if truncated_parts:
                         # The continuation(s) complete the earlier partial text.
@@ -1857,6 +1942,24 @@ class AgentLoop:
                         except Exception as exc:  # noqa: BLE001
                             logger.debug("Goal continuation check skipped: %s", exc)
 
+                    if should_continue_goal and continuation_snapshot is not None and (
+                        is_last_iteration or not self._time_for_another_round(deadline)
+                    ):
+                        # A continuation would start after the forced final
+                        # turn or past what the budget can hold: answer now
+                        # and say the goal is not finished.
+                        should_continue_goal = False
+                        final_content += GOAL_UNFINISHED_MARK
+                        trace.write(
+                            {
+                                "type": "goal_continuation_suppressed",
+                                "iter": current_iter,
+                                "goal_id": active_goal_id,
+                                "reason": "budget",
+                                "continuations": goal_continuations,
+                            }
+                        )
+
                     if should_continue_goal and continuation_snapshot is not None:
                         current_progress = goal_progress_tuple(continuation_snapshot)
                         no_new_progress = (
@@ -1910,19 +2013,7 @@ class AgentLoop:
                             goal_continuations += 1
                             continue
 
-                    trace.write_text_entry(
-                        {"type": "answer", "iter": current_iter},
-                        field="content",
-                        value=final_content,
-                        offload_kind=f"answer-{current_iter}",
-                    )
-                    trace.write_text_entry(
-                        {"type": "message", "iter": current_iter, "role": "assistant"},
-                        field="content",
-                        value=final_content,
-                        offload_kind=f"assistant-message-{current_iter}",
-                    )
-                    react_trace.append({"type": "answer", "content": final_content[:500]})
+                    self._write_answer_trace(trace, react_trace, current_iter, final_content)
                     break
 
                 # A tool-calling turn after a length continuation restarts the
@@ -2026,6 +2117,13 @@ class AgentLoop:
                 except Exception:  # noqa: BLE001 - trace must never break the run
                     logger.debug("verify_warnings trace write failed", exc_info=True)
                 self._emit("verify_warnings", {"warnings": verify_warnings})
+        elif deadline_exhausted:
+            final_reason = (
+                "deadline_exhausted: the attempt's time budget ran out before "
+                f"a final answer (iteration {iteration})"
+            )
+            state_store.mark_failure(run_dir, final_reason)
+            final_status = "failed"
         elif empty_model_response_iter is not None:
             provider = os.getenv("LANGCHAIN_PROVIDER", "openai").strip().lower() or "openai"
             model = getattr(self.llm, "model_name", None) or os.getenv("LANGCHAIN_MODEL_NAME", "").strip() or "(unset)"
@@ -2074,6 +2172,39 @@ class AgentLoop:
         if final_reason is not None:
             result["reason"] = final_reason
         return result
+
+    def _round_reserve_s(self) -> float:
+        """Seconds one more full iteration is expected to need.
+
+        ``max(FINALIZE_RESERVE_S, 1.2 × mean iteration)`` — the early-finalize
+        line; before any iteration has completed only the fixed reserve.
+        """
+        return max(FINALIZE_RESERVE_S, (self._avg_iter_s or 0.0) * 1.2)
+
+    def _time_for_another_round(self, deadline: Optional[float]) -> bool:
+        """Whether the attempt budget still holds one more full iteration."""
+        if deadline is None:
+            return True
+        return deadline - _time.monotonic() >= self._round_reserve_s()
+
+    @staticmethod
+    def _write_answer_trace(
+        trace: TraceWriter, react_trace: list, iteration: int, content: str
+    ) -> None:
+        """Record the final answer (``answer`` + assistant ``message`` entries)."""
+        trace.write_text_entry(
+            {"type": "answer", "iter": iteration},
+            field="content",
+            value=content,
+            offload_kind=f"answer-{iteration}",
+        )
+        trace.write_text_entry(
+            {"type": "message", "iter": iteration, "role": "assistant"},
+            field="content",
+            value=content,
+            offload_kind=f"assistant-message-{iteration}",
+        )
+        react_trace.append({"type": "answer", "content": content[:500]})
 
     def _emit_attempt_stats(
         self,
@@ -2139,12 +2270,16 @@ class AgentLoop:
         # into _stats and emitted here.
         for counter in (
             "compact_failures",
+            "compact_skips",
             "offload_failures",
             "output_truncations",
             "truncated_tool_calls",
         ):
             if self._stats.get(counter):
                 stats[counter] = int(self._stats[counter])
+        # A model turn was cut at the attempt deadline (only present when so).
+        if self._stats.get("budget_truncated"):
+            stats["budget_truncated"] = True
         collector = _fetch_stats.current()
         if collector is not None:
             fetches, gaps = collector.snapshot()
@@ -2644,6 +2779,28 @@ class AgentLoop:
             iteration: Current trace iteration.
         """
         del run_dir
+        # The summary is one more model call. With less than two rounds of
+        # budget left it would eat the time the answer needs; the trajectory
+        # simply stays long (the provider window is far larger than the
+        # compaction threshold). Otherwise the call may use what exceeds one
+        # round's reserve, and no more.
+        remaining = _budget.remaining_s()
+        summary_timeout: Optional[float] = None
+        if remaining is not None:
+            round_s = self._round_reserve_s()
+            if remaining < 2 * round_s:
+                self._stats["compact_skips"] = self._stats.get("compact_skips", 0) + 1
+                _best_effort(
+                    trace.write,
+                    {
+                        "type": "compact_skipped",
+                        "iter": iteration,
+                        "reason": "budget",
+                        "remaining_s": round(remaining, 1),
+                    },
+                )
+                return
+            summary_timeout = remaining - round_s
         # Save full transcript before compressing next to the active trace.
         transcript_path = trace.dir_path / f"transcript_{int(_time.time())}.jsonl"
         with open(transcript_path, "w", encoding="utf-8") as f:
@@ -2705,7 +2862,7 @@ class AgentLoop:
         # layers (L1/L2 already ran this iteration) and leave the trajectory
         # untouched; the next iteration retries compaction.
         try:
-            summary_resp = self.llm.chat([{"role": "user", "content": prompt}])
+            summary_resp = self._summary_call(prompt, summary_timeout)
             summary = summary_resp.content or ""
         except Exception as exc:  # noqa: BLE001 - degrade, never fail the run
             self._stats["llm_ms"] += int((_time.perf_counter() - compact_t0) * 1000)
@@ -2775,6 +2932,30 @@ class AgentLoop:
         self._called_ok = {
             key: msg for key, msg in self._called_ok.items() if id(msg) in live
         }
+
+    def _summary_call(self, prompt: str, timeout: Optional[float]) -> Any:
+        """Run the Layer 3 summary request.
+
+        Uses ``ChatLLM.summarize`` — streamed, cancellable per chunk, bounded
+        by ``timeout``, no SDK retries — when the client has it; plain
+        ``chat`` otherwise (LLM stand-ins). An interrupted summary is a
+        failure: half a summary must never replace the trajectory head.
+
+        Raises:
+            RuntimeError: When the summary stream was cancelled or ran out
+                of time.
+        """
+        messages = [{"role": "user", "content": prompt}]
+        summarize = getattr(self.llm, "summarize", None)
+        if not callable(summarize):
+            return self.llm.chat(messages)
+        response = summarize(
+            messages, timeout=timeout, should_cancel=self._cancel_event.is_set
+        )
+        interrupted = getattr(response, "interrupted", None)
+        if interrupted:
+            raise RuntimeError(f"summary call interrupted ({interrupted})")
+        return response
 
     def _emit(self, event_type: str, data: Dict[str, Any]) -> None:
         """Fire an event via the callback."""
