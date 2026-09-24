@@ -185,6 +185,97 @@ _LENGTH_CONTINUE_NUDGE = (
 )
 OUTPUT_TRUNCATED_MARK = "\n\n（输出被截断）"
 
+# A tool call whose arguments were still streaming when the output ceiling
+# hit is NOT executed: LangChain completes the cut JSON (``parse_partial_json``)
+# into a valid-looking dict, so a half-written file or script would otherwise
+# land on disk and report ``ok``. Each such call gets this structured error
+# instead, and the turn counts against ``LENGTH_CONTINUATIONS``. The refused
+# call stays in the trajectory (tool_use / tool_result pairing), with long
+# string arguments shortened so the partial payload does not bloat it.
+TRUNCATED_TOOL_CALL_ERROR = "tool_call_truncated"
+_TRUNCATED_ARG_MAX_CHARS = 2000
+_TRUNCATED_ARG_HEAD = 1500
+_TRUNCATED_ARG_TAIL = 500
+
+
+def _truncated_tool_call_error(tool_name: str) -> str:
+    """Structured tool result for a call cut by the output-token ceiling."""
+    return json.dumps(
+        {
+            "status": "error",
+            "error_code": TRUNCATED_TOOL_CALL_ERROR,
+            "tool": tool_name,
+            "message": (
+                "This call was NOT executed: your reply hit the output token "
+                "limit (finish_reason=length) while its arguments were still "
+                "being written, so they are incomplete. Re-issue it with "
+                "shorter arguments — split long content into several smaller "
+                "calls (write a long file in parts, keep scripts short) and "
+                "keep the text before the call brief."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _shorten_truncated_value(value: Any) -> Any:
+    """Shorten long strings inside a refused call's arguments (recursive)."""
+    if isinstance(value, str):
+        if len(value) <= _TRUNCATED_ARG_MAX_CHARS:
+            return value
+        omitted = len(value) - _TRUNCATED_ARG_HEAD - _TRUNCATED_ARG_TAIL
+        return (
+            f"{value[:_TRUNCATED_ARG_HEAD]}\n...[{omitted} chars omitted — "
+            f"truncated call, not executed]...\n{value[-_TRUNCATED_ARG_TAIL:]}"
+        )
+    if isinstance(value, dict):
+        return {k: _shorten_truncated_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_shorten_truncated_value(v) for v in value]
+    return value
+
+
+class _RefusedToolCall:
+    """Tool-call view with shortened arguments, for the trajectory only."""
+
+    def __init__(self, tc: Any) -> None:
+        self.id = tc.id
+        self.name = tc.name
+        self.arguments = _shorten_truncated_value(tc.arguments)
+        self.thought_signature = getattr(tc, "thought_signature", None)
+
+
+def truncated_tool_call_messages(
+    tool_calls: list,
+    *,
+    content: Optional[str],
+    reasoning_content: Optional[str],
+) -> list[dict[str, Any]]:
+    """Trajectory messages for a turn whose tool calls were cut by the ceiling.
+
+    Shared by the main loop and the swarm worker.
+
+    Args:
+        tool_calls: The (truncated) tool calls of the turn — none is executed.
+        content: The turn's visible text.
+        reasoning_content: The channel's reasoning field, as the caller would
+            pass it for an executed turn.
+
+    Returns:
+        The assistant tool-call message followed by one structured
+        ``tool_call_truncated`` error result per call.
+    """
+    assistant = ContextBuilder.format_assistant_tool_calls(
+        [_RefusedToolCall(tc) for tc in tool_calls],
+        content=content,
+        reasoning_content=reasoning_content,
+    )
+    _attach_tool_call_thought_signatures(assistant, tool_calls)
+    return [assistant] + [
+        ContextBuilder.format_tool_result(tc.id, tc.name, _truncated_tool_call_error(tc.name))
+        for tc in tool_calls
+    ]
+
 # Layer 2: Context collapse thresholds
 COLLAPSE_THRESHOLD = int(TOKEN_THRESHOLD * 0.7)
 COLLAPSE_PRESERVE_RECENT = 6
@@ -1646,6 +1737,35 @@ class AgentLoop:
                         self._stats.get("output_truncations", 0) + 1
                     )
 
+                if finish_reason == "length" and response.has_tool_calls:
+                    # The calls' arguments were cut mid-stream: refuse all of
+                    # them (see TRUNCATED_TOOL_CALL_ERROR) and let the model
+                    # re-issue shorter ones. Counts as a length continuation.
+                    length_continuations += 1
+                    truncated_parts = []
+                    refused = [tc.name for tc in response.tool_calls]
+                    messages.extend(
+                        truncated_tool_call_messages(
+                            response.tool_calls,
+                            content=response.content,
+                            reasoning_content=response.reasoning_content or None,
+                        )
+                    )
+                    self._stats["truncated_tool_calls"] = (
+                        self._stats.get("truncated_tool_calls", 0) + len(refused)
+                    )
+                    trace.write(
+                        {
+                            "type": "tool_calls_truncated",
+                            "iter": current_iter,
+                            "tools": refused,
+                            "attempt": length_continuations,
+                            "max_continuations": LENGTH_CONTINUATIONS,
+                        }
+                    )
+                    react_trace.append({"type": "tool_calls_truncated", "tools": refused})
+                    continue
+
                 if not response.has_tool_calls:
                     final_content = response.content or ""
                     if (
@@ -2014,9 +2134,15 @@ class AgentLoop:
         if self._stats.get("verify_warnings"):
             stats["verify_warnings"] = self._stats["verify_warnings"]
         # Degradation counters (only present when non-zero): L3 summary call
-        # failures and oversized-result offload failures; counted into _stats
-        # and emitted here.
-        for counter in ("compact_failures", "offload_failures"):
+        # failures, oversized-result offload failures, replies cut by the
+        # output ceiling and the tool calls refused because of it; counted
+        # into _stats and emitted here.
+        for counter in (
+            "compact_failures",
+            "offload_failures",
+            "output_truncations",
+            "truncated_tool_calls",
+        ):
             if self._stats.get(counter):
                 stats[counter] = int(self._stats[counter])
         collector = _fetch_stats.current()

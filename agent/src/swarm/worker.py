@@ -444,6 +444,7 @@ def run_worker(
         invoke_tool_guarded,
         tool_is_readonly,
         tool_timeout_for,
+        truncated_tool_call_messages,
     )
     from src.agent.tool_result_store import prepare_for_context
     from src.core.cancel import sleep_unless_cancelled
@@ -694,6 +695,29 @@ def run_worker(
         # Track last meaningful assistant content
         if response.content and len(response.content.strip()) > 20:
             last_assistant_content = response.content
+
+        # Tool calls whose arguments were cut by the output ceiling are never
+        # executed (a half-written report.md would pass the output contract
+        # and flow downstream as this task's summary): each gets a structured
+        # error and the model re-issues shorter calls. Same helper and the
+        # same continuation budget as the main loop.
+        if getattr(response, "finish_reason", "stop") == "length" and response.has_tool_calls:
+            length_continuations += 1
+            truncated_parts = []
+            _emit(
+                event_callback, "worker_output_truncated", agent_id, task_id,
+                {"iteration": iteration, "chars": len(response.content or ""),
+                 "continuation": None,
+                 "tool_calls_refused": [tc.name for tc in response.tool_calls]},
+            )
+            messages.extend(
+                truncated_tool_call_messages(
+                    response.tool_calls,
+                    content=response.content,
+                    reasoning_content=response.reasoning_content,
+                )
+            )
+            continue
 
         # If no tool calls, this is the final response — unless the output
         # ceiling cut it (finish_reason=length): then keep the partial text
