@@ -6,8 +6,9 @@ Run: VIBE_ROUTER_SECRET=x VIBE_ROUTER_TOKEN=y VIBE_CUBE_TEMPLATE_ID=tpl-test \
 
 No CubeAPI, no sandbox, no engine: every upstream call is an async fake.
 
-  · The answer poll tolerates failing polls within a bounded window and
-    fails fast when the launcher says the engine process is gone.
+  · The answer poll tolerates failing polls within a window that grows with
+    the ask's budget, keeps waiting while the launcher says the engine runs,
+    and fails fast when it says the engine process is gone.
   · The event pump reopens a dropped stream with Last-Event-ID and never
     forwards an event id twice.
   · Only the current attempt's events reach the caller: a continued
@@ -121,26 +122,72 @@ class TestWaitAnswerTolerance:
         assert _run(router._wait_answer(_inst(), "sid", "a1", 30, stats=stats)) == "答案"
         assert stats["poll_errors"] == 3
 
+    def _window(self, monkeypatch, floor_s: float, ratio: float = 0.0) -> None:
+        monkeypatch.setattr(router, "POLL_FAIL_MAX_S", floor_s)
+        monkeypatch.setattr(router, "POLL_FAIL_BUDGET_RATIO", ratio)
+
     def test_streak_resets_after_a_good_poll(self, monkeypatch):
-        monkeypatch.setattr(router, "POLL_FAIL_MAX_CONSECUTIVE", 2)
+        self._window(monkeypatch, 0.0)
         self._script(monkeypatch, [
             httpx.ConnectError("x"), _Resp(200, []), httpx.ConnectError("y"),
             _Resp(200, []), _Resp(200, ANSWER),
         ], health=None)
         assert _run(router._wait_answer(_inst(), "sid", "a1", 30)) == "答案"
 
-    def test_consecutive_failures_end_the_wait(self, monkeypatch):
-        monkeypatch.setattr(router, "POLL_FAIL_MAX_CONSECUTIVE", 3)
-        seen = self._script(monkeypatch, [httpx.ConnectError("down")], health=None)
+    def test_fast_failures_do_not_end_the_wait_before_the_window(self, monkeypatch):
+        """Connection refused comes back in milliseconds: dozens of failed
+        polls inside the window are no reason to give up."""
+        self._window(monkeypatch, 0.3)
+        outcomes = [httpx.ConnectError("refused")] * 40 + [_Resp(200, ANSWER)]
+        seen = self._script(monkeypatch, outcomes, health=None)
+        stats: dict = {}
+        assert _run(router._wait_answer(_inst(), "sid", "a1", 30, stats=stats)) == "答案"
+        assert stats["poll_errors"] == 40
+        assert seen["polls"] == 41
+
+    def test_unreachable_engine_ends_the_wait_after_the_window(self, monkeypatch):
+        self._window(monkeypatch, 0.05)
+
+        async def slow_fail(inst, method, path, **kw):
+            await asyncio.sleep(0.02)
+            raise httpx.ConnectError("down")
+
+        async def health(inst):
+            return None
+
+        monkeypatch.setattr(router, "_vibe", slow_fail)
+        monkeypatch.setattr(router, "_launcher_health", health)
         with pytest.raises(HTTPException) as ei:
             _run(router._wait_answer(_inst(), "sid", "a1", 30))
         assert ei.value.status_code == 502
         assert "unreachable" in ei.value.detail
-        assert seen["polls"] == 3
+
+    def test_window_grows_with_the_ask_budget(self, monkeypatch):
+        monkeypatch.setattr(router, "POLL_FAIL_MAX_S", 120.0)
+        monkeypatch.setattr(router, "POLL_FAIL_BUDGET_RATIO", 0.05)
+        assert router.poll_fail_window_s(900) == 120.0
+        assert router.poll_fail_window_s(7200) == 360.0
+
+    def test_running_engine_keeps_the_ask_waiting(self, monkeypatch):
+        """The launcher sees the engine healthy from inside the sandbox: only
+        the path to it fails, so the window never runs out."""
+        self._window(monkeypatch, 0.0)
+
+        async def slow_fail(inst, method, path, **kw):
+            await asyncio.sleep(0.01)
+            raise httpx.ReadTimeout("proxy")
+
+        async def health(inst):
+            return {"launcher": "ok", "engine": "running"}
+
+        monkeypatch.setattr(router, "_vibe", slow_fail)
+        monkeypatch.setattr(router, "_launcher_health", health)
+        with pytest.raises(HTTPException) as ei:
+            _run(router._wait_answer(_inst(), "sid", "a1", 0.3))
+        assert ei.value.status_code == 504
 
     def test_failure_window_in_seconds_ends_the_wait(self, monkeypatch):
-        monkeypatch.setattr(router, "POLL_FAIL_MAX_CONSECUTIVE", 10_000)
-        monkeypatch.setattr(router, "POLL_FAIL_MAX_S", 0.05)
+        self._window(monkeypatch, 0.05)
 
         async def slow_fail(inst, method, path, **kw):
             await asyncio.sleep(0.02)

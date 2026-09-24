@@ -94,13 +94,25 @@ ACTIVE_QUEUE_WAIT_S = float(os.environ.get("VIBE_ACTIVE_QUEUE_WAIT_S", "120"))
 IDLE_TTL_S = int(os.environ.get("VIBE_IDLE_TTL_S", str(20 * 60)))     # pause after idle
 READY_TIMEOUT_S = int(os.environ.get("VIBE_READY_TIMEOUT_S", "180"))  # create+boot budget
 POLL_INTERVAL_S = float(os.environ.get("VIBE_POLL_INTERVAL_S", "3"))
-# Answer-poll tolerance: a failing poll (transport error, non-JSON body,
-# non-200 from cube-proxy or the engine) is retried until the failures have
-# lasted POLL_FAIL_MAX_S seconds or POLL_FAIL_MAX_CONSECUTIVE polls in a row,
-# whichever comes first. A launcher that reports the engine process stopped
-# ends the wait at once — that attempt is gone.
-POLL_FAIL_MAX_CONSECUTIVE = int(os.environ.get("VIBE_POLL_FAIL_MAX", "10"))
+# Answer-poll tolerance. A failing poll (transport error, non-JSON body,
+# non-200 from cube-proxy or the engine) is followed by a launcher /health
+# probe, which decides:
+#   engine=stopped     → 502 at once (the attempt died with the process);
+#   engine=running     → the engine is healthy from inside the sandbox and
+#                        only the path to it fails: keep waiting;
+#   anything else      → (launcher unreachable too, or engine unresponsive)
+#                        tolerated for a window of max(POLL_FAIL_MAX_S,
+#                        POLL_FAIL_BUDGET_RATIO × the ask's budget) of
+#                        continuous failure — a two-hour deep_team rides out
+#                        a longer outage than a 15-minute question.
+# The answer deadline bounds every case. An engine 401 is a 502 at once.
 POLL_FAIL_MAX_S = float(os.environ.get("VIBE_POLL_FAIL_MAX_S", "120"))
+POLL_FAIL_BUDGET_RATIO = float(os.environ.get("VIBE_POLL_FAIL_BUDGET_RATIO", "0.05"))
+
+
+def poll_fail_window_s(timeout_s: float) -> float:
+    """Seconds of unexplained poll failure an ask with this budget tolerates."""
+    return max(POLL_FAIL_MAX_S, POLL_FAIL_BUDGET_RATIO * float(timeout_s))
 # The message list is a cheap read; a poll that hangs longer than this is a
 # transport problem, not a slow engine.
 POLL_HTTP_TIMEOUT = httpx.Timeout(10.0, read=30.0)
@@ -1180,15 +1192,17 @@ async def _wait_answer(
     """Poll the engine's message list until this attempt's answer appears.
 
     ``deadline`` (monotonic) overrides ``timeout_s`` so the caller can anchor
-    the window to when the ask arrived. Poll failures are tolerated per
-    POLL_FAIL_MAX_CONSECUTIVE / POLL_FAIL_MAX_S; while they last the launcher
-    is probed so a stopped engine fails the ask immediately instead of after
-    the tolerance window. ``stats["poll_errors"]`` counts failed polls.
+    the window to when the ask arrived. After a failed poll the launcher is
+    probed (see POLL_FAIL_MAX_S): a stopped engine fails the ask at once, a
+    running one keeps it waiting, anything else is tolerated for
+    ``poll_fail_window_s(timeout_s)`` of continuous failure.
+    ``stats["poll_errors"]`` counts failed polls.
     """
     if deadline is None:
         deadline = time.monotonic() + timeout_s
+    window_s = poll_fail_window_s(timeout_s)
     streak = 0
-    streak_t0 = 0.0
+    unexplained_t0: Optional[float] = None
     while time.monotonic() < deadline:
         if failed is None:
             await asyncio.sleep(POLL_INTERVAL_S)
@@ -1201,9 +1215,6 @@ async def _wait_answer(
                 raise _EngineFailed(failed.error or "attempt failed")
         msgs, problem = await _poll_messages(inst, sid)
         if msgs is None:
-            now = time.monotonic()
-            if streak == 0:
-                streak_t0 = now
             streak += 1
             if stats is not None:
                 stats["poll_errors"] = int(stats.get("poll_errors") or 0) + 1
@@ -1213,12 +1224,20 @@ async def _wait_answer(
                         sid, problem, streak, engine_state or "unreachable")
             if engine_state == "stopped":
                 raise HTTPException(502, "deep engine process stopped during the attempt")
-            if streak >= POLL_FAIL_MAX_CONSECUTIVE or now - streak_t0 >= POLL_FAIL_MAX_S:
+            now = time.monotonic()
+            if engine_state == "running":
+                unexplained_t0 = None
+            elif unexplained_t0 is None:
+                unexplained_t0 = now
+            elif now - unexplained_t0 >= window_s:
                 raise HTTPException(
-                    502, f"deep engine unreachable ({problem}; {streak} failed polls)"
+                    502,
+                    f"deep engine unreachable ({problem}; {streak} failed polls "
+                    f"over {int(now - unexplained_t0)}s)",
                 )
             continue
         streak = 0
+        unexplained_t0 = None
         for msg in reversed(msgs):
             kind, text = _classify_answer_message(msg, attempt_id)
             if kind == "answer":
