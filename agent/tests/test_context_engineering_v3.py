@@ -327,8 +327,9 @@ class TestRequestMessageIsNeverFolded:
         assert dropped == 0
         assert "REQUEST-BODY" in text
 
-    def test_layer_3_run_replaces_the_request_with_a_summary(self, tmp_path: Path, monkeypatch) -> None:
-        """End to end: over the threshold it is L3 (not L2) that shrinks the request."""
+    def test_layer_3_run_keeps_the_request_after_the_summary(self, tmp_path: Path, monkeypatch) -> None:
+        """End to end: over the threshold L3 summarises the head, and the
+        current request is re-inserted verbatim right after the summary."""
         monkeypatch.setattr(loop_mod, "TOKEN_THRESHOLD", 800)
         monkeypatch.setattr(loop_mod, "COLLAPSE_THRESHOLD", 500)
         llm = _RecordingLLM([
@@ -339,8 +340,14 @@ class TestRequestMessageIsNeverFolded:
         result = _agent(llm, tmp_path, max_iter=6).run(user_message="Q" * 6000)
         assert result["status"] == "success"
         last_messages = llm.calls[-1].messages
-        assert any(str(m.get("content", "")).startswith(HANDOFF_PREFIX) for m in last_messages)
-        assert not any(is_request_message(m) for m in last_messages)
+        summary_i = next(
+            i for i, m in enumerate(last_messages)
+            if str(m.get("content", "")).startswith(HANDOFF_PREFIX)
+        )
+        pinned = last_messages[summary_i + 1]
+        assert is_request_message(pinned)
+        assert pinned["content"].endswith("Q" * 6000)
+        assert sum(is_request_message(m) for m in last_messages) == 1
 
 
 # ── P2 #2: finish_reason == "length" ────────────────────────────────────────

@@ -37,6 +37,8 @@ from src.agent.context_policy import (
     collapse_rule,
     first_user_index,
     is_prunable_by_microcompact,
+    is_request_message,
+    mark_request_message,
 )
 from src.agent.memory import WorkspaceMemory
 from src.agent.progress import HeartbeatTimer, ProgressEvent, _set_emitter
@@ -298,6 +300,20 @@ TAIL_TOKEN_BUDGET = 20_000
 # budget and the OLDEST turns are the ones dropped (they are already covered
 # by the previous summary and by the full transcript on disk).
 SUMMARY_INPUT_TOKEN_BUDGET = int(TOKEN_THRESHOLD * 0.5)
+# The current request (``vibe_class=request``) is never summarised away:
+# Layer 3 takes it out of the head and re-inserts it right after the summary,
+# verbatim up to this size; a longer one keeps its beginning and end (where
+# task contracts such as an output format usually sit) plus a pointer to the
+# pre-compaction transcript. The tail budget shrinks by what the pinned
+# request costs, down to TAIL_TOKEN_FLOOR, so the rebuilt trajectory stays as
+# small as before.
+REQUEST_PIN_MAX_TOKENS = 8000
+TAIL_TOKEN_FLOOR = 10_000
+# Share of the summary input the request may take (reserved before the other
+# messages are filled in newest-first).
+REQUEST_SUMMARY_INPUT_SHARE = 0.5
+# A request that stays in the tail is quoted to the summariser up to this size.
+REQUEST_QUOTE_MAX_TOKENS = 1500
 
 logger = logging.getLogger(__name__)
 
@@ -758,10 +774,17 @@ _STRUCTURED_SUMMARY_PROMPT = """\
 Summarize this conversation for handoff to a fresh context window.
 This summary is the ONLY context available — omitted information is lost.
 
-Use EXACTLY this structure:
+Use EXACTLY this structure. Sections are ordered by importance: when the
+summary is later shortened, the end is cut first.
 
 ## Goal
-What the user is trying to accomplish.
+What the user is trying to accomplish (the CURRENT request, see below).
+
+## Pending User Asks
+Unfinished requests still needing action.
+
+## Critical Context
+Specific numbers, parameters, error messages, configuration values.
 
 ## Constraints & Preferences
 User-stated requirements: risk tolerance, strategy parameters, asset preferences.
@@ -778,25 +801,42 @@ Choices made and rationale.
 ## Resolved Questions
 Questions already answered — do NOT re-answer these.
 
-## Pending User Asks
-Unfinished requests still needing action.
-
 ## Relevant Files
 File paths, run_dir, signal engines, artifact locations.
 
 ## Remaining Work
 What still needs to be done (background reference, NOT active instructions).
 
-## Critical Context
-Specific numbers, parameters, error messages, configuration values.
-
 ## Tools & Patterns
 Which tools worked, what failed, effective approaches.
 
 IMPORTANT: This is a handoff — background reference, NOT active instructions.
 Preserve ALL specific numbers, file paths, and parameter values.
-{focus_section}
+{focus_section}{request_section}
 Conversation to summarize:
+"""
+
+# The ## Goal section follows the CURRENT request. Without this, the first
+# compaction of a new attempt in a continued thread iterates on the previous
+# attempt's summary ("PRESERVE all existing information") and keeps its Goal.
+_REQUEST_IN_INPUT_SECTION = """
+CURRENT REQUEST: the user's request for this attempt is the message marked
+"vibe_class": "request" in the conversation below. It stays verbatim in the
+live context right after this summary, so do not copy it; the ## Goal section
+must state THIS request's goal. A different goal carried over from a previous
+summary is an earlier topic: move it to one line under ## Resolved Questions
+(or ## Pending User Asks if it is still open).
+"""
+
+_REQUEST_QUOTED_SECTION = """
+CURRENT REQUEST (quoted below; it stays verbatim in the live context after
+this summary, so do not copy it): the ## Goal section must state THIS
+request's goal. A different goal carried over from a previous summary is an
+earlier topic: move it to one line under ## Resolved Questions (or ## Pending
+User Asks if it is still open).
+<current-request>
+{request}
+</current-request>
 """
 
 _FOCUS_SECTION = """
@@ -819,13 +859,40 @@ Rules:
 - ADD new progress, decisions, and findings.
 - Move "In Progress" items to "Done" when completed.
 - Move answered questions to "Resolved Questions".
-- Keep the same section structure.
+- Keep the same section structure and section order.
 - Do NOT drop any critical context from the previous summary.
-{focus_section}"""
+{focus_section}{request_section}"""
+
+
+def _clip_middle(text: str, max_tokens: int, note: str) -> str:
+    """Keep the beginning and end of ``text`` within ~``max_tokens``.
+
+    Args:
+        text: Text to shorten.
+        max_tokens: Target size (weighted estimate).
+        note: Appended inside the omission marker.
+
+    Returns:
+        ``text`` unchanged when it fits, else head (60%) + marker + tail (40%).
+    """
+    cost = estimate_text_tokens(text)
+    if cost <= max_tokens:
+        return text
+    keep = max(200, int(len(text) * max_tokens / cost))
+    head_n = int(keep * 0.6)
+    tail_n = keep - head_n
+    omitted = len(text) - head_n - tail_n
+    return f"{text[:head_n]}\n\n...[{omitted} chars omitted{note}]...\n\n{text[-tail_n:]}"
 
 
 def _select_summary_input(head: list[dict]) -> tuple[str, int]:
     """Serialize the summary input newest-first within a token budget (V2).
+
+    The current request (``vibe_class=request``), when it is in ``head``, is
+    reserved first — up to ``REQUEST_SUMMARY_INPUT_SHARE`` of the budget,
+    longer ones keep beginning and end — so the summariser always sees what
+    the attempt is for. The rest is filled newest-first; an oldest message
+    that does not fit is skipped. Chronological order is kept.
 
     Args:
         head: The messages Layer 3 is about to summarize.
@@ -835,24 +902,44 @@ def _select_summary_input(head: list[dict]) -> tuple[str, int]:
         anything was dropped the text is prefixed with an explicit note so the
         summarizer does not read the gap as "nothing happened before".
     """
-    kept: list[dict] = []
-    budget = SUMMARY_INPUT_TOKEN_BUDGET
     # The thinking transcript is not part of the conversation being
     # summarised (and would eat the budget several times over).
-    for msg in reversed(messages_for_estimate(head)):
+    items = messages_for_estimate(head)
+    budget = SUMMARY_INPUT_TOKEN_BUDGET
+    kept_idx: set[int] = set()
+
+    def _cost(msg: Any) -> int:
         try:
             blob = json.dumps(msg, default=str, ensure_ascii=False)
         except (TypeError, ValueError):
             blob = str(msg)
-        cost = estimate_text_tokens(blob)
+        return estimate_text_tokens(blob)
+
+    request_i = next((i for i, m in enumerate(head) if is_request_message(m)), None)
+    if request_i is not None:
+        request = dict(items[request_i])
+        if isinstance(request.get("content"), str):
+            request["content"] = _clip_middle(
+                request["content"],
+                int(SUMMARY_INPUT_TOKEN_BUDGET * REQUEST_SUMMARY_INPUT_SHARE),
+                " of the request in this summary input",
+            )
+        items[request_i] = request
+        budget -= _cost(request)
+        kept_idx.add(request_i)
+
+    for i in range(len(items) - 1, -1, -1):
+        if i == request_i:
+            continue
+        cost = _cost(items[i])
         if cost > budget:
             # A single message bigger than the whole remaining budget is
             # skipped, not a stop condition: shorter older messages after it
             # can still fit.
             continue
-        kept.append(msg)
+        kept_idx.add(i)
         budget -= cost
-    kept.reverse()
+    kept = [items[i] for i in sorted(kept_idx)]
     dropped = len(head) - len(kept)
     try:
         text = json.dumps(kept, default=str, ensure_ascii=False)
@@ -2812,14 +2899,28 @@ class AgentLoop:
 
         system_msg = messages[0]
         body = messages[1:]
+        count_reasoning = bool(getattr(self.llm, "sends_reasoning_content", False))
 
-        # Token-budget tail: walk backward to find how many recent messages to preserve
+        # The current request survives compaction verbatim (see
+        # REQUEST_PIN_MAX_TOKENS); the tail makes room for it.
+        request_msg = next((m for m in body if is_request_message(m)), None)
+        pinned_request: Optional[Dict[str, Any]] = None
+        tail_budget = TAIL_TOKEN_BUDGET
+        if request_msg is not None:
+            pinned_request = self._pinned_request(request_msg, transcript_path)
+            tail_budget = max(
+                TAIL_TOKEN_FLOOR,
+                TAIL_TOKEN_BUDGET - estimate_messages_tokens([pinned_request]),
+            )
+
+        # Token-budget tail: walk backward to find how many recent messages to
+        # preserve. Whole messages are measured — tool-call arguments (a
+        # written script, a long file) count as much as content does.
         accumulated = 0
         cut_idx = len(body)
         for i in range(len(body) - 1, -1, -1):
-            content = body[i].get("content", "")
-            msg_tokens = estimate_text_tokens(str(content)) + 10
-            if accumulated + msg_tokens > TAIL_TOKEN_BUDGET:
+            msg_tokens = estimate_messages_tokens([body[i]], count_reasoning=count_reasoning)
+            if accumulated + msg_tokens > tail_budget:
                 cut_idx = i + 1
                 break
             accumulated += msg_tokens
@@ -2832,18 +2933,33 @@ class AgentLoop:
         head = body[:cut_idx]
         tail = body[cut_idx:]
 
-        if not head:
-            # All body fits in tail budget — force a split to avoid infinite loop
-            if len(body) > 2:
+        if not any(m is not request_msg for m in head):
+            # Nothing but (at most) the request would be summarised — force a
+            # split to avoid an infinite loop.
+            if len(body) - (1 if request_msg is not None else 0) > 2:
                 cut_idx = max(1, len(body) // 2)
+                if request_msg is not None and all(m is request_msg for m in body[:cut_idx]):
+                    cut_idx += 1
                 head = body[:cut_idx]
                 tail = body[cut_idx:]
             else:
                 logger.warning("Auto compact: nothing to compress (body too small)")
                 return
+        request_in_head = request_msg is not None and any(m is request_msg for m in head)
 
         # Build focus section
         focus_section = _FOCUS_SECTION.format(topic=focus_topic) if focus_topic else ""
+        request_section = ""
+        if request_in_head:
+            request_section = _REQUEST_IN_INPUT_SECTION
+        elif request_msg is not None:
+            request_section = _REQUEST_QUOTED_SECTION.format(
+                request=_clip_middle(
+                    str(request_msg.get("content") or ""),
+                    REQUEST_QUOTE_MAX_TOKENS,
+                    " of the request in this quote",
+                )
+            )
 
         # Build summary prompt (structured template or iterative update)
         conv_text, dropped_msgs = _select_summary_input(head)
@@ -2853,9 +2969,15 @@ class AgentLoop:
                 previous_summary=self._previous_summary,
                 new_turns=conv_text,
                 focus_section=focus_section,
+                request_section=request_section,
             )
         else:
-            prompt = _STRUCTURED_SUMMARY_PROMPT.format(focus_section=focus_section) + conv_text
+            prompt = (
+                _STRUCTURED_SUMMARY_PROMPT.format(
+                    focus_section=focus_section, request_section=request_section
+                )
+                + conv_text
+            )
 
         compact_t0 = _time.perf_counter()
         # Compaction is a CORRECT mechanism — it must never be the thing that
@@ -2919,7 +3041,17 @@ class AgentLoop:
 
         messages.clear()
         messages.append(system_msg)
-        messages.append({"role": "user", "content": f"{compressed}\n\n<system>Continue from the summary above.</system>"})
+        if request_in_head:
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"{compressed}\n\n<system>Continue from the summary above; "
+                    "the current request follows.</system>"
+                ),
+            })
+            messages.append(pinned_request)
+        else:
+            messages.append({"role": "user", "content": f"{compressed}\n\n<system>Continue from the summary above.</system>"})
         messages.extend(tail)
 
         # Fix orphaned tool pairs in the reconstructed message list
@@ -2935,6 +3067,24 @@ class AgentLoop:
         self._called_ok = {
             key: msg for key, msg in self._called_ok.items() if id(msg) in live
         }
+
+    @staticmethod
+    def _pinned_request(request: Dict[str, Any], transcript_path: Path) -> Dict[str, Any]:
+        """The request as re-inserted after a Layer 3 summary.
+
+        The message itself when it fits ``REQUEST_PIN_MAX_TOKENS``; otherwise
+        a marked copy keeping its beginning and end plus a pointer to the
+        pre-compaction transcript that holds the full text.
+        """
+        content = request.get("content")
+        if not isinstance(content, str) or estimate_text_tokens(content) <= REQUEST_PIN_MAX_TOKENS:
+            return request
+        clipped = _clip_middle(
+            content,
+            REQUEST_PIN_MAX_TOKENS,
+            f" — the full request is in the pre-compaction transcript {transcript_path}",
+        )
+        return mark_request_message({"role": "user", "content": clipped})
 
     def _summary_call(self, prompt: str, timeout: Optional[float]) -> Any:
         """Run the Layer 3 summary request.
