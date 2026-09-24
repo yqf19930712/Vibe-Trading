@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -20,6 +21,21 @@ logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SECONDS = 5
 _MAX_WAIT_SECONDS = int(os.getenv("SWARM_TIMEOUT", "7200"))
+
+# Swarm token billing is incremental per run: every ``llm_usage`` it emits
+# carries only what was not reported before for that run (``billed.json``
+# next to run.json, plus this in-process copy). A wait that ran out of budget
+# bills the tokens so far; the resume that later sees the run finish bills the
+# rest — not the whole total a second time.
+_BILLED_FILE = "billed.json"
+_BILLING_LOCK = threading.Lock()
+_BILLED: dict[str, tuple[int, int]] = {}
+# A run left running after its wait budget ran out is watched until it ends,
+# so the tokens it keeps spending are reported (``source="swarm_tail"``) and
+# logged instead of vanishing.
+_TAIL_POLL_SECONDS = 15.0
+_TAIL_MAX_SECONDS = _MAX_WAIT_SECONDS + 600
+_TAIL_METERS: set[str] = set()
 # V2 payload budget for the ``run_swarm`` return. The whole point is that the
 # result arrives as VALID JSON inside the loop's ``TOOL_RESULT_LIMIT`` (10k
 # chars) instead of being cut mid-document on the way into the trajectory, so
@@ -1217,27 +1233,89 @@ class SwarmTool(BaseTool):
             ensure_ascii=False,
         )
 
-    def _emit_swarm_usage(self, run_id: str, run_obj: Any) -> None:
-        """Report swarm worker token totals through the same ``llm_usage``
-        event channel the main loop uses. Without this the caller's billing /
+    def _emit_swarm_usage(
+        self, run_id: str, run_obj: Any, *, store: Any = None, source: str = "swarm"
+    ) -> tuple[int, int]:
+        """Report swarm worker tokens through the same ``llm_usage`` event
+        channel the main loop uses. Without this the caller's billing /
         daily-quota accounting only ever saw main-loop usage — swarm-heavy
         attempts would under-report by orders of magnitude (an attempt
         recording 21k output tokens while its two swarm runs burn hundreds
-        of thousands)."""
+        of thousands).
+
+        Only the part not yet reported for this run is emitted (see
+        ``_BILLED_FILE``). Returns the ``(input, output)`` delta emitted."""
         tin = int(getattr(run_obj, "total_input_tokens", 0) or 0)
         tout = int(getattr(run_obj, "total_output_tokens", 0) or 0)
-        if tin <= 0 and tout <= 0:
-            return
+        with _BILLING_LOCK:
+            prev_in, prev_out = _billed_so_far(run_id, store)
+            d_in, d_out = max(0, tin - prev_in), max(0, tout - prev_out)
+            if d_in <= 0 and d_out <= 0:
+                return (0, 0)
+            _record_billed(run_id, store, max(tin, prev_in), max(tout, prev_out))
         self._emit_session_event(
             "llm_usage",
             {
-                "input_tokens": tin,
-                "output_tokens": tout,
-                "total_tokens": tin + tout,
-                "source": "swarm",
+                "input_tokens": d_in,
+                "output_tokens": d_out,
+                "total_tokens": d_in + d_out,
+                "source": source,
                 "run_id": run_id,
             },
         )
+        return (d_in, d_out)
+
+    def _start_tail_meter(self, store: Any, run_id: str) -> None:
+        """Watch a run the attempt stopped waiting for and report its tail.
+
+        The run keeps working by design (a later attempt may resume it), but
+        its tokens past this point used to be neither billed nor visible.
+        When it ends, the remainder goes out as ``llm_usage`` with
+        ``source="swarm_tail"`` on the session channel (forwarded if a later
+        request on the session is streaming then) and as a structured
+        engine-log line either way.
+        """
+        with _BILLING_LOCK:
+            if run_id in _TAIL_METERS:
+                return
+            _TAIL_METERS.add(run_id)
+
+        def _watch() -> None:
+            deadline = time.monotonic() + _TAIL_MAX_SECONDS
+            try:
+                while time.monotonic() < deadline:
+                    time.sleep(_TAIL_POLL_SECONDS)
+                    try:
+                        run = store.load_run(run_id)
+                    except Exception:  # noqa: BLE001 - a vanished / half-written run
+                        run = None
+                    if run is None:
+                        return
+                    status = getattr(getattr(run, "status", None), "value", "")
+                    if status not in ("completed", "failed", "cancelled"):
+                        continue
+                    d_in, d_out = self._emit_swarm_usage(
+                        run_id, run, store=store, source="swarm_tail"
+                    )
+                    logger.info(
+                        "swarm run finished after its attempt stopped waiting",
+                        extra={
+                            "run_id": run_id,
+                            "session": self._session_id,
+                            "status": status,
+                            "tail_input_tokens": d_in,
+                            "tail_output_tokens": d_out,
+                            "total_input_tokens": int(getattr(run, "total_input_tokens", 0) or 0),
+                            "total_output_tokens": int(getattr(run, "total_output_tokens", 0) or 0),
+                        },
+                    )
+                    return
+                logger.warning("swarm tail meter gave up on run %s", run_id)
+            finally:
+                with _BILLING_LOCK:
+                    _TAIL_METERS.discard(run_id)
+
+        threading.Thread(target=_watch, name=f"swarm-tail-{run_id}", daemon=True).start()
 
     def _emit_session_event(self, event_type: str, data: dict[str, Any]) -> None:
         """Forward swarm status to the hosting session SSE channel if present."""
@@ -1515,7 +1593,7 @@ class SwarmTool(BaseTool):
                     input_tokens=reconciled.total_input_tokens,
                     output_tokens=reconciled.total_output_tokens,
                 )
-                self._emit_swarm_usage(run_id, reconciled)
+                self._emit_swarm_usage(run_id, reconciled, store=store)
                 if reconciled.status.value == "failed":
                     # F3: arm the cooldown with salvageable worker products.
                     self._record_preset_failure(preset, reconciled)
@@ -1538,9 +1616,10 @@ class SwarmTool(BaseTool):
                 input_tokens=loaded.total_input_tokens,
                 output_tokens=loaded.total_output_tokens,
             )
-            # Tokens burned so far still get billed; the run keeps burning in
-            # the background and that tail is knowingly under-reported.
-            self._emit_swarm_usage(run_id, loaded)
+            # Tokens burned so far are billed now; the run keeps working in
+            # the background and the tail meter reports the rest when it ends.
+            self._emit_swarm_usage(run_id, loaded, store=store)
+            self._start_tail_meter(store, run_id)
             return _format_result(
                 store.reconcile_run(loaded, write=True),
                 preset,
@@ -1756,3 +1835,40 @@ def _format_result(
             "tokens. Otherwise report the partial results above as partial."
         )
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _billed_path(store: Any, run_id: str) -> Path | None:
+    try:
+        return Path(store.run_dir(run_id)) / _BILLED_FILE
+    except Exception:  # noqa: BLE001 - stores without run_dir (tests, fakes)
+        return None
+
+
+def _billed_so_far(run_id: str, store: Any) -> tuple[int, int]:
+    """Tokens already reported for ``run_id`` (caller holds ``_BILLING_LOCK``)."""
+    best = _BILLED.get(run_id, (0, 0))
+    path = _billed_path(store, run_id) if store is not None else None
+    if path is not None:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            best = (
+                max(best[0], int(data.get("input_tokens", 0) or 0)),
+                max(best[1], int(data.get("output_tokens", 0) or 0)),
+            )
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    return best
+
+
+def _record_billed(run_id: str, store: Any, tin: int, tout: int) -> None:
+    """Remember what has been reported for ``run_id`` (caller holds the lock)."""
+    _BILLED[run_id] = (tin, tout)
+    path = _billed_path(store, run_id) if store is not None else None
+    if path is None or not path.parent.is_dir():
+        return
+    try:
+        from src.core.atomic_write import atomic_write_text
+
+        atomic_write_text(path, json.dumps({"input_tokens": tin, "output_tokens": tout}))
+    except OSError:
+        logger.debug("billed.json not written for swarm run %s", run_id, exc_info=True)
