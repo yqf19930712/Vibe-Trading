@@ -42,6 +42,7 @@ flowchart LR
 | 引擎 | `<VIBE_DATA_DIR>/sessions/<sid>/trace.jsonl` | 逐事件 trace（含逐工具 `elapsed_ms` 与收口 `attempt_stats`） | 同上 |
 | 引擎 | `<run_dir>/llm_usage.json` | 逐迭代 token 用量 | 同上 |
 | 引擎 | `<VIBE_DATA_DIR>/.swarm/runs/<id>/billed.json` | swarm run 已上报的 token 数（按 run 增量计费的账） | 同上，随 run 目录删除 |
+| 引擎 | `<VIBE_DATA_DIR>/sessions/<sid>/swarm_tail_pending.json` | 结束时会话里没有 attempt 在跑的 swarm 尾段用量，等该会话下一次 attempt 开始时补发（§3.3） | 补发即删；随会话删除 |
 | router | `/var/lib/cube-router/ask_log.jsonl` | 每次 `/ask` 一行：分段计时 + outcome | 20MB 轮转（`.jsonl.1`） |
 | router | 进程内计数器 | asks_total/ok/timeout/busy/error + 近 100 次成功 p50/p95 | 重启清零，`/healthz` 输出 |
 | laicai | `deep_engine_runs` 表 | 每次调用一行（成功/失败/超时都写） | 永久（`user_query` 列另有 laicai 侧保留期） |
@@ -160,7 +161,7 @@ AgentLoop 在 **attempt 结束时**（成功/失败/取消/异常四条路径都
 - `compact` 带 `input_messages_dropped` —— L3 摘要输入按 token 预算从**旧端**裁掉的消息条数；
 - swarm 的 `tool_result` 事件 `status` 按 `_is_error_result` 判定，与主循环的 ok/error 双态口径一致；
 - `attempt_stats` 的 `compact_failures` / `offload_failures` 只在非零时出现（落盘失败 = 盘满/只读时工具结果降级为带标记的纯截断）；
-- SSE `llm_usage`：增量 `input_tokens` / `output_tokens`，原生通道另带非零才出现的 `cache_read_tokens` / `cache_creation_tokens`（都包含在 `input_tokens` 之内，不能再相加）。swarm 用量带 `source="swarm"`、按 run 增量上报（`billed.json` 记已报数，续等到终态只报剩余）；attempt 停止等待后仍在跑的 run 由尾段计量线程盯到结束（最长 `SWARM_TIMEOUT + 600s`，run 被删即停），把剩余用量以 `source="swarm_tail"` 报一次——带的是上一轮的 `attempt_id`，router 放行并计入当时在流的 ask；run 结束时没有 ask 在流，这条事件只留在会话缓冲里、不会被后来那一轮的 attempt 窗口回放（它早于那一轮的锚点），这部分用量只记在 §3.1 那行引擎日志里；
+- SSE `llm_usage`：增量 `input_tokens` / `output_tokens`，原生通道另带非零才出现的 `cache_read_tokens` / `cache_creation_tokens`（都包含在 `input_tokens` 之内，不能再相加）。swarm 用量带 `source="swarm"`、按 run 增量上报（`billed.json` 记已报数，续等到终态只报剩余）；attempt 停止等待后仍在跑的 run 由尾段计量线程盯到结束（最长 `SWARM_TIMEOUT + 600s`，run 被删即停），把剩余用量以 `source="swarm_tail"` 报一次，带上一轮的 `attempt_id` 与 `tail_key`（`<run_id>:<报后累计 input>:<报后累计 output>`，同一份尾段的稳定名字）。送达由会话决定：会话当时有 attempt 在跑（从 `attempt.started` 到写回执之前）就在它的流上发出，router 放行并计入当时在流的 ask；没有就暂存到会话目录的 `swarm_tail_pending.json`（按 `tail_key` 去重），在该会话下一次 attempt 的 `attempt.started` 之后补发一次，另带 `deferred: true`，取出即删文件（最多补发一次）。之后续等同一个 run 时增量为 0，不会再报。会话此后再无提问，这部分用量只记在 §3.1 那行引擎日志里；
 - swarm worker 事件：`worker_output_truncated` 带 `tool_calls_refused`（被截断的工具调用同样不执行）；`worker_context_wrap_up`（上下文估算超过 60k 硬上限的 85%，注入一次收尾提示，此后只执行 `write_file` / `edit_file`，其余调用回 `context_budget_reached`）；`worker_token_limit` 与 `worker_completed{token_limit:true}`（到达硬上限时 `report.md` 已满足产出契约则按完成收口，否则 `status=token_limit`）；`worker_text` 按 0.5s 或 2000 字符批量发送，而不是每个 token 一条。
 
 ### 3.4 fetch_stats 收集器（`src/core/fetch_stats.py`）

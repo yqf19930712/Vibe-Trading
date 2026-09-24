@@ -116,6 +116,7 @@ def test_tail_meter_reports_the_remainder_when_the_run_ends(store, monkeypatch) 
     tail = _usage(events, "swarm_tail")
     assert [(u["input_tokens"], u["output_tokens"]) for u in tail] == [(8000, 800)]
     assert tail[0]["run_id"] == run_id
+    assert tail[0]["tail_key"] == f"{run_id}:9000:900"
 
 
 def test_tail_meter_stops_when_the_run_is_deleted(store, monkeypatch) -> None:

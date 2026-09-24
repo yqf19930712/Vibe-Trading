@@ -1382,10 +1382,11 @@ def _event_belongs_to_ask(ev: dict, attempt_id: Optional[str]) -> bool:
 
     One foreign event passes: a swarm tail's ``llm_usage``
     (``source="swarm_tail"``). A swarm the previous attempt stopped waiting
-    for keeps running; the engine reports its remaining tokens once, when it
-    ends, stamped with that earlier attempt's id, and never replays it into a
-    later attempt's window. Arriving during this ask, it is billed to this
-    ask — dropping it would leave those tokens unbilled.
+    for keeps running; the engine reports its remaining tokens once, stamped
+    with that earlier attempt's id — on the stream of the attempt running
+    when the swarm ends, or, when none is, at the start of the session's
+    next attempt (``deferred: true``). Arriving during this ask, it is
+    billed to this ask — dropping it would leave those tokens unbilled.
     """
     if attempt_id is None:
         return True

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
@@ -39,8 +40,8 @@ def _spawn(coro: Coroutine[Any, Any, Any]) -> "asyncio.Task[Any]":
     task.add_done_callback(_bg_tasks.discard)
     return task
 
-from src.session import tombstone
-from src.session.events import EventBus
+from src.session import swarm_tail, tombstone
+from src.session.events import SWARM_TAIL_SOURCE, EventBus
 from src.session.models import (
     Attempt,
     AttemptStatus,
@@ -96,6 +97,15 @@ class SessionService:
         self._purge_hooks: List[Callable[[str], None]] = []
         self._last_retention_sweep = 0.0
         self._search_index = get_shared_index()
+        # Attempts whose events a caller is streaming: from ``attempt.started``
+        # until just before the answer receipt. A swarm tail report goes out
+        # live only while its session has one; otherwise it is parked for the
+        # next attempt (``_deliver_swarm_tail``). The lock makes "is one
+        # streaming → emit, else park" and "start streaming → take parked"
+        # one step each, so a report is neither lost between them nor sent
+        # twice.
+        self._streaming: Dict[str, Set[str]] = {}
+        self._tail_lock = threading.Lock()
 
     def add_purge_hook(self, hook: Callable[[str], None]) -> None:
         """Register a cleanup run whenever a session is purged."""
@@ -451,6 +461,7 @@ class SessionService:
                 session, attempt, include_shell_tools=include_shell_tools, deadline_s=deadline_s
             )
         finally:
+            self._end_streaming(session_id, attempt.attempt_id)
             live = self._inflight.get(session_id)
             if live is not None:
                 live.discard(attempt.attempt_id)
@@ -478,6 +489,7 @@ class SessionService:
             attempt.mark_running()
             self.store.update_attempt(attempt)
             self.event_bus.emit(session.session_id, "attempt.started", {"attempt_id": attempt.attempt_id})
+            self._begin_streaming(session.session_id, attempt.attempt_id)
 
             messages = self.store.get_messages(session.session_id)
             result = await self._run_with_agent(
@@ -526,6 +538,10 @@ class SessionService:
                 linked_attempt_id=attempt.attempt_id,
                 metadata=reply_metadata,
             )
+            # The receipt ends the caller's stream (the router stops reading
+            # once it sees the answer): a tail reported from here on waits
+            # for the next attempt.
+            self._end_streaming(session.session_id, attempt.attempt_id)
             self._store_receipt(reply)
             receipt_written = True
             try:
@@ -562,6 +578,66 @@ class SessionService:
             held.append(reply)
             del held[:-5]
 
+    def _begin_streaming(self, session_id: str, attempt_id: str) -> None:
+        """Mark the attempt as streamed to its caller and send parked swarm tails.
+
+        Parked reports go out on this attempt's stream after its
+        ``attempt.created`` anchor, still stamped with the attempt that
+        stopped waiting for the run and with ``source="swarm_tail"``, plus
+        ``deferred: true``.
+        """
+        with self._tail_lock:
+            self._streaming.setdefault(session_id, set()).add(attempt_id)
+            try:
+                reports = swarm_tail.take(self.store.base_dir, session_id)
+            except Exception:  # noqa: BLE001 - billing catch-up must not fail the attempt
+                logger.warning("parked swarm tails of %s not read", session_id, exc_info=True)
+                reports = []
+            for report in reports:
+                self.event_bus.emit(session_id, "llm_usage", {**report, "deferred": True})
+        for report in reports:
+            logger.info(
+                "parked swarm tail sent (session %s, run %s, attempt %s)",
+                session_id, report.get("run_id"), attempt_id,
+            )
+
+    def _end_streaming(self, session_id: str, attempt_id: str) -> None:
+        """The attempt's caller stops reading; idempotent."""
+        with self._tail_lock:
+            live = self._streaming.get(session_id)
+            if live is not None:
+                live.discard(attempt_id)
+                if not live:
+                    self._streaming.pop(session_id, None)
+
+    def _deliver_swarm_tail(self, session_id: str, data: Dict[str, Any]) -> None:
+        """Send a swarm tail report now, or park it for the next attempt.
+
+        Only a request streaming on this session can carry the report to
+        the caller; with no attempt streaming, an event published now would
+        sit before every later attempt's window and never be billed.
+        """
+        with self._tail_lock:
+            if self._streaming.get(session_id):
+                self.event_bus.emit(session_id, "llm_usage", data)
+                return
+            try:
+                parked = swarm_tail.park(self.store.base_dir, session_id, data)
+            except Exception:  # noqa: BLE001 - never raise into the tail meter thread
+                logger.warning("swarm tail of %s not parked", session_id, exc_info=True)
+                parked = False
+        if parked:
+            logger.info(
+                "swarm tail parked for the next attempt (session %s, run %s)",
+                session_id, data.get("run_id"),
+            )
+        else:
+            logger.warning(
+                "swarm tail not deliverable (session %s gone?, run %s, tokens %s/%s)",
+                session_id, data.get("run_id"),
+                data.get("input_tokens"), data.get("output_tokens"),
+            )
+
     @staticmethod
     def _empty_answer_reason(result: Dict[str, Any]) -> str:
         """Failure reason for a run the loop called successful but that has no text."""
@@ -591,6 +667,7 @@ class SessionService:
         )
         error = str(exc) or type(exc).__name__
         attempt.mark_failed(error=error)
+        self._end_streaming(session.session_id, attempt.attempt_id)
         try:
             self.store.update_attempt(attempt)
         except Exception:  # noqa: BLE001 - keep going, the receipt matters more
@@ -677,6 +754,11 @@ class SessionService:
         def event_callback(event_type: str, data: Dict[str, Any]) -> None:
             """Forward AgentLoop events to the SSE event bus."""
             data["attempt_id"] = attempt_id
+            if event_type == "llm_usage" and data.get("source") == SWARM_TAIL_SOURCE:
+                # Reported from the tail meter thread, possibly long after
+                # this attempt ended (see ``_deliver_swarm_tail``).
+                self._deliver_swarm_tail(session_id, data)
+                return
             self.event_bus.emit(session_id, event_type, data)
 
         def _mcp_collision_warn(msg: str) -> None:

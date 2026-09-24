@@ -32,7 +32,9 @@ _BILLING_LOCK = threading.Lock()
 _BILLED: dict[str, tuple[int, int]] = {}
 # A run left running after its wait budget ran out is watched until it ends,
 # so the tokens it keeps spending are reported (``source="swarm_tail"``) and
-# logged instead of vanishing.
+# logged instead of vanishing. The hosting session delivers that report: on
+# the stream of an attempt running then, or at the start of the next one
+# (``SessionService._deliver_swarm_tail``).
 _TAIL_POLL_SECONDS = 15.0
 _TAIL_MAX_SECONDS = _MAX_WAIT_SECONDS + 600
 _TAIL_METERS: set[str] = set()
@@ -1243,7 +1245,10 @@ class SwarmTool(BaseTool):
         of thousands).
 
         Only the part not yet reported for this run is emitted (see
-        ``_BILLED_FILE``). Returns the ``(input, output)`` delta emitted."""
+        ``_BILLED_FILE``). A tail report also carries ``tail_key`` — the run
+        id and its billed totals after this report — which names the report
+        across a deferred delivery. Returns the ``(input, output)`` delta
+        emitted."""
         tin = int(getattr(run_obj, "total_input_tokens", 0) or 0)
         tout = int(getattr(run_obj, "total_output_tokens", 0) or 0)
         with _BILLING_LOCK:
@@ -1251,17 +1256,18 @@ class SwarmTool(BaseTool):
             d_in, d_out = max(0, tin - prev_in), max(0, tout - prev_out)
             if d_in <= 0 and d_out <= 0:
                 return (0, 0)
-            _record_billed(run_id, store, max(tin, prev_in), max(tout, prev_out))
-        self._emit_session_event(
-            "llm_usage",
-            {
-                "input_tokens": d_in,
-                "output_tokens": d_out,
-                "total_tokens": d_in + d_out,
-                "source": source,
-                "run_id": run_id,
-            },
-        )
+            billed_in, billed_out = max(tin, prev_in), max(tout, prev_out)
+            _record_billed(run_id, store, billed_in, billed_out)
+        payload: dict[str, Any] = {
+            "input_tokens": d_in,
+            "output_tokens": d_out,
+            "total_tokens": d_in + d_out,
+            "source": source,
+            "run_id": run_id,
+        }
+        if source == "swarm_tail":
+            payload["tail_key"] = f"{run_id}:{billed_in}:{billed_out}"
+        self._emit_session_event("llm_usage", payload)
         return (d_in, d_out)
 
     def _start_tail_meter(self, store: Any, run_id: str) -> None:
@@ -1270,9 +1276,11 @@ class SwarmTool(BaseTool):
         The run keeps working by design (a later attempt may resume it), but
         its tokens past this point used to be neither billed nor visible.
         When it ends, the remainder goes out as ``llm_usage`` with
-        ``source="swarm_tail"`` on the session channel (forwarded if a later
-        request on the session is streaming then) and as a structured
-        engine-log line either way.
+        ``source="swarm_tail"`` through the session callback (which sends it
+        on a running attempt's stream or parks it for the next attempt) and
+        as a structured engine-log line either way. A resume that sees the
+        run finish first reports the remainder itself; the meter then finds
+        nothing left to report.
         """
         with _BILLING_LOCK:
             if run_id in _TAIL_METERS:
