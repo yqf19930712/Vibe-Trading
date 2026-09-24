@@ -111,7 +111,7 @@ class ReadFileTool(BaseTool):
 
         try:
             text = resolved.read_text(encoding="utf-8")
-            # F4: offset (1-based line start) + limit paging with an explicit
+            # Offset (1-based line start) + limit paging with an explicit
             # continuation hint, so large files are readable in slices instead
             # of always losing everything past the truncation point.
             full_text = text

@@ -562,7 +562,7 @@ class MCPRemoteTool(BaseTool):
 
     @property
     def timeout_seconds(self) -> float:
-        """Loop-side watchdog bound for this remote MCP tool (V1).
+        """Loop-side watchdog bound for this remote MCP tool.
 
         A remote call can legitimately take ``tool_timeout`` for the call plus
         ``init_timeout`` for a cold-start connection (pip install, docker pull,
@@ -600,7 +600,7 @@ class MCPRemoteTool(BaseTool):
             self._filter_arguments(kwargs),
             local_name=self.name,
         )
-        # F5: size cap + prompt-injection warning layer (same scanner as the
+        # Size cap + prompt-injection warning layer (same scanner as the
         # in-house reader tools) — remote MCP output is untrusted content.
         payload = _truncate_remote_payload(payload)
         payload = with_security_warnings(
@@ -643,7 +643,7 @@ class MCPRemoteTool(BaseTool):
 
 
 def _clamp_remote_description(description: str | None, tool_name: str, server_name: str) -> str:
-    """Clamp an untrusted remote tool description to a sane length (F5).
+    """Clamp an untrusted remote tool description to a sane length.
 
     Third-party MCP servers control this text and it flows into the model's
     tools payload verbatim — an unbounded description is a token-burn and
@@ -684,7 +684,7 @@ def _wrap_remote_text(payload: dict[str, Any], *, source: str) -> dict[str, Any]
 
 
 def _truncate_long_strings(value: Any) -> Any:
-    """Recursively truncate oversized strings in a payload (F5)."""
+    """Recursively truncate oversized strings in a payload."""
     if isinstance(value, str) and len(value) > _STRING_FIELD_TRUNC:
         omitted = len(value) - _STRING_FIELD_TRUNC
         return value[:_STRING_FIELD_TRUNC] + f"…[truncated {omitted} chars]"
@@ -696,7 +696,7 @@ def _truncate_long_strings(value: Any) -> Any:
 
 
 def _truncate_remote_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Cap a remote MCP result at ``_RESULT_CHAR_LIMIT`` serialized chars (F5).
+    """Cap a remote MCP result at ``_RESULT_CHAR_LIMIT`` serialized chars.
 
     Two stages: first oversized string fields are truncated in place (with a
     marker); if the payload is still too large (many medium fields, huge

@@ -17,7 +17,7 @@ from typing import Any
 from src.tools.redaction import redact_internal_paths
 
 
-# Preview budget for ``summary`` (V2). ``SwarmTask.summary`` IS the worker's
+# Preview budget for ``summary``. ``SwarmTask.summary`` IS the worker's
 # whole report.md, and the in-process ``run_swarm`` tool returned every one of
 # them in full — a multi-worker preset produced tens of KB of JSON that the
 # loop's 10k tool-result limit then cut mid-document, handing the model

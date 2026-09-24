@@ -69,8 +69,7 @@ def _ensure_registered() -> None:
     Thread-safe: parallel tool calls at cold boot must BLOCK until the import
     pass finishes. The flag is only set after the imports complete — setting it
     up-front let a concurrent caller read a half-filled registry and fail with
-    "Unknown data source: yfinance" while the first caller was still importing
-    (2026-08-25, attempt 88e080ef0a46).
+    "Unknown data source: yfinance" while the first caller was still importing.
     """
     global _registered
     if _registered:
@@ -114,7 +113,7 @@ def _ensure_registered() -> None:
 
 FALLBACK_CHAINS: dict[str, list[str]] = {
     "a_share":   ["tushare", "mootdx", "baostock", "tencent", "akshare"],
-    # 2026-08-25 运营决策：美/港股国内直连源优先，yfinance 等原有顺序整体
+    # 美/港股国内直连源优先，yfinance 等原有顺序整体
     # 后移——出境隧道+Yahoo 限频只作兜底。美股 tickflow 首位（结构化、快）、
     # ifind 次位；港股 ifind 首位——tickflow 免费档无港股权限，若放港股首位
     # 会让 resolve_loader 单选路径（如 correlation）拿到空结果直接丢标的，

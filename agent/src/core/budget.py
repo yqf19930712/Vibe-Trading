@@ -4,7 +4,8 @@ The caller (laicai → router → ``POST /sessions/<sid>/messages``) supplies a
 ``deadline_s`` budget; the AgentLoop binds the absolute monotonic deadline here
 so any long-running tool (swarm, market-data fallback chains, web research) can
 cap its own internal timeout to the time actually left instead of a fixed
-constant that may outlive the caller (the pre-batch-3 inverted-budget bug).
+constant that may outlive the caller (an inner timeout longer than the
+outer budget is the inversion this module exists to prevent).
 
 Propagation into worker threads relies on ``contextvars.copy_context()`` at
 thread creation — already done by the loop/service for tool execution.

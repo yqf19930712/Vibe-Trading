@@ -1,4 +1,4 @@
-"""Session-level handoff summary sidecar (V2).
+"""Session-level handoff summary sidecar.
 
 ``AgentLoop._previous_summary`` — the structured Layer 3 summary that Layer 5
 iteratively updates — is instance state reset on every ``run()``. Anything the

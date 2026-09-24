@@ -108,12 +108,12 @@ DEFAULT_ASK_TIMEOUT_S = int(os.environ.get("VIBE_ASK_TIMEOUT_S", str(15 * 60)))
 # Swarm committees legitimately run tens of minutes to hours (multi-layer DAG ×
 # multi-iteration workers).
 SWARM_ASK_TIMEOUT_S = int(os.environ.get("VIBE_SWARM_ASK_TIMEOUT_S", str(2 * 60 * 60)))
-# THE single place a caller's budget tier is decided. Callers declare a
-# structured `intent` and the number is derived here — writing 7200 out in
-# several places (laicai chat-tools, laicai warlab-engine, the SWARM_TIMEOUT
-# env below, the engine's swarm_tool) lets them drift apart. An explicit
-# `timeoutS` still
-# wins so laicai can be rolled back on its own without touching the router.
+# Budget tier per structured `intent`, for callers that send no explicit
+# `timeoutS`; the SWARM_TIMEOUT env below derives from the same number. An
+# explicit `timeoutS` wins — and laicai currently always sends one (900 /
+# 7200 by intent, its own constants), so for laicai traffic these two envs
+# change only the engine's SWARM_TIMEOUT, not the ask budget. Change both
+# sides together.
 BUDGET_BY_INTENT = {
     "standard": DEFAULT_ASK_TIMEOUT_S,
     "deep_team": SWARM_ASK_TIMEOUT_S,
@@ -334,8 +334,8 @@ def llm_fingerprint(
 def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict, str]:
     """Env the launcher passes to `vibe-trading serve` inside the guest.
     Returns (env, api_key): the engine validates `Authorization: Bearer
-    <API_AUTH_KEY>` on every non-loopback call, so the router must keep the
-    key it minted for the instance."""
+    <API_AUTH_KEY>` on every call (a multi-tenant engine trusts no loopback
+    caller), so the router must keep the key it minted for the instance."""
     env = {k: os.environ[k] for k in forwarded_env_names()}
     if llm is not None:
         for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
@@ -1044,10 +1044,9 @@ async def _post_turn(
         # The engine finalizes with what it has before this budget runs out
         # instead of grinding past the caller's timeout.
         payload["deadline_s"] = round(deadline_s, 1)
-    # Structured intent rides alongside deadline_s. Engines that don't know
-    # these fields yet ignore them (the request model tolerates extras), so the
-    # router can ship ahead of the engine — that is the whole point of staging
-    # the cross-repo contract: the budget lands first, the prompt branch later.
+    # Structured intent rides alongside deadline_s. The engine does not read
+    # these fields today (its request model ignores extras): whether a swarm
+    # runs, and which preset, still comes from the query prose laicai writes.
     if intent is not None:
         payload["intent"] = intent
     if swarm_preset is not None:
@@ -1420,10 +1419,9 @@ class AskBody(BaseModel):
     model: Optional[str] = None
     llm: Optional[LlmOverride] = None
     # Structured research-depth intent (cross-repo contract with laicai).
-    # "deep_team" = multi-agent swarm committee. The router derives the budget
-    # from it (BUDGET_BY_INTENT) instead of every caller hardcoding 7200.
-    # Optional on purpose: an older laicai that sends only `timeoutS` behaves
-    # exactly as before.
+    # "deep_team" = multi-agent swarm committee. Without `timeoutS` the
+    # router derives the budget from it (BUDGET_BY_INTENT); an explicit
+    # `timeoutS` wins. Logged in the ask log either way.
     intent: Optional[str] = None
     # Swarm preset name for deep_team asks. Forwarded to the engine as-is; the
     # authoritative enum is the engine's agent/src/swarm/presets/*.yaml listing,
@@ -1564,9 +1562,10 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                     _INFLIGHT[attempt_id] = (inst, sid)
                     # Early meta frame: laicai uses it to stamp attempt_id /
                     # session id onto its status=running placeholder row, so
-                    # the admin detail page can tail engine logs/trace while
-                    # the run is still in flight (not only after the terminal
-                    # frame). Consumers ignore unknown ev names, so this is
+                    # its admin execution-trace page can follow the run while
+                    # it is still in flight (not only after the terminal
+                    # frame), and as the anchor for its own attempt filter.
+                    # Consumers ignore unknown ev names, so this is
                     # backward-compatible. ``answer_deadline_s`` = seconds from
                     # this frame until the router answers or 504s;
                     # ``engine_deadline_s`` = the budget handed to the engine.
@@ -2036,9 +2035,11 @@ async def sessions_delete(
     return {"ok": True, "mode": mode, "deleted": engine_deleted or removed}
 
 
-# ── Read-only tenant observability (laicai admin deep-run detail page) ───────
-# Serves the tenant's engine.jsonl / trace.jsonl straight off the host
-# bind-mount, so operators can inspect a run in the browser instead of SSH.
+# ── Read-only tenant observability (/obs/*) ──────────────────────────────────
+# Serves the tenant's engine.jsonl / trace.jsonl / swarm events / prompts and
+# the router's own ask log straight off the host. laicai's admin
+# execution-trace page reads /obs/trace, /obs/swarm-events and /obs/prompt;
+# /obs/engine-log and /obs/ask-log have no page and are used via curl.
 # Bearer-gated like everything else; ids are strictly validated so a caller
 # can never traverse outside the tenant's data dir.
 
@@ -2245,8 +2246,8 @@ async def obs_swarm_events(
 ):
     """Tail a swarm run's internal event log (worker tool calls, retries,
     heartbeats) off the tenant bind-mount — the run_swarm counterpart of
-    /obs/trace, so the laicai detail page can render per-worker execution
-    without SSH. run_id comes from attempt_stats.swarm_runs[].run_id."""
+    /obs/trace, so the laicai execution-trace page can render per-worker
+    execution without SSH. run_id comes from attempt_stats.swarm_runs[].run_id."""
     _auth(authorization)
     if not _OBS_ID_RE.fullmatch(run_id):
         raise HTTPException(400, "invalid run_id")
@@ -2444,13 +2445,15 @@ async def memory_delete(body: dict, authorization: Optional[str] = Header(None))
 # right order is: expose usage first, watch real numbers for a couple of weeks,
 # then decide the retention windows from evidence instead of from a guess.
 #
-# TODO(retention, after ~2 weeks of /tenants/usage data): add `retention.py`
-#   with a 6-hourly sweeper — sessions/ and runs/ evicted by directory mtime
+# TODO(retention, after ~2 weeks of /tenants/usage data): a router-side sweeper
+#   (`retention.py`, 6-hourly) — sessions/ and runs/ evicted by directory mtime
 #   (age or count), uploads/ by age, **memory/ never** (it is the user's asset;
-#   only the user or /forget removes it). Two hard requirements before it ships:
-#     1. `--dry-run` listing reviewed by hand — no active session in it;
-#     2. the engine's FTS index (sessions.db) must drop rows for deleted session
-#        dirs, or search returns dead links.
+#   only the user or /forget removes it). Hard requirement before it ships: a
+#   `--dry-run` listing reviewed by hand — no active session in it. The engine
+#   already drops FTS rows of session dirs removed behind its back (at start
+#   and on sight in session_search), and has its own opt-in session sweep
+#   (VIBE_SESSION_RETENTION_DAYS, off by default, not in FORWARD_ENV) — turning
+#   that on (dry run first, then forward the two env names) is the alternative.
 #   laicai-bound session ids self-heal: a deleted session makes the engine 404,
 #   the router creates a new one and reports the new sid back (already in use).
 TENANT_QUOTA_BYTES = int(os.environ.get("VIBE_TENANT_QUOTA_BYTES", str(4 * 1024**3)))

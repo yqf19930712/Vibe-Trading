@@ -37,9 +37,9 @@ logger = logging.getLogger(__name__)
 class MemoryWriteError(RuntimeError):
     """Raised when a memory entry cannot be persisted (full / read-only disk).
 
-    Every tenant volume has a hard size cap, and the failure mode past it used
-    to be an unhandled ``OSError`` from ``Path.write_text`` that propagated all
-    the way up and failed the attempt. Callers catch this and return a
+    Tenant data has no filesystem quota, but the host disk can still fill up
+    or go read-only; an unhandled ``OSError`` from the write would propagate
+    all the way up and fail the attempt. Callers catch this and return a
     structured tool error: losing one memory write must not lose the answer.
     """
 
@@ -841,7 +841,7 @@ class PersistentMemory:
             return 0
 
     def maybe_auto_consolidate(self) -> dict | None:
-        """Run one consolidation pass when the index is close to its cap (V2).
+        """Run one consolidation pass when the index is close to its cap.
 
         Called at run end, not per-write: consolidation rewrites entry files,
         and doing that mid-run would churn the session-start snapshot the
