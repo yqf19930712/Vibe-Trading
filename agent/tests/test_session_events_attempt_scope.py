@@ -94,6 +94,40 @@ def test_anchor_evicted_falls_back_to_attempt_id_filter() -> None:
     assert replayed == kept
 
 
+def test_swarm_tail_usage_after_the_anchor_is_replayed() -> None:
+    """A tail is reported once, on whichever request streams then — this one."""
+    bus = EventBus()
+    _previous_turn(bus, "s")
+    early_tail = bus.emit("s", "llm_usage", {"input_tokens": 3, "source": "swarm_tail", "attempt_id": "A"})
+    created = bus.emit("s", "attempt.created", {"attempt_id": "B"})
+    tail = bus.emit("s", "llm_usage", {"input_tokens": 7, "source": "swarm_tail", "attempt_id": "A"})
+    bus.emit("s", "llm_usage", {"input_tokens": 5, "source": "swarm", "attempt_id": "A"})
+
+    replayed = bus.replay("s", replay_all=True, since_attempt="B")
+
+    assert replayed == [created, tail]
+    assert early_tail not in replayed
+
+
+def test_swarm_tail_is_left_out_when_the_anchor_is_gone() -> None:
+    bus = EventBus(max_buffer_size=4)
+    bus.emit("s", "attempt.created", {"attempt_id": "B"})
+    bus.emit("s", "llm_usage", {"input_tokens": 7, "source": "swarm_tail", "attempt_id": "A"})
+    kept = [bus.emit("s", "tool_call", {"i": i, "attempt_id": "B"}) for i in range(3)]
+
+    assert bus.replay("s", replay_all=True, since_attempt="B") == kept
+
+
+def test_reconnect_with_an_evicted_id_replays_the_attempt_window() -> None:
+    bus = EventBus()
+    _previous_turn(bus, "s")
+    created = bus.emit("s", "attempt.created", {"attempt_id": "B"})
+    usage = bus.emit("s", "llm_usage", {"input_tokens": 10, "attempt_id": "B"})
+
+    assert bus.replay("s", "evicted-id", replay_all=True, since_attempt="B") == [created, usage]
+    assert bus.replay("s", created.event_id, replay_all=True, since_attempt="B") == [usage]
+
+
 def test_without_since_attempt_the_legacy_replay_is_unchanged() -> None:
     bus = EventBus()
     _previous_turn(bus, "s")
@@ -207,3 +241,49 @@ def test_events_endpoint_passes_the_running_attempt(monkeypatch, tmp_path) -> No
                 break
 
     assert seen == {"replay_all": True, "since_attempt": attempt.attempt_id}
+
+
+def test_events_endpoint_replays_the_attempt_window_on_reconnect(monkeypatch, tmp_path) -> None:
+    import api_server
+    from src.session.models import Attempt, Session
+    from src.session.store import SessionStore
+
+    store = SessionStore(tmp_path / "sessions")
+    session = Session(title="t")
+    store.create_session(session)
+    attempt = Attempt(session_id=session.session_id, prompt="q")
+    attempt.mark_running()
+    store.create_attempt(attempt)
+    session.last_attempt_id = attempt.attempt_id
+    store.update_session(session)
+
+    seen: dict = {}
+
+    class _Bus:
+        async def subscribe(self, session_id, last_event_id=None, **kw):
+            seen.update(kw, last_event_id=last_event_id)
+            yield SSEEvent(event_type="attempt.created", data={"attempt_id": attempt.attempt_id})
+
+    class _Svc:
+        def __init__(self) -> None:
+            self.store = store
+            self.event_bus = _Bus()
+
+        def get_session(self, sid):
+            return store.get_session(sid)
+
+    monkeypatch.delenv("VIBE_MULTITENANT", raising=False)
+    monkeypatch.setattr(api_server, "_get_session_service", lambda: _Svc())
+    client = TestClient(api_server.app, client=("127.0.0.1", 50000))
+    with client.stream(
+        "GET", f"/sessions/{session.session_id}/events?replay=active",
+        headers={"Last-Event-ID": "abc123"},
+    ) as resp:
+        assert resp.status_code == 200
+        for line in resp.iter_lines():
+            if line.startswith("event:"):
+                break
+
+    assert seen == {
+        "replay_all": True, "since_attempt": attempt.attempt_id, "last_event_id": "abc123",
+    }

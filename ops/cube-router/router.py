@@ -1283,6 +1283,7 @@ async def _pump_events(
 # forwarded llm_usage into the user's token quota and stores attempt_stats as
 # the run's engine stats).
 _METERED_EVENTS = frozenset({"llm_usage", "attempt_stats"})
+SWARM_TAIL_SOURCE = "swarm_tail"
 
 
 def _event_belongs_to_ask(ev: dict, attempt_id: Optional[str]) -> bool:
@@ -1297,6 +1298,13 @@ def _event_belongs_to_ask(ev: dict, attempt_id: Optional[str]) -> bool:
     before, except metered ones: usage that cannot be attributed to this
     attempt is never forwarded. An engine that returned no ``attempt_id``
     gives nothing to filter on, so everything passes.
+
+    One foreign event passes: a swarm tail's ``llm_usage``
+    (``source="swarm_tail"``). A swarm the previous attempt stopped waiting
+    for keeps running; the engine reports its remaining tokens once, when it
+    ends, stamped with that earlier attempt's id, and never replays it into a
+    later attempt's window. Arriving during this ask, it is billed to this
+    ask — dropping it would leave those tokens unbilled.
     """
     if attempt_id is None:
         return True
@@ -1304,7 +1312,9 @@ def _event_belongs_to_ask(ev: dict, attempt_id: Optional[str]) -> bool:
     owner = data.get("attempt_id") if isinstance(data, dict) else None
     if owner is None:
         return ev.get("ev") not in _METERED_EVENTS
-    return owner == attempt_id
+    if owner == attempt_id:
+        return True
+    return ev.get("ev") == "llm_usage" and data.get("source") == SWARM_TAIL_SOURCE
 
 
 class _SessionGone(Exception):
