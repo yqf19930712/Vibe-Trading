@@ -86,6 +86,16 @@ MAX_CONCURRENT_ACTIVE = int(os.environ.get("VIBE_MAX_CONCURRENT_ACTIVE", "2"))
 IDLE_TTL_S = int(os.environ.get("VIBE_IDLE_TTL_S", str(20 * 60)))     # pause after idle
 READY_TIMEOUT_S = int(os.environ.get("VIBE_READY_TIMEOUT_S", "180"))  # create+boot budget
 POLL_INTERVAL_S = float(os.environ.get("VIBE_POLL_INTERVAL_S", "3"))
+# Answer-poll tolerance: a failing poll (transport error, non-JSON body,
+# non-200 from cube-proxy or the engine) is retried until the failures have
+# lasted POLL_FAIL_MAX_S seconds or POLL_FAIL_MAX_CONSECUTIVE polls in a row,
+# whichever comes first. A launcher that reports the engine process stopped
+# ends the wait at once — that attempt is gone.
+POLL_FAIL_MAX_CONSECUTIVE = int(os.environ.get("VIBE_POLL_FAIL_MAX", "10"))
+POLL_FAIL_MAX_S = float(os.environ.get("VIBE_POLL_FAIL_MAX_S", "120"))
+# The message list is a cheap read; a poll that hangs longer than this is a
+# transport problem, not a slow engine.
+POLL_HTTP_TIMEOUT = httpx.Timeout(10.0, read=30.0)
 DEFAULT_ASK_TIMEOUT_S = int(os.environ.get("VIBE_ASK_TIMEOUT_S", str(15 * 60)))
 # Swarm committees legitimately run tens of minutes to hours (multi-layer DAG ×
 # multi-iteration workers).
@@ -760,11 +770,48 @@ class _FailSignal:
         self.event.set()
 
 
+async def _poll_messages(inst: Instance, sid: str) -> tuple[Optional[list], str]:
+    """One answer poll. Returns ``(messages, "")`` or ``(None, problem)``."""
+    try:
+        m = await _vibe(
+            inst, "GET", f"/sessions/{sid}/messages",
+            params={"limit": 50}, timeout=POLL_HTTP_TIMEOUT,
+        )
+    except (httpx.HTTPError, OSError) as e:
+        return None, type(e).__name__
+    if m.status_code == 401:
+        # The engine no longer accepts the key this attempt was posted with:
+        # it was restarted underneath us, so the attempt is gone.
+        raise HTTPException(502, "deep engine restarted during the attempt (key rejected)")
+    if m.status_code != 200:
+        return None, f"http_{m.status_code}"
+    try:
+        msgs = m.json()
+    except ValueError:
+        return None, "invalid_json"
+    if not isinstance(msgs, list):
+        return None, "invalid_body"
+    return msgs, ""
+
+
 async def _wait_answer(
     inst: Instance, sid: str, attempt_id: Optional[str], timeout_s: int,
     failed: Optional[_FailSignal] = None,
+    deadline: Optional[float] = None,
+    stats: Optional[dict] = None,
 ) -> str:
-    deadline = time.monotonic() + timeout_s
+    """Poll the engine's message list until this attempt's answer appears.
+
+    ``deadline`` (monotonic) overrides ``timeout_s`` so the caller can anchor
+    the window to when the ask arrived. Poll failures are tolerated per
+    POLL_FAIL_MAX_CONSECUTIVE / POLL_FAIL_MAX_S; while they last the launcher
+    is probed so a stopped engine fails the ask immediately instead of after
+    the tolerance window. ``stats["poll_errors"]`` counts failed polls.
+    """
+    if deadline is None:
+        deadline = time.monotonic() + timeout_s
+    streak = 0
+    streak_t0 = 0.0
     while time.monotonic() < deadline:
         if failed is None:
             await asyncio.sleep(POLL_INTERVAL_S)
@@ -775,10 +822,26 @@ async def _wait_answer(
                 pass
             if failed.event.is_set():
                 raise _EngineFailed(failed.error or "attempt failed")
-        m = await _vibe(inst, "GET", f"/sessions/{sid}/messages", params={"limit": 50})
-        if m.status_code != 200:
+        msgs, problem = await _poll_messages(inst, sid)
+        if msgs is None:
+            now = time.monotonic()
+            if streak == 0:
+                streak_t0 = now
+            streak += 1
+            if stats is not None:
+                stats["poll_errors"] = int(stats.get("poll_errors") or 0) + 1
+            h = await _launcher_health(inst)
+            engine_state = (h or {}).get("engine")
+            log.warning("answer poll failed (sid %s, %s, streak %d, engine %s)",
+                        sid, problem, streak, engine_state or "unreachable")
+            if engine_state == "stopped":
+                raise HTTPException(502, "deep engine process stopped during the attempt")
+            if streak >= POLL_FAIL_MAX_CONSECUTIVE or now - streak_t0 >= POLL_FAIL_MAX_S:
+                raise HTTPException(
+                    502, f"deep engine unreachable ({problem}; {streak} failed polls)"
+                )
             continue
-        msgs = m.json()
+        streak = 0
         for msg in reversed(msgs):
             kind, text = _classify_answer_message(msg, attempt_id)
             if kind == "answer":
@@ -788,29 +851,87 @@ async def _wait_answer(
     raise HTTPException(504, "deep engine timed out")
 
 
-async def _pump_events(inst: Instance, sid: str, q: "asyncio.Queue[dict]") -> None:
-    try:
-        async with http.stream(
-            "GET",
-            f"{inst.base_url}/sessions/{sid}/events",
-            params={"replay": "active"},
-            headers=_engine_headers(inst),
-            timeout=None,
-        ) as r:
-            ev_type: Optional[str] = None
-            async for line in r.aiter_lines():
-                if line.startswith("event:"):
-                    ev_type = line[6:].strip()
-                elif line.startswith("data:"):
-                    raw = line[5:].strip()
-                    try:
-                        payload = json.loads(raw)
-                    except Exception:
-                        payload = raw
-                    q.put_nowait({"ev": ev_type or "message", "data": payload})
-                    ev_type = None
-    except Exception as e:
-        log.info("event pump ended (%s): %s", sid, e)
+# Event stream reconnect: the engine sends a heartbeat every 30s of silence,
+# so a read that stays silent for PUMP_READ_TIMEOUT_S is a dead connection.
+PUMP_READ_TIMEOUT_S = float(os.environ.get("VIBE_PUMP_READ_TIMEOUT_S", "90"))
+PUMP_RECONNECT_MIN_DELAY_S = 0.5
+PUMP_RECONNECT_MAX_DELAY_S = 10.0
+_PUMP_SEEN_IDS = 4096
+
+
+async def _pump_events(
+    inst: Instance, sid: str, q: "asyncio.Queue[dict]", stats: Optional[dict] = None,
+) -> None:
+    """Forward the engine's session SSE stream into ``q`` until cancelled.
+
+    A dropped stream is reopened with ``Last-Event-ID`` set to the last event
+    id seen, so the engine replays only what was missed (its per-session
+    buffer); before any id has been seen it reopens with ``replay=active``
+    exactly like the first connect. Event ids already forwarded are skipped,
+    so a replay never duplicates a metered event. The pump runs until the
+    ask cancels it; reconnects back off up to PUMP_RECONNECT_MAX_DELAY_S.
+    ``stats["pump_reconnects"]`` counts reopened streams.
+    """
+    last_id: Optional[str] = None
+    seen: set[str] = set()
+    seen_order: "deque[str]" = deque()
+    delay = PUMP_RECONNECT_MIN_DELAY_S
+    first = True
+    while True:
+        if not first:
+            if stats is not None:
+                stats["pump_reconnects"] = int(stats.get("pump_reconnects") or 0) + 1
+            await asyncio.sleep(delay)
+        first = False
+        headers = _engine_headers(inst)
+        if last_id:
+            headers["Last-Event-ID"] = last_id
+        delivered = False
+        try:
+            async with http.stream(
+                "GET",
+                f"{inst.base_url}/sessions/{sid}/events",
+                params={"replay": "active"},
+                headers=headers,
+                timeout=httpx.Timeout(30.0, read=PUMP_READ_TIMEOUT_S),
+            ) as r:
+                if r.status_code != 200:
+                    raise RuntimeError(f"events http {r.status_code}")
+                ev_type: Optional[str] = None
+                ev_id: Optional[str] = None
+                async for line in r.aiter_lines():
+                    if line.startswith("id:"):
+                        ev_id = line[3:].strip() or None
+                    elif line.startswith("event:"):
+                        ev_type = line[6:].strip()
+                    elif line.startswith("data:"):
+                        raw = line[5:].strip()
+                        try:
+                            payload = json.loads(raw)
+                        except Exception:
+                            payload = raw
+                        this_id, ev_id = ev_id, None
+                        name, ev_type = ev_type or "message", None
+                        if this_id:
+                            if this_id in seen:
+                                continue
+                            seen.add(this_id)
+                            seen_order.append(this_id)
+                            if len(seen_order) > _PUMP_SEEN_IDS:
+                                seen.discard(seen_order.popleft())
+                            last_id = this_id
+                        q.put_nowait({"ev": name, "data": payload})
+                        delivered = True
+            reason = "stream closed"
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - any failure means reconnect
+            reason = f"{type(e).__name__}: {e}"
+        delay = (
+            PUMP_RECONNECT_MIN_DELAY_S if delivered
+            else min(delay * 2, PUMP_RECONNECT_MAX_DELAY_S)
+        )
+        log.info("event pump for %s dropped (%s); reconnecting in %.1fs", sid, reason, delay)
 
 
 class _SessionGone(Exception):
@@ -1026,9 +1147,11 @@ async def _ask_stream(body: AskBody, timeout_s: int):
                         if data.get("attempt_id") in (attempt_id, None):
                             failed.fire(str(data.get("error") or "attempt failed")[:500])
 
-                    pump = asyncio.create_task(_pump_events(inst, sid, q))
+                    pump = asyncio.create_task(_pump_events(inst, sid, q, stats=stats))
                     waiter = asyncio.create_task(
-                        _wait_answer(inst, sid, attempt_id, timeout_s, failed=failed)
+                        _wait_answer(
+                            inst, sid, attempt_id, timeout_s, failed=failed, stats=stats
+                        )
                     )
                     try:
                         while not waiter.done():

@@ -256,10 +256,10 @@ class TestFailedAttemptClassification:
         async def _post_turn(inst_, sid, query, **kw):
             return "att-1"
 
-        async def _pump_events(inst_, sid, q):
+        async def _pump_events(inst_, sid, q, **kw):
             await asyncio.sleep(3600)
 
-        async def _wait_answer(inst_, sid, attempt_id, timeout_s, failed=None):
+        async def _wait_answer(inst_, sid, attempt_id, timeout_s, failed=None, **kw):
             raise router._EngineFailed("Execution failed: provider 502")
 
         async def _cancel_attempt_bg(inst_, sid, tk, stats, finalize=None):
