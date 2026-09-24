@@ -10,12 +10,21 @@ import concurrent.futures
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Coroutine, Dict, Optional, Set
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
 
 # Dedicated thread pool limited to four concurrent agents to avoid exhausting the default executor.
 _AGENT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="agent")
 
 logger = logging.getLogger(__name__)
+
+# Session retention: ``VIBE_SESSION_RETENTION_DAYS`` (unset / non-positive =
+# keep forever, the default) deletes sessions idle for longer than that —
+# through ``delete_session``, so runs, swarm runs, FTS rows and the goal
+# ledger go with them. ``VIBE_SESSION_RETENTION_DRY_RUN=1`` only logs what
+# would go. Long-term memory (``memory/``) is never touched by it.
+RETENTION_DAYS_ENV = "VIBE_SESSION_RETENTION_DAYS"
+RETENTION_DRY_RUN_ENV = "VIBE_SESSION_RETENTION_DRY_RUN"
+_RETENTION_INTERVAL_S = 24 * 3600
 
 # Strong references for fire-and-forget tasks: the event loop only keeps
 # weak ones, so an attempt task with no other referrer could be collected
@@ -30,6 +39,7 @@ def _spawn(coro: Coroutine[Any, Any, Any]) -> "asyncio.Task[Any]":
     task.add_done_callback(_bg_tasks.discard)
     return task
 
+from src.session import tombstone
 from src.session.events import EventBus
 from src.session.models import (
     Attempt,
@@ -67,12 +77,29 @@ class SessionService:
         self.event_bus = event_bus
         self.runs_dir = runs_dir
         self._active_loops: Dict[str, "AgentLoop"] = {}
-        # Sessions with an attempt in flight, and those whose cancel arrived
-        # while the attempt was still building its registry (no loop to
-        # signal yet): the loop is cancelled the moment it registers.
-        self._inflight: Set[str] = set()
+        # In-flight bookkeeping is per ATTEMPT: a session can briefly have
+        # two (a cancelled one still finishing while the retry builds its
+        # registry), and the older one's cleanup must not clear the newer
+        # one's entries. ``_inflight`` maps session -> its live attempt ids;
+        # ``_pending_cancel`` holds attempt ids whose cancel arrived before
+        # their loop existed (delivered the moment the loop registers).
+        self._inflight: Dict[str, Set[str]] = {}
         self._pending_cancel: Set[str] = set()
+        self._attempt_loops: Dict[str, "AgentLoop"] = {}
+        # Receipts that could not be persisted (full disk): kept in memory
+        # and merged into get_messages so the caller polling for the answer
+        # still gets it instead of waiting out its budget.
+        self._volatile_receipts: Dict[str, List[Message]] = {}
+        # Extra per-session cleanups run on delete (e.g. the goal ledger,
+        # owned by the API layer), including the late re-sweep after a
+        # deleted session's attempt finally exits.
+        self._purge_hooks: List[Callable[[str], None]] = []
+        self._last_retention_sweep = 0.0
         self._search_index = get_shared_index()
+
+    def add_purge_hook(self, hook: Callable[[str], None]) -> None:
+        """Register a cleanup run whenever a session is purged."""
+        self._purge_hooks.append(hook)
 
     def create_session(self, title: str = "", config: Optional[Dict[str, Any]] = None) -> Session:
         """Create a new session.
@@ -102,21 +129,74 @@ class SessionService:
         """Delete a session: cancel its live loop, drop files, runs, events and FTS rows.
 
         Everything the session produced goes with it: the session directory,
-        every ``runs/<id>`` whose ``req.json`` names the session (the run
-        directories are the only other place the request lands), and the
-        ``sessions.db`` rows (otherwise ``session_search`` keeps returning
-        the deleted conversation as a snippet). Goal-ledger rows are the
-        caller's job (``api_server`` owns the GoalStore).
+        every ``runs/<id>`` whose ``req.json`` names the session, every
+        ``.swarm/runs/<id>`` whose ``run.json`` names it (its goal holds the
+        user's request), its background tasks, and the ``sessions.db`` rows
+        (otherwise ``session_search`` keeps returning the deleted
+        conversation as a snippet). Goal-ledger rows go through the purge
+        hook ``api_server`` registers (it owns the GoalStore).
         """
+        # Tombstone first: an attempt of this session that is still running
+        # finishes at its next cancel check, and every write it makes until
+        # then must be refused rather than recreate what is deleted below.
+        tombstone.mark(session_id, self.store.base_dir)
         self.cancel_current(session_id)
-        self.event_bus.clear(session_id)
         deleted = self.store.delete_session(session_id)
+        self._purge_session(session_id)
+        return deleted
+
+    def _purge_session(self, session_id: str, run_dir: Optional[str] = None) -> None:
+        """Remove everything a deleted session left outside its directory.
+
+        Called by ``delete_session`` and again when a deleted session's
+        attempt finally exits, to sweep what that attempt wrote in between
+        (trace, tool-result offloads into its run dir, swarm artifacts).
+        """
+        self.event_bus.clear(session_id)
+        self._volatile_receipts.pop(session_id, None)
         self._delete_session_runs(session_id)
+        if run_dir:
+            self._delete_run_dir(Path(run_dir))
+        self._delete_session_swarm_runs(session_id)
         try:
             self._search_index.delete_session(session_id)
         except Exception as exc:  # noqa: BLE001 - index cleanup is best-effort
             logger.warning("search index cleanup failed for session %s: %s", session_id, exc)
-        return deleted
+        try:
+            from src.tools.background_tools import get_background_manager
+
+            get_background_manager().cancel_session(session_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("background task cleanup failed for %s", session_id, exc_info=True)
+        for hook in list(self._purge_hooks):
+            try:
+                hook(session_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("session purge hook failed for %s: %s", session_id, exc)
+
+    def _delete_run_dir(self, run_dir: Path) -> None:
+        """Remove one run directory, only when it sits directly under ``runs_dir``."""
+        import shutil
+
+        try:
+            if run_dir.is_symlink() or run_dir.resolve().parent != self.runs_dir.resolve():
+                return
+        except OSError:
+            return
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    def _delete_session_swarm_runs(self, session_id: str) -> list[str]:
+        """Remove the swarm run directories stamped with ``session_id``."""
+        try:
+            from src.swarm.store import delete_session_runs
+
+            removed = delete_session_runs(session_id)
+        except Exception as exc:  # noqa: BLE001 - best effort, like the other stores
+            logger.warning("swarm run cleanup failed for session %s: %s", session_id, exc)
+            return []
+        if removed:
+            logger.info("removed %d swarm run(s) of session %s", len(removed), session_id)
+        return removed
 
     def _delete_session_runs(self, session_id: str) -> int:
         """Remove the run directories linked to ``session_id``; returns the count."""
@@ -136,6 +216,87 @@ class SessionService:
                 removed += 1
         return removed
 
+    @staticmethod
+    def _retention_days() -> Optional[float]:
+        import os
+
+        raw = os.getenv(RETENTION_DAYS_ENV, "").strip()
+        if not raw:
+            return None
+        try:
+            days = float(raw)
+        except ValueError:
+            logger.warning("%s=%r is not a number; session retention disabled", RETENTION_DAYS_ENV, raw)
+            return None
+        return days if days > 0 else None
+
+    def sweep_expired_sessions(
+        self, max_age_days: Optional[float] = None, *, dry_run: Optional[bool] = None
+    ) -> list[str]:
+        """Delete sessions idle for more than ``max_age_days`` (see ``RETENTION_DAYS_ENV``).
+
+        Idle age is the newest mtime of the session's own files
+        (``session.json`` / ``messages.jsonl``). Sessions with an attempt in
+        flight are never touched.
+
+        Returns:
+            The session ids deleted (or, in a dry run, that would be).
+        """
+        import os
+        import time as _time
+
+        days = max_age_days if max_age_days is not None else self._retention_days()
+        if days is None:
+            return []
+        if dry_run is None:
+            dry_run = os.getenv(RETENTION_DRY_RUN_ENV, "").strip().lower() in {"1", "true", "yes"}
+        cutoff = _time.time() - days * 86400.0
+        expired: list[str] = []
+        base = self.store.base_dir
+        try:
+            candidates = [p for p in base.iterdir() if p.is_dir() and not p.is_symlink()]
+        except OSError as exc:
+            logger.warning("session retention sweep skipped: %s", exc)
+            return []
+        for session_dir in candidates:
+            sid = session_dir.name
+            if sid.startswith(".") or sid in self._inflight:
+                continue
+            stamps = []
+            for name in ("session.json", "messages.jsonl"):
+                try:
+                    stamps.append((session_dir / name).stat().st_mtime)
+                except OSError:
+                    continue
+            if not stamps or max(stamps) >= cutoff:
+                continue
+            expired.append(sid)
+            if not dry_run:
+                self.delete_session(sid)
+        if expired:
+            logger.info(
+                "session retention (%s days)%s: %d session(s) %s",
+                days, " dry run" if dry_run else "", len(expired),
+                "would be deleted" if dry_run else "deleted",
+                extra={"session_ids": expired[:50]},
+            )
+        return expired
+
+    def maybe_sweep_expired_sessions(self) -> None:
+        """Run the retention sweep at most once a day (no-op while it is disabled)."""
+        import time as _time
+
+        if self._retention_days() is None:
+            return
+        now = _time.monotonic()
+        if self._last_retention_sweep and now - self._last_retention_sweep < _RETENTION_INTERVAL_S:
+            return
+        self._last_retention_sweep = now
+        try:
+            self.sweep_expired_sessions()
+        except Exception:  # noqa: BLE001 - housekeeping must never block a request
+            logger.warning("session retention sweep failed", exc_info=True)
+
     def reconcile_orphans(self, goal_store: Optional[Any] = None) -> list[str]:
         """Drop index/ledger rows of sessions whose directory is gone.
 
@@ -152,6 +313,10 @@ class SessionService:
         Returns:
             Session ids removed from the search index.
         """
+        try:
+            tombstone.prune(self.store.base_dir)
+        except Exception:  # noqa: BLE001
+            logger.debug("tombstone prune failed", exc_info=True)
         try:
             self._search_index.bind_store(self.store.base_dir)
             removed = list(self._search_index.reconcile_with_store())
@@ -197,6 +362,8 @@ class SessionService:
 
         message = Message(session_id=session_id, role=role, content=content)
         self.store.append_message(message)
+        # After the append: this session's own mtime is now fresh.
+        self.maybe_sweep_expired_sessions()
         self._search_index.index_message(session_id, role, content)
         self.event_bus.emit(session_id, "message.received", {"message_id": message.message_id, "role": role, "content": content})
 
@@ -211,7 +378,7 @@ class SessionService:
         self.store.update_session(session)
         self.event_bus.emit(session_id, "attempt.created", {"attempt_id": attempt.attempt_id, "prompt": content})
 
-        self._inflight.add(session_id)
+        self._inflight.setdefault(session_id, set()).add(attempt.attempt_id)
         _spawn(
             self._run_attempt(
                 session,
@@ -223,8 +390,14 @@ class SessionService:
         return {"message_id": message.message_id, "attempt_id": attempt.attempt_id}
 
     def get_messages(self, session_id: str, limit: int = 100) -> list[Message]:
-        """Return the message history."""
-        return self.store.get_messages(session_id, limit)
+        """Return the message history (plus any receipt the disk refused)."""
+        messages = self.store.get_messages(session_id, limit)
+        volatile = self._volatile_receipts.get(session_id)
+        if volatile:
+            stored = {m.message_id for m in messages}
+            messages = messages + [m for m in volatile if m.message_id not in stored]
+            messages = messages[-limit:]
+        return messages
 
     def cancel_current(self, session_id: str) -> bool:
         """Cancel the currently running AgentLoop for a session.
@@ -237,15 +410,21 @@ class SessionService:
             still in its preparation phase (cancelled as soon as its loop
             registers), or a swarm run this session left running.
         """
+        cancelled = False
         loop = self._active_loops.get(session_id)
         if loop is not None:
             loop.cancel()
             cancelled = True
-        elif session_id in self._inflight:
-            self._pending_cancel.add(session_id)
+        # Every live attempt of the session, not only the newest loop: a
+        # retry still building its registry has no loop yet and gets the
+        # cancel delivered when it registers.
+        for attempt_id in list(self._inflight.get(session_id, ())):
+            attempt_loop = self._attempt_loops.get(attempt_id)
+            if attempt_loop is not None:
+                attempt_loop.cancel()
+            else:
+                self._pending_cancel.add(attempt_id)
             cancelled = True
-        else:
-            cancelled = False
         # A cancelled attempt has no one left to resume a swarm run it was
         # waiting on (or had handed back as wait_budget_exhausted), so the
         # run is stopped with it instead of burning on in the background.
@@ -265,14 +444,26 @@ class SessionService:
         deadline_s: Optional[float] = None,
     ) -> None:
         """Execute an Attempt in the background."""
-        self._inflight.add(session.session_id)
+        session_id = session.session_id
+        self._inflight.setdefault(session_id, set()).add(attempt.attempt_id)
         try:
             await self._run_attempt_inner(
                 session, attempt, include_shell_tools=include_shell_tools, deadline_s=deadline_s
             )
         finally:
-            self._inflight.discard(session.session_id)
-            self._pending_cancel.discard(session.session_id)
+            live = self._inflight.get(session_id)
+            if live is not None:
+                live.discard(attempt.attempt_id)
+                if not live:
+                    self._inflight.pop(session_id, None)
+            self._pending_cancel.discard(attempt.attempt_id)
+            self._attempt_loops.pop(attempt.attempt_id, None)
+            # The session was deleted while this attempt ran: whatever it
+            # wrote after the delete (trace, offloads, swarm artifacts) is
+            # swept now that it can write no more.
+            if self.store.is_deleted(session_id):
+                self.store.delete_session(session_id)
+                self._purge_session(session_id, run_dir=attempt.run_dir)
 
     async def _run_attempt_inner(
         self,
@@ -296,13 +487,24 @@ class SessionService:
                 session_config=dict(session.config),
                 deadline_s=deadline_s,
             )
-            if result.get("status") == "success":
-                attempt.mark_completed(summary=result.get("content", ""))
+            answer = result.get("content") or ""
+            if result.get("status") == "success" and answer.strip():
+                attempt.mark_completed(summary=answer)
+            elif result.get("status") == "success":
+                # A run that left artifacts (e.g. metrics.csv) but no text is
+                # not an answer: reporting it as success handed the caller a
+                # canned "completed" line in place of the research result.
+                attempt.mark_failed(error=self._empty_answer_reason(result))
             else:
                 attempt.mark_failed(error=result.get("reason", "unknown"))
             attempt.run_dir = result.get("run_dir")
 
-            self.store.update_attempt(attempt)
+            # Bookkeeping writes on the way out are best effort: a full disk
+            # must not turn an answer that exists into a failed attempt.
+            try:
+                self.store.update_attempt(attempt)
+            except OSError as exc:
+                logger.warning("attempt %s: update_attempt failed: %s", attempt.attempt_id, exc)
             reply_metadata = {}
             if attempt.run_dir:
                 reply_metadata["run_id"] = Path(attempt.run_dir).name
@@ -324,9 +526,12 @@ class SessionService:
                 linked_attempt_id=attempt.attempt_id,
                 metadata=reply_metadata,
             )
-            self.store.append_message(reply)
+            self._store_receipt(reply)
             receipt_written = True
-            self._search_index.index_message(session.session_id, "assistant", reply.content)
+            try:
+                self._search_index.index_message(session.session_id, "assistant", reply.content)
+            except Exception:  # noqa: BLE001 - the answer is delivered; search is secondary
+                logger.warning("attempt %s: receipt not indexed", attempt.attempt_id, exc_info=True)
             self.event_bus.emit(
                 session.session_id,
                 "attempt.completed" if attempt.status == AttemptStatus.COMPLETED else "attempt.failed",
@@ -336,6 +541,38 @@ class SessionService:
 
         except Exception as exc:
             self._fail_attempt(session, attempt, exc, receipt_written=receipt_written)
+
+    def _store_receipt(self, reply: Message) -> None:
+        """Persist the assistant receipt; keep it in memory when the disk refuses.
+
+        The router finds the answer by polling the message list, so a receipt
+        lost to a full disk would leave it waiting out the whole budget for an
+        answer that was already produced.
+        """
+        if self.store.is_deleted(reply.session_id):
+            return
+        try:
+            self.store.append_message(reply)
+        except OSError as exc:
+            logger.warning(
+                "attempt %s: receipt not persisted (%s); serving it from memory",
+                reply.linked_attempt_id, exc,
+            )
+            held = self._volatile_receipts.setdefault(reply.session_id, [])
+            held.append(reply)
+            del held[:-5]
+
+    @staticmethod
+    def _empty_answer_reason(result: Dict[str, Any]) -> str:
+        """Failure reason for a run the loop called successful but that has no text."""
+        iterations = result.get("iterations")
+        max_iterations = result.get("max_iterations")
+        if iterations and max_iterations and iterations >= max_iterations:
+            return (
+                f"reached max iterations ({max_iterations}) without a final answer "
+                "(run artifacts exist but the model produced no text)"
+            )
+        return "no final answer: the run produced artifacts but the model returned no text"
 
     def _fail_attempt(
         self, session: Session, attempt: Attempt, exc: Exception, *, receipt_written: bool
@@ -366,7 +603,7 @@ class SessionService:
                 metadata={"status": attempt.status.value, "ok": False, "error": error},
             )
             try:
-                self.store.append_message(reply)
+                self._store_receipt(reply)
             except Exception:  # noqa: BLE001
                 logger.warning("attempt %s: failure receipt not stored", attempt.attempt_id, exc_info=True)
             try:
@@ -480,10 +717,11 @@ class SessionService:
         if previous is not None and previous is not agent:
             previous.cancel()
         self._active_loops[session_id] = agent
+        self._attempt_loops[attempt_id] = agent
         # A cancel that arrived during build_registry had no loop to hit;
         # deliver it now, before the loop is even scheduled.
-        if session_id in self._pending_cancel:
-            self._pending_cancel.discard(session_id)
+        if attempt_id in self._pending_cancel:
+            self._pending_cancel.discard(attempt_id)
             agent.cancel()
 
         # Build the message history context.
@@ -507,6 +745,7 @@ class SessionService:
             # Only drop OUR entry — a newer loop may have replaced it.
             if self._active_loops.get(session_id) is agent:
                 self._active_loops.pop(session_id, None)
+            self._attempt_loops.pop(attempt_id, None)
 
         # Load metrics from the run output when available.
         if result.get("run_dir"):
@@ -596,12 +835,13 @@ class SessionService:
         out: list[Dict[str, Any]] = []
         summary = handoff.load(session_id) if session_id else ""
         if summary:
-            clipped = summary
-            if estimate_text_tokens(clipped) > HANDOFF_INJECT_MAX_TOKENS:
-                limit = len(clipped)
-                while limit > 0 and estimate_text_tokens(clipped[:limit]) > HANDOFF_INJECT_MAX_TOKENS:
-                    limit = int(limit * 0.9)
-                clipped = clipped[:limit] + "\n\n...[summary clipped]"
+            # Section-aware: the goal, open asks and concrete numbers are
+            # kept whole before anything else, instead of losing whatever
+            # the template happens to list last.
+            clipped = handoff.fit_summary(
+                summary, HANDOFF_INJECT_MAX_TOKENS,
+                "\n\n...[summary clipped; omitted: {omitted}]",
+            )
             out.append(
                 {
                     "role": "user",
@@ -652,5 +892,5 @@ class SessionService:
     def _format_result_message(attempt: Attempt) -> str:
         """Format the final execution result message."""
         if attempt.status == AttemptStatus.COMPLETED:
-            return attempt.summary or "Strategy execution completed."
+            return attempt.summary or ""
         return f"Execution failed: {attempt.error or 'unknown error'}"

@@ -115,11 +115,11 @@ class FactorAnalysisTool(BaseTool):
         "properties": {
             "factor_csv": {
                 "type": "string",
-                "description": "Factor values CSV path (index=date, columns=codes)",
+                "description": "Factor values CSV path, relative to run_dir (index=date, columns=codes)",
             },
             "return_csv": {
                 "type": "string",
-                "description": "Returns CSV path (same structure)",
+                "description": "Returns CSV path, relative to run_dir (same structure)",
             },
             "n_groups": {
                 "type": "integer",
@@ -128,7 +128,7 @@ class FactorAnalysisTool(BaseTool):
             },
             "output_dir": {
                 "type": "string",
-                "description": "Output directory for results",
+                "description": "Output directory for results, relative to run_dir",
             },
         },
         "required": ["factor_csv", "return_csv", "output_dir"],
@@ -143,9 +143,20 @@ class FactorAnalysisTool(BaseTool):
         Returns:
             JSON-formatted analysis summary.
         """
+        from src.tools.path_utils import safe_tool_input, safe_tool_output_dir
+
+        # Same boundary as the other file tools: reads come from the run dir
+        # (or an earlier run / an upload), results go into the run dir.
+        run_dir = kwargs.get("run_dir")
+        try:
+            factor_csv = safe_tool_input(str(kwargs["factor_csv"]), run_dir)
+            return_csv = safe_tool_input(str(kwargs["return_csv"]), run_dir)
+            output_dir = safe_tool_output_dir(str(kwargs["output_dir"]), run_dir)
+        except ValueError as exc:
+            return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
         return run_factor_analysis(
-            factor_csv=kwargs["factor_csv"],
-            return_csv=kwargs["return_csv"],
-            output_dir=kwargs["output_dir"],
+            factor_csv=str(factor_csv),
+            return_csv=str(return_csv),
+            output_dir=str(output_dir),
             n_groups=kwargs.get("n_groups", 5),
         )

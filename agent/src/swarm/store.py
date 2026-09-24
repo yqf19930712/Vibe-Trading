@@ -11,15 +11,82 @@ File-system-based persistence for SwarmRun. Directory structure:
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
+import logging
 import os
+import shutil
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 from src.swarm.models import SwarmEvent, SwarmRun
 from src.tools.redaction import redact_internal_paths
+
+logger = logging.getLogger(__name__)
+
+# Session that owns the runs created in this context. The runtime builds the
+# SwarmRun itself, so the tool that starts it declares the owner around the
+# start call and ``create_run`` stamps it onto the run before the first write
+# — every later write of that same object keeps it.
+_RUN_OWNER: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "swarm_run_owner_session", default=None
+)
+
+
+@contextlib.contextmanager
+def run_owner(session_id: str | None) -> Iterator[None]:
+    """Stamp runs created inside this block with ``session_id``."""
+    token = _RUN_OWNER.set(session_id or None)
+    try:
+        yield
+    finally:
+        _RUN_OWNER.reset(token)
+
+
+def delete_session_runs(session_id: str, base_dir: Path | None = None) -> list[str]:
+    """Delete every run directory whose ``run.json`` names ``session_id``.
+
+    Symlinked run directories / run files and anything resolving outside the
+    runs root are skipped, never followed. Runs persisted before
+    ``SwarmRun.session_id`` existed carry no owner and are only removed with
+    the whole tenant.
+
+    Args:
+        session_id: Owning engine session.
+        base_dir: Runs root (defaults to :func:`swarm_runs_root`).
+
+    Returns:
+        Ids of the removed runs.
+    """
+    if not session_id:
+        return []
+    root = base_dir if base_dir is not None else swarm_runs_root()
+    if root.is_symlink() or not root.is_dir():
+        return []
+    real_root = root.resolve()
+    removed: list[str] = []
+    for entry in root.iterdir():
+        run_file = entry / "run.json"
+        if entry.is_symlink() or not entry.is_dir() or run_file.is_symlink():
+            continue
+        try:
+            data = json.loads(run_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or data.get("session_id") != session_id:
+            continue
+        if entry.resolve().parent != real_root:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        if not entry.exists():
+            removed.append(entry.name)
+        else:
+            logger.warning("swarm run %s of session %s not fully removed", entry.name, session_id)
+    return removed
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -158,6 +225,10 @@ class SwarmStore:
         Raises:
             FileExistsError: If the run directory already exists.
         """
+        if run.session_id is None:
+            owner = _RUN_OWNER.get()
+            if owner:
+                run.session_id = owner
         rd = self.run_dir(run.id)
         rd.mkdir(parents=True, exist_ok=False)
         (rd / "tasks").mkdir()

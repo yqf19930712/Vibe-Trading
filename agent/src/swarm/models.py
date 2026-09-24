@@ -174,6 +174,10 @@ class SwarmRun(BaseModel):
             field is the run-level default.
         model: LLM model name in effect when the run started, captured from
             ``LANGCHAIN_MODEL_NAME``. Same scoping rules as :attr:`provider`.
+        session_id: Engine session whose attempt started the run (``None``
+            for runs started outside a session, and for runs persisted
+            before the field existed). Deleting the session deletes the run
+            directory with it; see ``src.swarm.store.delete_session_runs``.
         grounding_data: Pre-fetched OHLCV bars for any suffixed stock or
             crypto symbols mentioned in :attr:`user_vars`. Captured once at
             run-creation time by :mod:`src.swarm.grounding` so workers see
@@ -201,6 +205,7 @@ class SwarmRun(BaseModel):
     total_tool_ms: int = 0
     provider: str | None = None
     model: str | None = None
+    session_id: str | None = None
     grounding_data: dict[str, list[dict]] | None = None
 
 

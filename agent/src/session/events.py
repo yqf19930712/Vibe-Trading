@@ -11,10 +11,21 @@ import logging
 import threading
 import time
 import uuid
+from collections import deque
 
 logger = logging.getLogger(__name__)
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Deque, Dict, List, Optional
+
+# High-frequency incremental events. They are the only ones a full subscriber
+# queue or the replay buffer may shed: losing a text delta costs a flicker in
+# a live view, losing an ``llm_usage`` / ``attempt_stats`` / ``attempt.*``
+# event costs the caller its billing or its terminal signal.
+LOSSY_EVENT_TYPES = frozenset({"text_delta", "tool_progress", "elapsed_s", "heartbeat"})
+# ``swarm.event`` wraps every worker event; only the per-token text stream is
+# high-frequency, the lifecycle events inside it are kept.
+_LOSSY_SWARM_EVENT_TYPES = frozenset({"worker_text"})
+SUBSCRIBER_QUEUE_SIZE = 200
 
 
 @dataclass
@@ -35,6 +46,16 @@ class SSEEvent:
     session_id: str = ""
     timestamp: float = field(default_factory=time.time)
 
+    @property
+    def lossy(self) -> bool:
+        """Whether this event may be dropped under back-pressure."""
+        if self.event_type in LOSSY_EVENT_TYPES:
+            return True
+        if self.event_type == "swarm.event":
+            inner = self.data.get("event") if isinstance(self.data, dict) else None
+            return isinstance(inner, dict) and inner.get("type") in _LOSSY_SWARM_EVENT_TYPES
+        return False
+
     def to_sse(self) -> str:
         """Format the event as an SSE text frame.
 
@@ -52,6 +73,49 @@ class SSEEvent:
             "",
         ])
         return "\n".join(lines)
+
+
+class _SubscriberQueue:
+    """Delivery queue of one SSE subscriber.
+
+    Bounded for stream deltas, lossless for everything else: when it is full
+    a lossy event is dropped (or, for an incoming lossless event, the oldest
+    queued lossy event makes room). A queue holding only lossless events
+    grows past the bound — those are a handful per attempt. Only touched from
+    the event-loop thread (``publish`` hands off with ``call_soon_threadsafe``)
+    or synchronously when no loop runs, so it needs no lock of its own.
+    """
+
+    def __init__(self, maxsize: int = SUBSCRIBER_QUEUE_SIZE) -> None:
+        self._items: Deque[SSEEvent] = deque()
+        self._maxsize = maxsize
+        self._ready = asyncio.Event()
+        self.dropped = 0
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def put(self, event: SSEEvent) -> bool:
+        """Enqueue ``event``; returns False when it was dropped."""
+        if len(self._items) >= self._maxsize:
+            if event.lossy:
+                self.dropped += 1
+                return False
+            for index, queued in enumerate(self._items):
+                if queued.lossy:
+                    del self._items[index]
+                    self.dropped += 1
+                    break
+        self._items.append(event)
+        self._ready.set()
+        return True
+
+    async def get(self, timeout: float) -> SSEEvent:
+        """Return the next event, raising ``asyncio.TimeoutError`` after ``timeout``."""
+        while not self._items:
+            self._ready.clear()
+            await asyncio.wait_for(self._ready.wait(), timeout=timeout)
+        return self._items.popleft()
 
 
 class EventBus:
@@ -72,7 +136,7 @@ class EventBus:
         """
         self.max_buffer_size = max_buffer_size
         self._buffers: Dict[str, List[SSEEvent]] = {}
-        self._subscribers: Dict[str, List[asyncio.Queue]] = {}
+        self._subscribers: Dict[str, List[_SubscriberQueue]] = {}
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -97,7 +161,7 @@ class EventBus:
             buffer = self._buffers[session_id]
             buffer.append(event)
             if len(buffer) > self.max_buffer_size:
-                self._buffers[session_id] = buffer[-self.max_buffer_size:]
+                self._trim(buffer)
 
             queues = list(self._subscribers.get(session_id, []))
 
@@ -106,22 +170,37 @@ class EventBus:
             if self._loop and self._loop.is_running():
                 self._loop.call_soon_threadsafe(self._safe_put, queue, event)
             else:
-                try:
-                    queue.put_nowait(event)
-                except asyncio.QueueFull:
-                    pass
+                queue.put(event)
+
+    def _trim(self, buffer: List[SSEEvent]) -> None:
+        """Shrink ``buffer`` to ``max_buffer_size``, shedding lossy events first.
+
+        A long streamed answer is hundreds of ``text_delta`` events; evicting
+        strictly oldest-first pushed the attempt's ``attempt.created`` anchor,
+        its ``llm_usage`` and ``attempt_stats`` out of the replay window.
+        """
+        excess = len(buffer) - self.max_buffer_size
+        if excess <= 0:
+            return
+        keep: List[SSEEvent] = []
+        for event in buffer:
+            if excess > 0 and event.lossy:
+                excess -= 1
+                continue
+            keep.append(event)
+        if excess > 0:
+            keep = keep[excess:]
+        buffer[:] = keep
 
     @staticmethod
-    def _safe_put(queue: asyncio.Queue, event: SSEEvent) -> None:
-        """Safely put an event onto a queue.
+    def _safe_put(queue: _SubscriberQueue, event: SSEEvent) -> None:
+        """Deliver an event to one subscriber queue (event-loop thread).
 
         Args:
-            queue: asyncio queue.
+            queue: Subscriber queue.
             event: SSE event.
         """
-        try:
-            queue.put_nowait(event)
-        except asyncio.QueueFull:
+        if not queue.put(event):
             logger.warning("EventBus queue full, dropping %s event for session %s", event.event_type, event.session_id)
 
     def emit(
@@ -154,6 +233,7 @@ class EventBus:
         last_event_id: Optional[str] = None,
         *,
         replay_all: bool = False,
+        since_attempt: Optional[str] = None,
     ) -> List[SSEEvent]:
         """Replay buffered session events for reconnect recovery.
 
@@ -163,12 +243,20 @@ class EventBus:
             replay_all: Return the buffered stream from the beginning when
                 ``last_event_id`` is absent. Used only for active run recovery;
                 completed history is loaded through REST.
+            since_attempt: With ``replay_all``, start the stream at this
+                attempt's ``attempt.created`` event and leave out events
+                stamped with another attempt id. The buffer is per session:
+                without this a follow-up question replayed the previous
+                attempt's ``llm_usage`` / ``attempt_stats`` to a caller that
+                bills whatever arrives on the stream.
 
         Returns:
             List of events that should be replayed.
         """
         with self._lock:
             buffer = self._buffers.get(session_id, [])
+            if replay_all and since_attempt:
+                buffer = self._attempt_window(buffer, since_attempt)
             if not last_event_id:
                 return list(buffer) if replay_all else []  # First connect: history loaded via REST by default.
             found = False
@@ -182,12 +270,33 @@ class EventBus:
                 return list(buffer)
             return result
 
+    @staticmethod
+    def _attempt_window(buffer: List[SSEEvent], attempt_id: str) -> List[SSEEvent]:
+        """Events of ``attempt_id``: from its ``attempt.created`` on, foreign attempts excluded.
+
+        When the anchor itself has left the buffer, every remaining event is
+        newer than it (lossless events are only evicted oldest-first, after
+        every lossy one), so the attempt-id filter alone is enough.
+        """
+        start = 0
+        for index, event in enumerate(buffer):
+            if event.event_type == "attempt.created" and event.data.get("attempt_id") == attempt_id:
+                start = index
+                break
+        else:
+            return [e for e in buffer if e.data.get("attempt_id") == attempt_id]
+        return [
+            e for e in buffer[start:]
+            if e.data.get("attempt_id") in (None, "", attempt_id)
+        ]
+
     async def subscribe(
         self,
         session_id: str,
         last_event_id: Optional[str] = None,
         *,
         replay_all: bool = False,
+        since_attempt: Optional[str] = None,
     ) -> AsyncIterator[SSEEvent]:
         """Subscribe to a session event stream asynchronously.
 
@@ -196,11 +305,12 @@ class EventBus:
             last_event_id: Last event ID received by the client for reconnect recovery.
             replay_all: Replay all buffered events when no last event ID is
                 available. This is opt-in for active run hydration.
+            since_attempt: Limit that replay to one attempt (see ``replay``).
 
         Yields:
             SSEEvent objects.
         """
-        queue: asyncio.Queue[SSEEvent] = asyncio.Queue(maxsize=200)
+        queue = _SubscriberQueue()
 
         with self._lock:
             if session_id not in self._subscribers:
@@ -208,13 +318,15 @@ class EventBus:
             self._subscribers[session_id].append(queue)
 
         try:
-            replay_events = self.replay(session_id, last_event_id, replay_all=replay_all)
+            replay_events = self.replay(
+                session_id, last_event_id, replay_all=replay_all, since_attempt=since_attempt
+            )
             for event in replay_events:
                 yield event
 
             while True:
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    event = await queue.get(timeout=30.0)
                     yield event
                 except asyncio.TimeoutError:
                     yield SSEEvent(

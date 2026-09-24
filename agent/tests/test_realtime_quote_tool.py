@@ -50,7 +50,8 @@ class TestExecute:
         assert out["status"] == "ok"
         assert out["quotes"][0]["symbol"] == "INTC.US"
         assert out["quotes"][0]["name"] == "英特尔"
-        assert out["quotes"][0]["change_pct"] == 0.00252
+        # percent, the same unit as get_market_data's summary.change_pct
+        assert out["quotes"][0]["change_pct"] == 0.252
         assert out["unsupported_non_us"] == ["600036.SH"]
         # bare INTC normalized to INTC.US before the HTTP call
         assert mock_get.call_args[0][0] == ["INTC.US"]

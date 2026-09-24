@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from src.session import tombstone
 from src.session.models import Attempt, Message, Session
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,39 @@ class SessionStore:
     def _attempt_file(self, session_id: str, attempt_id: str) -> Path:
         return self._attempt_dir(session_id, attempt_id) / "attempt.json"
 
+    def is_deleted(self, session_id: str) -> bool:
+        """Whether ``session_id`` carries a deletion tombstone."""
+        return tombstone.is_deleted(session_id, self.base_dir)
+
+    def _writable_dir(self, session_id: str, target_dir: Path) -> bool:
+        """Create ``target_dir`` inside an existing, live session; False to skip the write.
+
+        Writes into a session never recreate its root directory: a missing
+        root means the session was deleted (or never existed), and a
+        tombstoned one is being deleted right now. Intermediate directories
+        below the root are created one level at a time, so a delete racing
+        this call cannot be undone by a ``parents=True`` walk.
+        """
+        session_dir = self._session_dir(session_id)
+        if self.is_deleted(session_id):
+            logger.info("session %s is deleted; write to %s skipped", session_id, target_dir.name)
+            return False
+        if not session_dir.is_dir():
+            logger.info("session %s has no directory; write to %s skipped", session_id, target_dir.name)
+            return False
+        try:
+            relative = target_dir.relative_to(session_dir)
+        except ValueError:
+            return False
+        current = session_dir
+        for part in relative.parts:
+            current = current / part
+            try:
+                current.mkdir(exist_ok=True)
+            except FileNotFoundError:
+                return False
+        return True
+
     # ---- Session CRUD ----
 
     def create_session(self, session: Session) -> Session:
@@ -92,12 +126,15 @@ class SessionStore:
         return Session.from_dict(data)
 
     def update_session(self, session: Session) -> None:
-        """Update a session.
+        """Update a session (skipped once the session is deleted).
 
         Args:
             session: Modified Session instance.
         """
-        self._write_json(self._session_file(session.session_id), session.to_dict())
+        path = self._session_file(session.session_id)
+        if not self._writable_dir(session.session_id, path.parent):
+            return
+        self._write_json(path, session.to_dict())
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a session and all of its data.
@@ -109,6 +146,9 @@ class SessionStore:
             Whether the delete succeeded.
         """
         session_dir = self._session_dir(session_id)
+        if session_dir.is_symlink():
+            session_dir.unlink(missing_ok=True)
+            return True
         if not session_dir.exists():
             return False
         import shutil
@@ -139,18 +179,23 @@ class SessionStore:
 
     # ---- Message Append-Only Log ----
 
-    def append_message(self, message: Message) -> None:
+    def append_message(self, message: Message) -> bool:
         """Append a message to the session JSONL log.
 
         Args:
             message: Message to append.
+
+        Returns:
+            False when the session is deleted / missing and nothing was written.
         """
         path = self._messages_file(message.session_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        if not self._writable_dir(message.session_id, path.parent):
+            return False
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(message.to_dict(), ensure_ascii=False) + "\n")
             f.flush()
             os.fsync(f.fileno())
+        return True
 
     def get_messages(self, session_id: str, limit: int = 100) -> List[Message]:
         """Read all messages for a session.
@@ -190,7 +235,8 @@ class SessionStore:
             The persisted Attempt.
         """
         attempt_dir = self._attempt_dir(attempt.session_id, attempt.attempt_id)
-        attempt_dir.mkdir(parents=True, exist_ok=True)
+        if not self._writable_dir(attempt.session_id, attempt_dir):
+            return attempt
         self._write_json(
             self._attempt_file(attempt.session_id, attempt.attempt_id),
             attempt.to_dict(),
@@ -214,15 +260,15 @@ class SessionStore:
         return Attempt.from_dict(data)
 
     def update_attempt(self, attempt: Attempt) -> None:
-        """Update an execution attempt.
+        """Update an execution attempt (skipped once the session is deleted).
 
         Args:
             attempt: Modified Attempt.
         """
-        self._write_json(
-            self._attempt_file(attempt.session_id, attempt.attempt_id),
-            attempt.to_dict(),
-        )
+        path = self._attempt_file(attempt.session_id, attempt.attempt_id)
+        if not self._writable_dir(attempt.session_id, path.parent):
+            return
+        self._write_json(path, attempt.to_dict())
 
     # ---- IO Helpers ----
 
