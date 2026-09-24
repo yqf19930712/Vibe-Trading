@@ -1953,7 +1953,8 @@ class AgentLoop:
 
                 thinking_text = "".join(thinking_chunks)
                 if thinking_text:
-                    trace.write_text_entry(
+                    _best_effort(
+                        trace.write_text_entry,
                         {"type": "thinking", "iter": current_iter},
                         field="content",
                         value=thinking_text,
@@ -2267,10 +2268,14 @@ class AgentLoop:
         final_reason: str | None = None
         if self._cancel_event.is_set():
             final_reason = "cancelled by user"
-            state_store.mark_failure(run_dir, final_reason)
+            _best_effort(state_store.mark_failure, run_dir, final_reason)
             final_status = "cancelled"
-        elif (run_dir / "artifacts" / "metrics.csv").exists() or final_content:
-            state_store.mark_success(run_dir)
+        elif final_content:
+            # Success means an answer. A metrics.csv left by a backtest is an
+            # artifact, not an answer: a run that produced one but then no
+            # text (empty replies, iterations exhausted) fails with its real
+            # reason instead of passing with a template receipt.
+            _best_effort(state_store.mark_success, run_dir)
             final_status = "success"
             # F1: zero-LLM structural verification. Warnings never flip the
             # success status — they ride attempt_stats / trace / an event so
@@ -2300,7 +2305,7 @@ class AgentLoop:
                 "deadline_exhausted: the attempt's time budget ran out before "
                 f"a final answer (iteration {iteration})"
             )
-            state_store.mark_failure(run_dir, final_reason)
+            _best_effort(state_store.mark_failure, run_dir, final_reason)
             final_status = "failed"
         elif empty_model_response_iter is not None:
             provider = os.getenv("LANGCHAIN_PROVIDER", "openai").strip().lower() or "openai"
@@ -2310,13 +2315,13 @@ class AgentLoop:
                 f"provider={provider} model={model} iteration {empty_model_response_iter} "
                 "returned no content and no tool calls"
             )
-            state_store.mark_failure(run_dir, final_reason)
+            _best_effort(state_store.mark_failure, run_dir, final_reason)
             final_status = "failed"
         else:
             final_reason = (
                 f"reached max iterations ({self.max_iterations}) without final answer"
             )
-            state_store.mark_failure(run_dir, final_reason)
+            _best_effort(state_store.mark_failure, run_dir, final_reason)
             final_status = "failed"
 
         end_event: dict[str, Any] = {
@@ -2327,7 +2332,9 @@ class AgentLoop:
         }
         if final_reason is not None:
             end_event["reason"] = final_reason
-        trace.write(end_event)
+        # Bookkeeping only: a full or read-only disk must not turn an answer
+        # that already exists into a failed attempt.
+        _best_effort(trace.write, end_event)
         self._emit_attempt_stats(
             {"success": "ok", "cancelled": "cancelled"}.get(final_status, "failed"),
             iteration,
@@ -2336,7 +2343,7 @@ class AgentLoop:
             trace,
             reason=final_reason,
         )
-        trace.close()
+        _best_effort(trace.close)
 
         result: dict[str, Any] = {
             "status": final_status,
@@ -2400,14 +2407,20 @@ class AgentLoop:
     def _write_answer_trace(
         trace: TraceWriter, react_trace: list, iteration: int, content: str
     ) -> None:
-        """Record the final answer (``answer`` + assistant ``message`` entries)."""
-        trace.write_text_entry(
+        """Record the final answer (``answer`` + assistant ``message`` entries).
+
+        Best effort: the answer is returned even when the trace cannot be
+        written (full or read-only tenant disk).
+        """
+        _best_effort(
+            trace.write_text_entry,
             {"type": "answer", "iter": iteration},
             field="content",
             value=content,
             offload_kind=f"answer-{iteration}",
         )
-        trace.write_text_entry(
+        _best_effort(
+            trace.write_text_entry,
             {"type": "message", "iter": iteration, "role": "assistant"},
             field="content",
             value=content,
@@ -3033,10 +3046,20 @@ class AgentLoop:
                 return
             summary_timeout = remaining - round_s
         # Save full transcript before compressing next to the active trace.
+        # It is what the summary header and a clipped request point at, so
+        # when it cannot be written (full / read-only disk) nothing is
+        # compressed this turn — the run goes on with the longer context.
         transcript_path = trace.dir_path / f"transcript_{int(_time.time())}.jsonl"
-        with open(transcript_path, "w", encoding="utf-8") as f:
-            for msg in messages:
-                f.write(json.dumps(msg, default=str, ensure_ascii=False) + "\n")
+        try:
+            with open(transcript_path, "w", encoding="utf-8") as f:
+                for msg in messages:
+                    f.write(json.dumps(msg, default=str, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            self._stats["compact_failures"] = self._stats.get("compact_failures", 0) + 1
+            payload = {"iter": iteration, "error": f"transcript write failed: {exc}"[:300]}
+            _best_effort(trace.write, {"type": "compact_failed", **payload})
+            self._emit("compact_failed", payload)
+            return
 
         system_msg = messages[0]
         body = messages[1:]
