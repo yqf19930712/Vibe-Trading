@@ -2300,10 +2300,14 @@ async def session_events(
         replay_all = attempt_status == "running"
 
     async def event_generator():
+        # replay=active hydrates the RUNNING attempt only: the buffer is per
+        # session, and its tail still holds the previous attempt's llm_usage
+        # and attempt_stats, which a billing consumer would count twice.
         async for event in svc.event_bus.subscribe(
             session_id,
             last_event_id=event_id,
             replay_all=replay_all,
+            since_attempt=session.last_attempt_id if replay_all else None,
         ):
             if await request.is_disconnected():
                 break
