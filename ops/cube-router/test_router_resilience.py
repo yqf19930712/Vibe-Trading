@@ -19,8 +19,9 @@ No CubeAPI, no sandbox, no engine: every upstream call is an async fake.
     under a boot-pending fingerprint (adopted if the engine came up with it,
     rebooted otherwise); an engine 401 marks the instance stale, and /ask
     reboots once and retries.
-  · Waiting for a processing slot is bounded (VIBE_ACTIVE_QUEUE_WAIT_S);
-    every 503 busy frame carries code=busy + busy_reason.
+  · Waiting for a processing slot is bounded (VIBE_ACTIVE_QUEUE_WAIT_S, scaled
+    up by the ask budget); every 503 busy frame carries code=busy +
+    busy_reason + retry_after_s.
   · A pause CubeAPI refuses leaves the sandbox counted as RUNNING; eviction
     moves on to the next victim and the reaper retries next sweep.
   · The answer window is anchored at the ask's arrival (queue / cold start /
@@ -847,6 +848,41 @@ class TestAskRebootsOnRejectedKey:
 class TestActiveSlotQueue:
     def _saturate(self, monkeypatch, wait_s):
         monkeypatch.setattr(router, "ACTIVE_QUEUE_WAIT_S", wait_s)
+        monkeypatch.setattr(router, "ACTIVE_QUEUE_BUDGET_RATIO", 0.0)
+
+    def test_queue_wait_grows_with_the_budget(self, monkeypatch):
+        monkeypatch.setattr(router, "ACTIVE_QUEUE_WAIT_S", 120.0)
+        monkeypatch.setattr(router, "ACTIVE_QUEUE_BUDGET_RATIO", 0.2)
+        assert router.active_queue_wait_s(900) == 180.0
+        assert router.active_queue_wait_s(7200) == 1440.0
+        assert router.active_queue_wait_s(300) == 120.0
+        assert router.active_queue_wait_s(60) == 60.0  # never past the budget
+
+    def test_long_budget_ask_waits_past_the_fixed_bound(self, monkeypatch):
+        """A deep_team ask still gets the slot a batch job frees after the
+        fixed bound a standard question gives up at."""
+        h = _AskHarness(monkeypatch)
+        monkeypatch.setattr(router, "ACTIVE_QUEUE_WAIT_S", 0.02)
+        monkeypatch.setattr(router, "ACTIVE_QUEUE_BUDGET_RATIO", 0.001)  # 7200 s → 7.2 s
+
+        async def go():
+            sem = asyncio.Semaphore(1)
+            monkeypatch.setattr(router, "active_sem", sem)
+            await sem.acquire()
+
+            async def release_later():
+                await asyncio.sleep(0.2)
+                sem.release()
+
+            asyncio.create_task(release_later())
+            import json as _json
+
+            body = router.AskBody(uid="u-ask", query="q", intent="deep_team")
+            return [_json.loads(line) async for line in router._ask_stream(body, 7200)]
+
+        frames = _run(go())
+        assert frames[-1]["t"] == "answer"
+        assert frames[-1]["stats"]["router"]["queue_wait_ms"] >= 150
 
     def test_saturated_slots_answer_503_busy_after_the_bound(self, monkeypatch):
         h = _AskHarness(monkeypatch)
@@ -866,6 +902,7 @@ class TestActiveSlotQueue:
         err = frames[0]
         assert err["t"] == "error" and err["status"] == 503
         assert err["code"] == "busy" and err["busy_reason"] == "active_queue_full"
+        assert err["retry_after_s"] == router.BUSY_RETRY_AFTER_S
         assert err["stats"]["router"]["outcome"] == "busy"
         assert err["stats"]["router"]["queue_wait_ms"] >= 40
         assert h.recorded and h.recorded[0]["busy_reason"] == "active_queue_full"
@@ -906,6 +943,7 @@ class TestActiveSlotQueue:
         frames = h.run()
         assert frames[-1]["code"] == "busy" and frames[-1]["busy_reason"] == "instances_full"
         assert frames[-1]["status"] == 503
+        assert frames[-1]["retry_after_s"] == router.BUSY_RETRY_AFTER_S
 
 
 # ── a refused pause is not counted as paused ─────────────────────────────────

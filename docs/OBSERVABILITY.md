@@ -346,7 +346,7 @@ laicai 侧实现在主仓库（桥接 `app/src/server/vibe-trading.ts`、落库 
 
 - `askVibeTrading` 解析终帧 `stats:{router,engine}` 并全路径计时/状态分类（`ok/timeout/busy/engine_error/router_unavailable/connection_failed/empty_answer/not_configured`），每次调用（含失败）落 `deep_engine_runs` 一行；token 列只记引擎 `llm_usage` 实报值（估算兜底只进 `ai_token_usage`，不污染测量口径）。引擎自己在截流时补的估算用量带 `estimated: true`：计入 `ai_token_usage` 照常，要保持 token 列的测量口径就需把它排除在外。
 - `attempt_meta` 帧一到就给 `status=running` 的占位行补上 attempt_id 与会话 id，并以它为本轮 attempt 的归属锚点；laicai 在 router 之外再按 `data.attempt_id` 做一道过滤（第二道防线）。**这道过滤必须对 `llm_usage` 的 `source="swarm_tail"` 开例外**（它带的是上一轮的 attempt_id，router 有意放行，见 §3.3），否则 swarm 尾段的 token 不进用户用量。
-- error 帧：`code=query_too_long` / `query_rejected` 是可处置的拒绝，转述 detail、不说「稍后重试」；`code=busy`（带 `busy_reason`）对应 503；`code=tenant_forgotten`（410）表示账号已注销，不应重试、也不当作引擎故障告警。
+- error 帧：`code=query_too_long` / `query_rejected` 是可处置的拒绝，转述 detail、不说「稍后重试」；`code=busy`（带 `busy_reason` 与 `retry_after_s`）对应 503，批量调用方（作战室计划）应至少隔 `retry_after_s` 按退避重试；`code=tenant_forgotten`（410）表示账号已注销，不应重试、也不当作引擎故障告警。
 - 深度引擎看板 `/app/admin/deep-engine`：30 天请求/成功率/超时率/P50·P95/冷启占比/平均迭代/状态分布 + 分页明细。
 - 调用详情页 `/app/admin/deep-run/$id`（只读 laicai 的 `deep_engine_runs`）：链路瀑布（排队/沙箱就绪/建会话/引擎执行/传输）、引擎内部 LLM vs 工具分解、逐工具耗时错误表、data_fetches/gaps 表、提前收敛徽标。
 - 执行 Trace 页 `/app/admin/deep-trace/$id`：经 `/obs/trace`、`/obs/swarm-events`、`/obs/prompt` 在线读租户 trace、swarm 事件（甘特图）与完整输入 prompt，运行中即可看——大多数排障不需要 SSH；router 调用日志与引擎日志见 §7.3。
@@ -400,7 +400,7 @@ laicai 侧实现在主仓库（桥接 `app/src/server/vibe-trading.ts`、落库 
 
 **launcher env**：`/boot` 时消费、弹出后不进引擎的是 `VIBE_EGRESS_SSH_KEY_B64` / `VIBE_EGRESS_SSH_DEST`（router 下发）、`VIBE_EGRESS_REMOTE`（默认 127.0.0.1:8888，router 不下发，生产只取默认）与 `VIBE_LAUNCHER_AUTH` / `VIBE_LAUNCHER_TOKEN`（router 开了 launcher 鉴权才下发）；launcher 进程启动时从自身 env 读的是 `VIBE_EGRESS_LOCAL_PORT`（默认 8118）与 `VIBE_LAUNCHER_BOOT_TIMEOUT`（默认 120s），生产只取默认。
 
-**router env 增量**（全量见 README_CUSTOM.md）：`VIBE_ASK_LOG`(默认 /var/lib/cube-router/ask_log.jsonl)、`VIBE_EGRESS_KEY_FILE`、`VIBE_EGRESS_SSH_DEST`、`VIBE_SWEEP_STALE_TEMPLATES`(默认 1，回滚模板前置 0)、`VIBE_CUBEMASTERCLI`、`VIBE_ACTIVE_QUEUE_WAIT_S`(120)、`VIBE_POLL_FAIL_MAX_S`(120) / `VIBE_POLL_FAIL_BUDGET_RATIO`(0.05)、`VIBE_PUMP_READ_TIMEOUT_S`(90)、`VIBE_FORGET_TOMBSTONE_S`(2592000) / `VIBE_FORGET_LOCK_WAIT_S`(10)、`VIBE_LAUNCHER_AUTH`(0)、`VIBE_MEMORY_LOCK_TIMEOUT_S`(5)、`VIBE_BYOK_CONTEXT_WINDOW_TOKENS`，以及第一张表的同名覆盖项。
+**router env 增量**（全量见 README_CUSTOM.md）：`VIBE_ASK_LOG`(默认 /var/lib/cube-router/ask_log.jsonl)、`VIBE_EGRESS_KEY_FILE`、`VIBE_EGRESS_SSH_DEST`、`VIBE_SWEEP_STALE_TEMPLATES`(默认 1，回滚模板前置 0)、`VIBE_CUBEMASTERCLI`、`VIBE_ACTIVE_QUEUE_WAIT_S`(120) / `VIBE_ACTIVE_QUEUE_BUDGET_RATIO`(0.2)、`VIBE_BUSY_RETRY_AFTER_S`(30)、`VIBE_POLL_FAIL_MAX_S`(120) / `VIBE_POLL_FAIL_BUDGET_RATIO`(0.05)、`VIBE_PUMP_READ_TIMEOUT_S`(90)、`VIBE_FORGET_TOMBSTONE_S`(2592000) / `VIBE_FORGET_LOCK_WAIT_S`(10)、`VIBE_LAUNCHER_AUTH`(0)、`VIBE_MEMORY_LOCK_TIMEOUT_S`(5)、`VIBE_BYOK_CONTEXT_WINDOW_TOKENS`，以及第一张表的同名覆盖项。
 
 ## 10. 排障手册：按 attempt_id 五步追查
 

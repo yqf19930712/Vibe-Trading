@@ -140,7 +140,8 @@ systemctl daemon-reload && systemctl enable --now cube-router
 | `VIBE_HOST_DATA_ROOT` | | 租户引擎数据在**宿主**上的根目录，默认 `/data/shared/vibe`。每租户一个子目录（名 = tenant_key），建沙箱时 bind-mount 到 `/home/vibe/.vibe-trading`。必须落在 `allowed_host_mount_prefixes` 之内 |
 | `VIBE_MAX_INSTANCES` | | 并发 RUNNING 沙箱上限，默认 3（8G 宿主机的安全值） |
 | `VIBE_MAX_CONCURRENT_ACTIVE` | | 并发 `/ask` 处理上限，默认 2 |
-| `VIBE_ACTIVE_QUEUE_WAIT_S` | | 超出上一项的 `/ask` 排队等处理槽的上限，默认 120（且不超过本问预算）；等不到回 503 busy 帧（`code=busy`、`busy_reason=active_queue_full`），与 RUNNING 满的 503 同形 |
+| `VIBE_ACTIVE_QUEUE_WAIT_S` / `VIBE_ACTIVE_QUEUE_BUDGET_RATIO` | | 超出上一项的 `/ask` 排队等处理槽的上限：`max(VIBE_ACTIVE_QUEUE_WAIT_S, VIBE_ACTIVE_QUEUE_BUDGET_RATIO × 本问预算)`，且不超过本问预算；默认 120 与 0.2（标准问答 900s 预算排 180s，deep_team 7200s 排 1440s）。等不到回 503 busy 帧（`code=busy`、`busy_reason=active_queue_full`），与 RUNNING 满的 503 同形 |
+| `VIBE_BUSY_RETRY_AFTER_S` | | 每个 503 busy 帧带的 `retry_after_s`（建议的最早重试间隔），默认 30 |
 | `VIBE_IDLE_TTL_S` | | 空闲 pause 阈值，默认 1200 |
 | `VIBE_READY_TIMEOUT_S` / `VIBE_POLL_INTERVAL_S` / `VIBE_ASK_TIMEOUT_S` | | 就绪预算 180s / 轮询间隔 3s / 单问默认超时 900s（= `intent=standard` 的预算档，只对不带 `timeoutS` 的调用方生效，见下一行） |
 | `VIBE_SWARM_ASK_TIMEOUT_S` | | `intent=deep_team`（多智能体团队）的预算档，默认 7200。`BUDGET_BY_INTENT` 与下发给租户引擎的 `SWARM_TIMEOUT` env 都从它派生。**但 ask 预算以请求里显式的 `timeoutS` 为准**，而 laicai 现在每次都显式发（缺省按 intent 取 900 / 7200，数值写在 laicai 的 `vibe-trading.ts` 与 `swarm-directive.ts`），ask_log 的 `budget_source` 对 laicai 流量恒为 `explicit`——所以改这两个 `VIBE_*_ASK_TIMEOUT_S` 只改变不带 `timeoutS` 的调用方的预算与引擎的 `SWARM_TIMEOUT`，laicai 流量的 ask 预算不变；要改 laicai 的档位，两边一起改 |

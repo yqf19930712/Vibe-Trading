@@ -186,7 +186,7 @@ stateDiagram-v2
  "stats":{"router":{...分段计时/outcome/attempt_id...},
           "engine":{...引擎 attempt_stats 原文...}}}                 // 成功终帧
 {"t":"error","status":<HTTP 语义码>,"detail":"...","code":"busy","busy_reason":"…",
- "stats":{...}}                                               // 失败终帧（同样带 stats；code / busy_reason 见下）
+ "retry_after_s":30,"stats":{...}}                            // 失败终帧（同样带 stats；code / busy_reason / retry_after_s 见下）
 ```
 
 `attempt_meta` 不是引擎事件：router 发出消息、拿回本轮 `attempt_id` 后立即合成这一帧（建会话失效重建、401 重启重试都在它之前），然后才开始转发引擎事件。`answer_deadline_s` = 从这一帧起到 router 给出答案或 504 的剩余秒数，`engine_deadline_s` = 下发给引擎的 `deadline_s`。laicai 靠它给 `status=running` 的占位行补上 attempt_id 与会话 id（执行 Trace 页运行中就能看），并把它当作本轮 attempt 的归属锚点；消费方按「不认识的 ev 忽略」处理即可向后兼容。
@@ -203,7 +203,7 @@ stateDiagram-v2
 - **引擎 401 自愈**：router 对引擎的任何请求收到 401（引擎被绕过 router 重启过、不再认这把 key）就把实例标成 `stale`；`/ask` 在建会话或发消息时遇到 401，自动以新 key 重启一次引擎再重试（`stats.router.auth_reboot=true`）。已经在跑的 attempt 轮询时遇到 401 则直接 502（那个 attempt 已随旧进程消失）。
 - **会话失效自愈**：`vibeSessionId` 指向的会话在引擎侧 404（沙箱被删除重建、或该会话已被 `/sessions/delete` 删除）→ router 透明新建会话、重发本问，终帧回传**新** `vibeSessionId`，laicai 应重绑线程。上下文丢失但长期记忆仍在（记忆在 `memory/`，不在 session）。
 - 常见错误：401 未鉴权；400 model/llm/intent/swarmPreset 参数非法（HTTP 400，不进流）；流内 error 帧——**400 问题过长**（引擎 pydantic 422 由 router 转译：detail 为「问题过长，请精简后重试（引擎单次输入上限 20000 字符，含注入的持仓上下文）」，`code=query_too_long`；其他 422 原样截 200 字符转 400，`code=query_rejected`——两者都是可处置的拒绝，调用方应转述 detail 而不是原样重试）；**503 忙**（`code=busy`，`busy_reason` ∈ `active_queue_full` 排队等处理槽超时 / `instances_full` RUNNING 沙箱满且无可换出者 / `model_switch` 在途请求持有不同 LLM 指纹）；**410 租户已注销**（`code=tenant_forgotten`，`outcome=forgotten`：墓碑期内的 ask 直接拒绝、不占处理槽、不重建任何东西，调用方不应重试也不应当作引擎故障告警）；502 沙箱创建/resume/引擎 boot 失败、轮询失败超出容忍、引擎进程停止或 key 被拒，或 attempt 以 `failed` 结束（`outcome=engine_failed`）；504 引擎超时。
-- 并发：全局同时处理的 `/ask` 数受 `VIBE_MAX_CONCURRENT_ACTIVE`（信号量）钳制，超出者排队，最多等 `VIBE_ACTIVE_QUEUE_WAIT_S`（120s，且不超过本问预算），等不到回 503 `busy_reason=active_queue_full`。
+- 并发：全局同时处理的 `/ask` 数受 `VIBE_MAX_CONCURRENT_ACTIVE`（信号量）钳制，超出者排队，最多等 `max(VIBE_ACTIVE_QUEUE_WAIT_S, VIBE_ACTIVE_QUEUE_BUDGET_RATIO × 本问预算)`（默认 120s / 0.2，且不超过本问预算：标准问答 180s，deep_team 1440s），等不到回 503 `busy_reason=active_queue_full`。所有 503 busy 帧都带 `retry_after_s`（`VIBE_BUSY_RETRY_AFTER_S`，默认 30）：调用方（例如作战室的批量计划）应至少隔这么久、按退避重试，而不是把这次 busy 记成失败。
 
 ### 3.2 `POST /forget` — 租户注销
 
@@ -322,7 +322,7 @@ flowchart LR
 | 沙箱 writable layer | 4G（模板 `--writable-layer-size`） | 沙箱 rootfs 的可写层，只装引擎代码之外的临时产物（pip 缓存、/tmp）。**租户数据不在这里** |
 | 租户数据目录 | 宿主 `/data/shared/vibe/<tk>`，**无文件系统配额** | 租户全部落盘状态（记忆/会话/trace/上传/runs/logs）在宿主 bind-mount 上，受限于宿主数据盘总容量。`VIBE_TENANT_QUOTA_BYTES`（默认 4G）**只是 `/healthz` / `/tenants/usage` 计算 `pct` 与 `over_watermark` 的分母**，不是 quota——写满不会被拒，直到宿主盘满（引擎侧记忆/索引写盘失败已结构化为工具错误，不杀 attempt）。超 80%（`VIBE_TENANT_WATERMARK`）打 warn 并列进 `over_watermark` tk8 列表；`disk_used_pct` 曝光整盘水位。**目前只曝光不清扫**——router 侧保留清扫未实现（`router.py` 的 `TODO(retention)`），引擎侧的会话保留期默认关闭、未转发（§3.3.1）；单会话删除见 §3.2.1 |
 | RUNNING 沙箱上限 | `VIBE_MAX_INSTANCES`（默认 3；**生产现配 4**，配合 laicai 作战室四份专业报告并行，宿主已加 2G swap） | 8G 宿主机：OS + CubeSandbox 控制面 ≈2.5G，余量 ≈3 个 RUNNING；满则 pause LRU 空闲者（CubeAPI 拒绝暂停的实例计回 RUNNING、换下一个；本轮全被拒则 503），全忙 503。计数含**正在冷启/重挂/resume 的实例**（`booting`，在建沙箱前就占位，`capacity_lock` 串行化「腾位 + 占位」），所以并发冷启与 router 重启后的 state 重挂都不会越过上限；booting 实例不会被 LRU 或 reaper 当空闲 pause 掉 |
-| 并发 `/ask` | `VIBE_MAX_CONCURRENT_ACTIVE`（默认 2；**生产现配 4**） | 信号量排队，最多等 `VIBE_ACTIVE_QUEUE_WAIT_S`（120s），超时 503 busy |
+| 并发 `/ask` | `VIBE_MAX_CONCURRENT_ACTIVE`（默认 2；**生产现配 4**） | 信号量排队，最多等 `max(VIBE_ACTIVE_QUEUE_WAIT_S, VIBE_ACTIVE_QUEUE_BUDGET_RATIO × 本问预算)`（120s / 0.2），超时 503 busy（带 `retry_after_s`） |
 | 空闲 pause | `VIBE_IDLE_TTL_S`（默认 20min） | pause 不占 CPU/内存调度，盘保留 |
 | router 自身 | systemd `MemoryMax=1G` | router 只做编排，不承载引擎负载 |
 

@@ -88,9 +88,21 @@ GUEST_DATA_DIR = "/home/vibe/.vibe-trading"
 GUEST_UID = GUEST_GID = 1000  # the image's `vibe` user
 MAX_RUNNING = int(os.environ.get("VIBE_MAX_INSTANCES", "3"))          # concurrent RUNNING sandboxes
 MAX_CONCURRENT_ACTIVE = int(os.environ.get("VIBE_MAX_CONCURRENT_ACTIVE", "2"))
-# An /ask beyond MAX_CONCURRENT_ACTIVE queues for a slot, at most this long;
-# past it the ask ends with the same 503 busy frame as a full RUNNING cap.
+# An /ask beyond MAX_CONCURRENT_ACTIVE queues for a slot, at most
+# max(ACTIVE_QUEUE_WAIT_S, ACTIVE_QUEUE_BUDGET_RATIO × its budget) (never
+# past the budget itself): a two-hour deep_team waits out a morning batch
+# that a 15-minute question gives up on. Past it the ask ends with the same
+# 503 busy frame as a full RUNNING cap. Every busy frame carries
+# ``retry_after_s`` (BUSY_RETRY_AFTER_S), the earliest sensible retry.
 ACTIVE_QUEUE_WAIT_S = float(os.environ.get("VIBE_ACTIVE_QUEUE_WAIT_S", "120"))
+ACTIVE_QUEUE_BUDGET_RATIO = float(os.environ.get("VIBE_ACTIVE_QUEUE_BUDGET_RATIO", "0.2"))
+BUSY_RETRY_AFTER_S = int(os.environ.get("VIBE_BUSY_RETRY_AFTER_S", "30"))
+
+
+def active_queue_wait_s(timeout_s: float) -> float:
+    """How long an ask with this budget queues for a processing slot."""
+    budget = float(timeout_s)
+    return min(budget, max(ACTIVE_QUEUE_WAIT_S, ACTIVE_QUEUE_BUDGET_RATIO * budget))
 IDLE_TTL_S = int(os.environ.get("VIBE_IDLE_TTL_S", str(20 * 60)))     # pause after idle
 READY_TIMEOUT_S = int(os.environ.get("VIBE_READY_TIMEOUT_S", "180"))  # create+boot budget
 POLL_INTERVAL_S = float(os.environ.get("VIBE_POLL_INTERVAL_S", "3"))
@@ -1572,7 +1584,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
 
     try:
         _check_not_forgotten(tk)
-        async with _active_slot(min(ACTIVE_QUEUE_WAIT_S, float(timeout_s)), stats):
+        async with _active_slot(active_queue_wait_s(timeout_s), stats):
             meta: dict[str, Any] = {}
             try:
                 inst = await get_or_create(tk, body.model, body.llm, meta=meta)
@@ -1741,6 +1753,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
         if isinstance(e, _Busy):
             stats["busy_reason"] = e.busy_reason
             frame["busy_reason"] = e.busy_reason
+            frame["retry_after_s"] = BUSY_RETRY_AFTER_S
         frame["stats"] = {"router": dict(stats), "engine": engine_stats}
         yield _frame(frame)
     except Exception as e:  # noqa: BLE001 - surface as an error frame, not a broken stream
