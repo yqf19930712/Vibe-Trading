@@ -193,13 +193,39 @@ BYOK_PROVIDERS = {
 }
 
 
-def llm_fingerprint(model: Optional[str], llm: Optional["LlmOverride"]) -> Optional[str]:
+# Env names minted afresh on every boot; everything else a tenant engine
+# receives is part of its identity.
+_FP_VOLATILE_ENV = frozenset({"API_AUTH_KEY"})
+
+
+def env_digest(env: dict) -> str:
+    """Short hash over the names and values of a boot env (volatile keys excluded)."""
+    items = sorted((str(k), str(v)) for k, v in env.items() if k not in _FP_VOLATILE_ENV)
+    return hashlib.sha256(json.dumps(items, ensure_ascii=False).encode()).hexdigest()[:16]
+
+
+def llm_fingerprint(
+    model: Optional[str], llm: Optional["LlmOverride"], env: Optional[dict] = None,
+) -> Optional[str]:
+    """Identity of the engine configuration an ask needs.
+
+    ``byok:<sha16>`` / ``builtin:<model>`` / ``default`` names the request's
+    LLM choice; with ``env`` (the boot env from :func:`engine_env`) an
+    ``|env:<sha16>`` digest of every forwarded name and value is appended, so
+    editing router.env (credentials, default model, tier knobs) and
+    restarting the router makes every existing tenant engine reboot on its
+    next ask. Only hashes are stored, never the values.
+    """
     if llm is not None:
         raw = "|".join([llm.provider, llm.model, llm.apiKey, llm.baseUrl])
-        return "byok:" + hashlib.sha256(raw.encode()).hexdigest()[:16]
-    if model:
-        return f"builtin:{model}"
-    return None
+        base: Optional[str] = "byok:" + hashlib.sha256(raw.encode()).hexdigest()[:16]
+    elif model:
+        base = f"builtin:{model}"
+    else:
+        base = None
+    if env is None:
+        return base
+    return f"{base or 'default'}|env:{env_digest(env)}"
 
 
 def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict, str]:
@@ -501,7 +527,6 @@ async def get_or_create(
     tk: str, model: Optional[str] = None, llm: Optional["LlmOverride"] = None,
     meta: Optional[dict] = None,
 ) -> Instance:
-    fp = llm_fingerprint(model, llm)
     t0 = time.monotonic()
     async with pool_mutex:
         lock = uid_locks.setdefault(tk, asyncio.Lock())
@@ -548,6 +573,7 @@ async def get_or_create(
                     meta["cold_start"] = True
                 log.info("tenant %s -> new sandbox %s", tk[:8], inst.sandbox_id[:12])
             env, api_key = engine_env(model, llm)
+            fp = llm_fingerprint(model, llm, env)
             await _ensure_ready(inst, fp, env, api_key, meta=meta)
         except BaseException as exc:
             if fresh:

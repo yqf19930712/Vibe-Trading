@@ -12,6 +12,8 @@ No CubeAPI, no sandbox, no engine: every upstream call is an async fake.
     forwards an event id twice.
   · Only the current attempt's events reach the caller: a continued
     session's replayed llm_usage / attempt_stats are dropped and counted.
+  · The engine fingerprint covers every forwarded router.env name and value
+    (hashed), so an env edit + router restart reboots existing engines.
 """
 from __future__ import annotations
 
@@ -399,3 +401,66 @@ class TestEventAttribution:
         h.events = [{"ev": "attempt.failed", "data": {"attempt_id": "a0", "error": "old"}}]
         frames = h.run()
         assert frames[-1]["t"] == "answer"
+
+
+# ── router.env is part of the engine fingerprint ─────────────────────────────
+
+
+class TestEnvFingerprint:
+    def test_router_env_change_changes_the_fingerprint(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "old-credential-value")
+        env1, key1 = router.engine_env(None, None)
+        env1b, key1b = router.engine_env(None, None)
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "rotated-credential-value")
+        env2, _ = router.engine_env(None, None)
+
+        fp1 = router.llm_fingerprint(None, None, env1)
+        assert key1 != key1b                                 # fresh key per boot …
+        assert fp1 == router.llm_fingerprint(None, None, env1b)  # … not part of identity
+        assert fp1 != router.llm_fingerprint(None, None, env2)
+        assert fp1.startswith("default|env:")
+        assert "credential" not in fp1
+
+    def test_default_model_and_tier_knobs_count_too(self, monkeypatch):
+        base = router.llm_fingerprint(None, None, router.engine_env(None, None)[0])
+        monkeypatch.setenv("LANGCHAIN_MODEL_NAME", "some-other-model")
+        assert router.llm_fingerprint(None, None, router.engine_env(None, None)[0]) != base
+        monkeypatch.delenv("LANGCHAIN_MODEL_NAME")
+        monkeypatch.setenv("VIBE_MAX_ITERATIONS", "30")
+        assert router.llm_fingerprint(None, None, router.engine_env(None, None)[0]) != base
+
+    def test_request_choice_is_still_named(self):
+        llm = router.LlmOverride(provider="deepseek", model="deepseek-chat",
+                                 apiKey="k" * 12, baseUrl="https://api.deepseek.com")
+        env = {"X": "1"}
+        assert router.llm_fingerprint("m1", None, env).startswith("builtin:m1|env:")
+        assert router.llm_fingerprint(None, llm, env).startswith("byok:")
+        # Without env the old shape is kept (callers that only name the choice).
+        assert router.llm_fingerprint(None, None) is None
+        assert router.llm_fingerprint("m1", None) == "builtin:m1"
+
+    def test_instance_from_an_older_fingerprint_is_rebooted(self, monkeypatch):
+        """A state row written before the env digest existed never matches."""
+        booted: list[str] = []
+
+        async def health(inst):
+            return {"launcher": "ok", "engine": "running"}
+
+        async def boot(inst, fp, env, api_key):
+            booted.append(fp)
+            inst.llm_fp, inst.api_key = fp, api_key
+
+        monkeypatch.setattr(router, "_launcher_health", health)
+        monkeypatch.setattr(router, "_boot_engine", boot)
+        env, key = router.engine_env(None, None)
+        fp = router.llm_fingerprint(None, None, env)
+
+        for legacy in (None, "builtin:claude-opus-5"):
+            inst = router.Instance("tk", "sbx", legacy, "old-key")
+            _run(router._ensure_ready(inst, fp, env, key))
+        assert booted == [fp, fp]
+
+        booted.clear()
+        inst = router.Instance("tk", "sbx", fp, "old-key")
+        _run(router._ensure_ready(inst, fp, env, key))
+        assert booted == []
