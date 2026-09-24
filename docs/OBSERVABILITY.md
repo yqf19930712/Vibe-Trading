@@ -191,16 +191,19 @@ budget 的姊妹模块：`AgentLoop.run()` 开头把自己的 `threading.Event` 
 deadline 单向传递链：
 
 ```
-laicai timeoutS（默认 900s）
-  └► router /ask：engine_deadline_s = max(60, timeoutS − 已耗(排队/冷启/建会话) − 10)
-       └► 引擎 POST /sessions/<sid>/messages 的 deadline_s 字段
+laicai timeoutS（laicai 每次显式发：standard 900s / deep_team 7200s；不带时 router 按 intent 推导）
+  └► router /ask：等答案窗口 = 请求到达 + timeoutS（排队、冷启、锁等待都在窗口里）
+       engine_deadline_s = max(60, timeoutS − 已耗(排队/冷启/锁等待) − 10)，在建会话之前算出
+       └► 引擎 POST /sessions/<sid>/messages 的 deadline_s 字段（缺省时租户档按 VIBE_DEFAULT_DEADLINE_S=900 兜底）
             └► SessionService 换算绝对 deadline → budget.bind_deadline → AgentLoop.run(deadline=…)
+                 └► 每次模型调用 stream_chat(timeout=剩余) / 每次工具 cap_timeout(…)
 ```
 
 循环内两级升级（`loop.py`）：
 
 1. **收尾提示**（剩余 < 25% 总预算，**每轮**）：从跌破 25% 起，每次迭代都把 `[SYSTEM] Less than 25% of the time budget remains (~Ns)…` 并入该轮的 `<agent_status>` 状态栏（状态栏用后即弃，所以轨迹里始终只有一条），引导模型收敛、不再开新调查线。独立于「迭代数 80% 收尾提示」——后者按迭代计数，迭代慢时开火太晚。
 2. **强制收敛 early_finalize**（剩余 < max(`VIBE_FINALIZE_RESERVE_S`=60s, 1.2×平均迭代耗时)）：本轮按「最后一轮」处理——工具定义保留、以 `tool_choice=none` 禁止调用来强制出文本，并注入提示要求**基于已有材料立即作答、明确标注未完成/未验证部分**。trace/事件只在首次触发时写一次，提示行随状态栏持续到 run 结束。宁可给部分答案，不让调用方超时拿到空文案。
+3. **模型调用本身受 deadline 约束**：`stream_chat(timeout=…)` 是真正的墙钟预算——每收到一个 chunk 检查一次，到点就关流、返回已流出的部分（`LLMResponse.interrupted="deadline"`），到点之后的传输异常也按截断处理；同时经 `bind(timeout=…)` 收紧 SDK 的请求超时，只收紧、不放宽（基准 `TIMEOUT_SECONDS`）。主循环的取消检查同时看 cancel 与 deadline：被截断的那一轮，已流出的正文作为答案、末尾附「（时间预算耗尽，输出被截断）」（trace `llm_deadline_cut`、`attempt_stats.budget_truncated`），部分工具调用不执行；deadline 之后不再开新一轮（`deadline_exhausted`），此时仍没有任何答案则以 `deadline_exhausted` 失败收口。剩余风险：原生通道在完全没有 chunk 的静默期（首 token 前的预填充）不会轮询检查，思考过程持续流出 thinking delta 时每个 delta 都会触发检查。
 
 router 侧的 `max(60, …)` 下限意味着引擎拿到的 `deadline_s` 永远不少于 60s，哪怕调用方预算已在排队/冷启中耗尽。注意 early_finalize 的判定从**第 2 轮**起才生效（`loop.py` 的 `iteration > 1`——需要先有一轮的平均耗时）：第 1 轮照常跑工具，只是工具窗被 `cap_timeout` 钳到 `_TOOL_CAP_FLOOR_S`=10s 地板；第 2 轮才强制收敛、用剩下的时间出一段部分答案。
 
@@ -217,7 +220,11 @@ router 侧的 `max(60, …)` 下限意味着引擎拿到的 `deadline_s` 永远�
 | 迭代上限 | `VIBE_MAX_ITERATIONS`（引擎默认 50 与上游一致；**router 给 laicai 租户同样下发 50**——swarm 意图的长任务仅数据收集阶段就要 ~20 迭代，墙钟 deadline 才是硬止损） |
 | router 兜底取消 | `/ask` 未拿到答案（504/客户端断开/异常/attempt 以 failed 结束）一律 `POST /sessions/<sid>/cancel`，止住「超时后继续烧 + 拖死同租户重试」。引擎侧取消事件穿透在途工具等待与 swarm 轮询（§3.6），≤1s 内生效，不必等 30 分钟的工具自己回来；对 `intent=deep_team` 同样有效——swarm run 随 attempt 一起被 `cancel_run`，worker 在下一次迭代/重试前停下，不再跑完当前层。ask_log 的 `engine_cancelled` 只在引擎回 `status=cancelled` 时为 true，`engine_cancel_status` 记原始答复（`no_active_loop` / `http_<code>` / `unreachable`） |
 | attempt 准备段失败 | 引擎在 loop 之外失败（`ChatLLM()` 凭据缺失、`build_registry`、run 目录/trace 文件写不进盘）也产出 `status=failed` 结果 + `attempt_stats{status:"error"}`，会话层写同形的 `ok=false` 回执并发 `attempt.failed`；router 在事件流上看到本 attempt 的 `attempt.failed` 即打断答案轮询，以 502 `engine_failed` 收尾而不是等满预算 |
-| 单次输入上限 | 引擎 `SendMessageRequest.content` 20000 字符（含 laicai 注入的持仓上下文）；超限的 422 由 router 转为 400「问题过长」 |
+| 单次输入上限 | 引擎 `SendMessageRequest.content` 20000 字符（含 laicai 注入的持仓上下文）；超限的 422 由 router 转为 400「问题过长」（error 帧 `code=query_too_long`） |
+| L3 摘要 | 剩余不足两轮（`_round_reserve_s` 的两倍）时跳过（trace `compact_skipped{reason:"budget"}`、`attempt_stats.compact_skips`），轨迹保持原长——provider 窗口远大于压缩阈值；否则 `ChatLLM.summarize` 流式、按 chunk 可取消、客户端 `max_retries=0`，只能用「剩余 − 一轮保留量」的时间，摘要被截断按压缩失败降级（`compact_failed`） |
+| goal 续跑 | 研究目标的续跑同样遵守收尾轮与预算：下一轮会越过最后一轮或预算放不下时不再续跑，答案末尾附「（研究目标尚未完成：本次时间预算不足以继续推进。）」（`goal_continuation_suppressed{reason:"budget"}`） |
+| swarm worker | 每次 LLM 调用的超时真正生效（同一套流式截断）；被截断的调用与超出 worker 预算后的失败都按 `timeout` 收口，部分工具调用不执行；上下文估算到 60k 硬上限的 85% 时先收尾写报告（§3.3） |
+| 等答案 | router 轮询答案的截止 = 请求到达 + timeoutS，所以带 stats 的 504 总早于 laicai 的 `timeoutS + 15s`；比引擎 deadline 晚约 10s，引擎先收口 |
 
 ## 5. 数据可靠性
 
@@ -245,7 +252,7 @@ router 侧的 `max(60, …)` 下限意味着引擎拿到的 `deadline_s` 永远�
 
 工具级契约（`src/market_data.py` + `src/tools/market_data_tool.py` + `src/agent/tool_result_store.py`）：
 
-- **每标的紧凑表**：`{"summary": {start, end, rows, first_close, last_close, high, low, change_pct[, total_rows]}, "columns": [...], "rows": [[...], ...]}`——列名只出现一次，日线日期是裸 `YYYY-MM-DD`，数值 4 位小数（`PRICE_DECIMALS`）、整数值的浮点去 `.0`，NaN/inf → null；序列化不带缩进（`dumps_compact`）。被 `max_rows` 裁过的标的另带 `total_rows`/`returned`/`truncated`/`policy`/`hint`。`_unresolved` / `_gaps` 元数据键不变。`summary` 排在最前，是结构化截断时必定保留的部分。
+- **每标的紧凑表**：`{"summary": {start, end, rows, first_close, last_close, high, low, change_pct[, total_rows]}, "columns": [...], "rows": [[...], ...]}`——列名只出现一次，日线日期是裸 `YYYY-MM-DD`，数值 4 位小数（`PRICE_DECIMALS`）、整数值的浮点去 `.0`，NaN/inf → null；序列化不带缩进（`dumps_compact`）。被 `max_rows` 裁过的标的另带 `total_rows`/`returned`/`truncated`/`policy`/`hint`。`_unresolved` / `_gaps` 元数据键不变。`summary` 排在最前，是结构化截断时必定保留的部分；它的首末收盘、涨跌、高低点按降采样**之前**的整个请求区间计算（`summary.rows` 仍是实际返回的行数，`total_rows` 不变），真实高低点落在未采样的 bar 上也不会丢。`change_pct` 是百分数，与 `get_realtime_quotes.change_pct` 同单位（TickFlow 原始值是小数，工具内乘 100）。
 - **默认 `max_rows=120`**（半个交易年的日线），一个标的的默认调用落在 10k 字符的轨迹预算之内（`TOOL_RESULT_LIMIT`），不再每次落盘。更长区间按等步长降采样（末根 bar 钉住），`truncated=true`；`max_rows=0` 取全量（必然落盘）。
 - **参数 schema**：`source` 是 enum，`auto` + `backtest.loaders.registry.VALID_SOURCES` 里注册的全部 loader 名（动态取，registry 导入失败才回退到静态清单）；`interval` 是 enum `1m/5m/15m/30m/1H/4H/1D/1W/1M`（`1D` 全源支持，分钟/小时线 okx/ccxt/tushare/mootdx/futu/yfinance，周/月线 mootdx/futu/akshare）。
 - **超 10k 的结构化预览**：不是盲切字符——每个标的保留 `summary` + 首尾各 20 根 bar（`MARKET_DATA_EDGE_ROWS`；多标的仍超限时收缩到首尾 5 根，再超才退回通用 head+tail 信封），`rows_omitted` 记中段丢弃数，预览本身是合法 JSON，并明说「中段 bar 不是数据源缺失」。全量落盘 `run_dir/tool-results/<iter>-get_market_data-<callid8>.json`，**每根 bar 一行**，`read_file(offset, limit)` 按行翻页即按 bar 翻页、`grep -n <日期>` 直接定位。
@@ -289,11 +296,16 @@ flowchart LR
 | `ts` | 结束时刻（epoch 秒） |
 | `tk8` | tenant_key 前 8 位（全量 key 不落日志） |
 | `channel` / `model` / `timeout_s` | 请求参数 |
-| `outcome` | `ok` / `timeout` / `busy` / `upstream_failed` / `engine_failed`（attempt 以 `failed` 结束，答案帧不发、走 error 帧 502）/ `error`（含 400 问题过长）/ `exception` / `incomplete`（客户端断开） |
+| `outcome` | `ok` / `timeout` / `busy` / `upstream_failed` / `engine_failed`（attempt 以 `failed` 结束，答案帧不发、走 error 帧 502）/ `forgotten`（租户墓碑期内的 ask，410）/ `error`（含 400 问题过长）/ `exception` / `incomplete`（客户端断开） |
 | `intent` / `budget_source` | 结构化意图（`standard`/`deep_team`）与预算来源（`explicit` = 调用方给了 `timeoutS`，`intent` = 由意图推导） |
-| `queue_wait_ms` | 全局并发信号量等待 |
-| `cold_start` / `resumed` / `booted` | 沙箱路径标记 |
-| `sandbox_ready_ms` / `session_ms` / `first_progress_ms` / `total_ms` | 分段计时 |
+| `queue_wait_ms` | 全局并发信号量等待（等到与没等到都记；没等到时 `outcome=busy`、`busy_reason=active_queue_full`） |
+| `busy_reason` | 仅 503 时：`active_queue_full` / `instances_full` / `model_switch` |
+| `cold_start` / `resumed` / `booted` / `boot_adopted` | 沙箱路径标记；`boot_adopted` = 上次没拿到 200 的 `/boot` 其实已生效、经鉴权探测直接采纳 |
+| `lock_wait_ms` | 同租户上一问还在跑时，在租户锁上的等待 |
+| `sandbox_ready_ms` / `session_ms` / `first_progress_ms` / `total_ms` | 分段计时（`first_progress_ms` 只看放行的非心跳事件） |
+| `engine_deadline_s` | 下发给引擎的 `deadline_s` |
+| `session_recovered` / `auth_reboot` | 会话在引擎侧 404 后透明新建 / 引擎 401 后以新 key 重启一次再重试 |
+| `poll_errors` / `pump_reconnects` / `stale_events_dropped` | 失败的答案轮询次数 / 事件流重连次数 / 因不属于本轮 attempt 而丢弃的事件数（都只在非零时出现） |
 | `attempt_id` / `engine_status` / `iterations` | 引擎侧关联与结局 |
 | `engine_cancelled` / `engine_cancel_status` | 未答路径的兜底 cancel：前者仅在引擎确认（`cancelled`）时为 true，后者是引擎对 cancel 的原始答复（`cancelled` / `no_active_loop` / `http_<code>` / `unreachable`）；这一行日志由 cancel 任务在拿到答复后写出 |
 | `error` | 失败详情（截断 300 字符） |
@@ -309,43 +321,44 @@ flowchart LR
           "asks_error": 2, "uptime_s": 15591, "p50_ms": 21276, "p95_ms": 580769, "window": 3}
 ```
 
-p50/p95 只统计成功请求（近 100 次环形窗口）；重启清零——持久口径以 laicai `deep_engine_runs` 为准。`disk` 段（`data_root_bytes` / `quota_bytes` / `watermark` / `tenants_total` / `over_watermark`（tk8 列表）/ `disk_used_pct`）与 `GET /tenants/usage` 的字段见 PRODUCT_DESIGN §3.3。
+顶层与每个 `tenants[]` 另有 `booting`（正在冷启 / 重挂 / resume 的实例，已计入 `running`）。p50/p95 只统计成功请求（近 100 次环形窗口）；重启清零——持久口径以 laicai `deep_engine_runs` 为准。`disk` 段（`data_root_bytes` / `quota_bytes` / `watermark` / `tenants_total` / `over_watermark`（tk8 列表）/ `disk_used_pct`）与 `GET /tenants/usage` 的字段见 PRODUCT_DESIGN §3.3。
 
-### 7.3 只读 `/obs/*` 端点（laicai 详情页在线回读）
+### 7.3 只读 `/obs/*` 端点（在线回读）
 
-五个端点，Bearer 鉴权同源，id 严格正则（`[A-Za-z0-9_-]{4,64}`）防路径穿越，路径经 `_tenant_file()` → `_safe_tenant_path()` 守卫（目标或其任一父级是 symlink、或解析后不在租户目录内 → 当作文件不存在返回空），只读尾部 4MB、单字段裁 600 字符、行数上限，文件读取走 `asyncio.to_thread`：
+五个端点，Bearer 鉴权同源，id 严格正则（`[A-Za-z0-9_-]{4,64}`）防路径穿越，路径经 `_tenant_file()` → `_safe_tenant_path()` 守卫（目标自身是 symlink，或 `resolve()` 之后不在租户目录内——包括父目录是指向外部的 symlink——当作文件不存在返回空；父目录的 symlink 解析后仍在租户目录内则放行），只读尾部 4MB、单字段裁 600 字符、行数上限，文件读取走 `asyncio.to_thread`：
 
 | 端点 | 参数 | 数据源 |
 |---|---|---|
 | `GET /obs/ask-log` | `uid`、`attempt_id?`、`limit≤200` | ask_log.jsonl 按 tk8（由 uid 派生）过滤 |
 | `GET /obs/engine-log` | `uid`、`attempt_id?`、`limit≤2000` | 租户 `logs/engine.jsonl` |
 | `GET /obs/trace` | `uid`、`session_id`、`limit≤2000` | 租户 `sessions/<sid>/trace.jsonl` |
-| `GET /obs/prompt` | `uid`、`session_id` | trace 中各 attempt 的 `start` 事件完整引擎输入 prompt——`/obs/trace` 每字段裁 600 字符，此端点不裁（单 prompt 上限 64KB，最近 20 条），laicai trace 页的调用输入查看器用它 |
+| `GET /obs/prompt` | `uid`、`session_id` | trace 中各 attempt 的 `start` 事件完整引擎输入 prompt——`/obs/trace` 每字段裁 600 字符，此端点不裁（单 prompt 上限 64KB，最近 20 条），laicai 执行 Trace 页的调用输入查看器用它 |
 | `GET /obs/swarm-events` | `uid`、`run_id`、`limit≤2000`、`skip_heartbeats?` | 租户 `.swarm/runs/<run_id>/events.jsonl` 尾读（worker 工具调用/重试/心跳；`skip_heartbeats=1` 先滤心跳再截 limit，保住早期事件；`run_id` 来自 `attempt_stats.swarm_runs[].run_id`） |
+
+laicai 目前只在执行 Trace 页（`/app/admin/deep-trace/$id`）用 `/obs/trace`、`/obs/swarm-events`、`/obs/prompt`；`/obs/ask-log` 与 `/obs/engine-log` 没有页面在用，排障时 curl（`?uid=<laicai userId>&attempt_id=<id>`）或直接读宿主文件。router 的 access log 把查询参数里的 `uid` 改写成 `tk8:<8位>`，原始 userId 不进 journald。
 
 ## 8. laicai 消费端
 
 laicai 侧实现在主仓库（桥接 `app/src/server/vibe-trading.ts`、落库 `deep-engine-runs.ts`、在线回读 `deep-run-debug.ts`、聚合 `ops-analytics.ts`），此处只列契约要点：
 
 - `askVibeTrading` 解析终帧 `stats:{router,engine}` 并全路径计时/状态分类（`ok/timeout/busy/engine_error/router_unavailable/connection_failed/empty_answer/not_configured`），每次调用（含失败）落 `deep_engine_runs` 一行；token 列只记引擎 `llm_usage` 实报值（估算兜底只进 `ai_token_usage`，不污染测量口径）。
-- admin 运营 Tab「深度引擎」Section：30 天请求/成功率/超时率/P50·P95/冷启占比/平均迭代/状态分布 + 最近 10 次明细表。
-- 详情页 `/app/admin/deep-run/$id`：链路瀑布（排队/沙箱就绪/建会话/引擎执行/传输）、引擎内部 LLM vs 工具分解、逐工具耗时错误表、data_fetches/gaps 表、提前收敛徽标，以及经 `/obs/*` 的三个在线面板（Router 调用日志 / 引擎日志 / 执行 Trace）——**排障不需要 SSH**。
+- `attempt_meta` 帧一到就给 `status=running` 的占位行补上 attempt_id 与会话 id，并以它为本轮 attempt 的归属锚点；laicai 在 router 之外再按 `data.attempt_id` 做一道过滤（第二道防线）。**这道过滤必须对 `llm_usage` 的 `source="swarm_tail"` 开例外**（它带的是上一轮的 attempt_id，router 有意放行，见 §3.3），否则 swarm 尾段的 token 不进用户用量。
+- error 帧：`code=query_too_long` / `query_rejected` 是可处置的拒绝，转述 detail、不说「稍后重试」；`code=busy`（带 `busy_reason`）对应 503；`code=tenant_forgotten`（410）表示账号已注销，不应重试、也不当作引擎故障告警。
+- 深度引擎看板 `/app/admin/deep-engine`：30 天请求/成功率/超时率/P50·P95/冷启占比/平均迭代/状态分布 + 分页明细。
+- 调用详情页 `/app/admin/deep-run/$id`（只读 laicai 的 `deep_engine_runs`）：链路瀑布（排队/沙箱就绪/建会话/引擎执行/传输）、引擎内部 LLM vs 工具分解、逐工具耗时错误表、data_fetches/gaps 表、提前收敛徽标。
+- 执行 Trace 页 `/app/admin/deep-trace/$id`：经 `/obs/trace`、`/obs/swarm-events`、`/obs/prompt` 在线读租户 trace、swarm 事件（甘特图）与完整输入 prompt，运行中即可看——大多数排障不需要 SSH；router 调用日志与引擎日志见 §7.3。
 
 ## 9. 环境变量参考
 
-**引擎进程 env**（多租户下由 router `engine_env()` 经 launcher `/boot` 注入；括号内为 router 给 laicai 租户的下发值）：
+**引擎进程 env**。多租户下引擎 env = 镜像 `ENV` + router `engine_env()` 经 launcher `/boot` 下发的部分。router 能送进引擎的只有三类：档位默认值（在 router.env 设同名变量即覆盖）、`FORWARD_ENV` 显式名单、`LANGCHAIN_*` / `VIBE_ANTHROPIC_*` 前缀（减去 LangSmith 拒绝名单）。所以下面分两张表：
+
+**router 可覆盖**（括号内加粗为 router 给 laicai 租户的下发值；改 router.env 后各租户在下一次 `/ask` 重启一次引擎生效）：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `VIBE_LOG_LEVEL` | INFO | 结构化日志级别 |
-| `VIBE_MAX_ITERATIONS` | 50（**50**） | ReAct 迭代上限 |
-| `VIBE_FINALIZE_RESERVE_S` | 60 | 提前收敛的保底剩余秒数 |
-| `VIBE_TRADING_TOOL_TIMEOUT_SECONDS` | 1800（**300**） | 单工具硬超时**默认值**（读写皆适用；写工具按 1× 警告 / 2× 放弃）。声明了 `timeout_seconds` 的工具取二者较大值，另被剩余预算钳制 |
-| `SWARM_TIMEOUT` | 7200（**7200**） | swarm 等待上限（另被剩余预算钳制）。**租户档由 router 的 `VIBE_SWARM_ASK_TIMEOUT_S` 派生下发**，与 `intent=deep_team` 的 ask 预算同源——不要在 router.env 里单独写 `SWARM_TIMEOUT` 再让两者漂移。同时是 `run_swarm` 向循环声明的 `timeout_seconds` 来源（+120s 余量），要收紧 swarm 应改这里而不是调低租户档工具超时 |
-| `VIBE_ALPHA_BENCH_BUDGET_S` | 1800 | alpha_bench 自身总预算；耗尽即停止起新 alpha 并返回部分 IC 表（`budget_exhausted`）。同时是它声明的 `timeout_seconds` 来源（+120s） |
-| `VIBE_BASH_TIMEOUT_S` | 120 | bash 单命令超时（另被剩余预算钳制）；长任务应走 `background_run` |
-| `VIBE_TOOL_CIRCUIT_FAILURE_LIMIT` | 3 | 同一 (工具, 参数) 连续失败几次后熔断该调用；命中写 `tool_circuit_open` |
-| `VIBE_EMPTY_RESPONSE_RETRIES` | 1 | 流成功但返回空 turn 时的就地重试次数（0 = 一次即判败） |
+| `VIBE_MAX_ITERATIONS` | 50（**50**） | ReAct 迭代上限。档位默认值 |
+| `VIBE_TRADING_TOOL_TIMEOUT_SECONDS` | 1800（**300**） | 单工具硬超时**默认值**（读写皆适用；写工具按 1× 警告 / 2× 放弃）。声明了 `timeout_seconds` 的工具取二者较大值，另被剩余预算钳制。档位默认值 |
+| `SWARM_TIMEOUT` | 7200（**7200**） | swarm 等待上限（另被剩余预算钳制）。**租户档由 router 的 `VIBE_SWARM_ASK_TIMEOUT_S` 派生下发**，与 router 按 `intent=deep_team` 推导的 ask 预算同源——不要在 router.env 里单独写 `SWARM_TIMEOUT` 再让两者漂移。注意 laicai 自己显式发 `timeoutS`（7200），改 `VIBE_SWARM_ASK_TIMEOUT_S` 不会改变 laicai 流量的 ask 预算，两边要一起改。同时是 `run_swarm` 向循环声明的 `timeout_seconds` 来源（+120s 余量），要收紧 swarm 应改这里而不是调低租户档工具超时 |
 | `VIBE_LENGTH_CONTINUATIONS` | 2 | `finish_reason=length` 的续写次数（占正常迭代）；用尽或已是最后一轮则答案末尾附「（输出被截断）」 |
 | `VIBE_MAX_OUTPUT_TOKENS` | 无 | 单次回复输出 token 上限，两通道共用；不设则原生 Anthropic 通道 32000、OpenAI 兼容通道**不发上限字段**（由端点自己封顶，截断可续写）。设了以后兼容通道经 `ChatOpenAI` 发出的字段名是 `max_completion_tokens`（langchain-deepseek 原生适配器才是 `max_tokens`），设前要确认目标端点认这个字段。router.env 里设了即原样转发 |
 | `VIBE_ANTHROPIC_MAX_TOKENS` | 无 | 只覆盖原生 Anthropic 通道的上限，优先于 `VIBE_MAX_OUTPUT_TOKENS`。按 `VIBE_ANTHROPIC_*` 前缀转发 |
@@ -355,23 +368,40 @@ laicai 侧实现在主仓库（桥接 `app/src/server/vibe-trading.ts`、落库 
 | `TICKFLOW_BASE_URL` | loader 内置默认 | TickFlow 美股备源的接口根地址。显式转发 |
 | `VIBE_MEMORY_TTL_DAYS` | 无（永不过期） | 长期记忆非 `user` 条目的软过期天数：超期条目退出索引快照与自动召回，文件保留。显式转发 |
 | `TIMEOUT_SECONDS` | 120（**300**） | LLM 流式读超时（httpx）。opus 级长上下文的思考停顿可超 120s，300 能熬过停顿而真死的上游仍在一个 worker 迭代内失败 |
-| `VIBE_TRADING_FETCH_BUDGET_S` | 120 | market_data 单次调用含降级链的总预算 |
-| `VIBE_SOCKET_TIMEOUT_S` | 30 | 阻塞 socket 默认超时兜底 |
-| `TUSHARE_MAX_PER_MIN` | 300 | tushare 进程内节流 |
 | `VIBE_TRADING_DATA_CACHE` | off（**1**） | loader parquet 缓存 |
 | `VIBE_TRADING_SEARCH_BACKENDS` | auto | ddgs 后端列表 |
 | `VIBE_TRADING_ALLOWED_FILE_ROOTS` | 无（**/tmp**） | 文件工具在租户数据根之外额外放行的目录 |
-| `VIBE_TRADING_EGRESS_PROXY` | 无（**http://127.0.0.1:8118**，配了 egress key 才注入） | web_search / read_url / yfinance 专用出境代理（§6） |
+| `VIBE_TRADING_EGRESS_PROXY` | 无（**http://127.0.0.1:8118**，配了 egress key 才注入） | web_search / read_url / yfinance 专用出境代理（§6）。由 router 在配了出境隧道时写死注入，router.env 里设同名变量**不会**覆盖它 |
+| `VIBE_CONTEXT_WINDOW_TOKENS` | 无 | 模型可接受的输入 token（窗口减去输出上限）；设了则压缩阈值封顶为 `窗口 × 0.8 ÷ 实测估算比例 − 工具 schema 体积`（只会压低阈值）。显式转发，**只下发给内置通道**；BYOK 引擎改收 router.env 的 `VIBE_BYOK_CONTEXT_WINDOW_TOKENS`（不设则不下发） |
+| `TOKEN_THRESHOLD` | 40000 | 上下文压缩阈值（估算 token；L1 在其 50% 起剪、L3 在其之上摘要）。显式转发 |
+
+**只能改镜像**（不在转发名单与前缀里，router.env 设了也到不了引擎；要改只能改镜像 `ENV` 或代码）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `VIBE_LOG_LEVEL` | INFO | 结构化日志级别 |
+| `VIBE_FINALIZE_RESERVE_S` | 60 | 提前收敛的保底剩余秒数 |
+| `VIBE_ALPHA_BENCH_BUDGET_S` | 1800 | alpha_bench 自身总预算；耗尽即停止起新 alpha 并返回部分 IC 表（`budget_exhausted`）。同时是它声明的 `timeout_seconds` 来源（+120s） |
+| `VIBE_BASH_TIMEOUT_S` | 120 | bash 单命令超时（另被剩余预算钳制）；长任务应走 `background_run` |
+| `VIBE_TOOL_CIRCUIT_FAILURE_LIMIT` | 3 | 同一 (工具, 参数) 连续失败几次后熔断该调用；命中写 `tool_circuit_open` |
+| `VIBE_EMPTY_RESPONSE_RETRIES` | 1 | 流成功但返回空 turn 时的就地重试次数（0 = 一次即判败） |
+| `VIBE_TRADING_FETCH_BUDGET_S` | 120 | market_data 单次调用含降级链的总预算 |
+| `VIBE_SOCKET_TIMEOUT_S` | 30 | 阻塞 socket 默认超时兜底 |
+| `TUSHARE_MAX_PER_MIN` | 300 | tushare 进程内节流 |
+| `VIBE_DEFAULT_DEADLINE_S` | 租户档 900，单机不设 | messages 请求缺 `deadline_s` 时的兜底墙钟；router 总会带 `deadline_s`，一般用不到 |
+| `VIBE_SESSION_RETENTION_DAYS` / `VIBE_SESSION_RETENTION_DRY_RUN` | 不设（关闭） | 引擎侧会话保留期清扫（PRODUCT_DESIGN §3.3.1）。生产启用须先 dry-run 人工核对，再把这两个名字加进 router 的 `FORWARD_ENV` |
+| `VIBE_TRADING_GOAL_DB_PATH` | `~/.vibe-trading/sessions.db` | GoalStore 的库文件（默认与会话搜索索引同名，见 README_CUSTOM 已知坑） |
+| `VT_*` / `SWARM_*`（`SWARM_TIMEOUT` 除外） | 见 README_CUSTOM | 主循环与 swarm 的流重试 / 心跳 / worker 旋钮 |
 
 以上变量中，凡名字带 `_KEY`/`_TOKEN`/`_SECRET`/`_PASSWORD` 段或 `OPENAI_`/`ANTHROPIC_`/`LANGCHAIN_` 前缀的都**不会**进入 `bash`/`background_run` 子进程；`VIBE_*` 全部透传（`src/tools/subprocess_env.py`）。
 
-**launcher env**（`/boot` 时消费，不进引擎）：`VIBE_EGRESS_SSH_KEY_B64` / `VIBE_EGRESS_SSH_DEST` / `VIBE_EGRESS_REMOTE`(默认 127.0.0.1:8888) / `VIBE_EGRESS_LOCAL_PORT`(默认 8118)。
+**launcher env**：`/boot` 时消费、弹出后不进引擎的是 `VIBE_EGRESS_SSH_KEY_B64` / `VIBE_EGRESS_SSH_DEST`（router 下发）、`VIBE_EGRESS_REMOTE`（默认 127.0.0.1:8888，router 不下发，生产只取默认）与 `VIBE_LAUNCHER_AUTH` / `VIBE_LAUNCHER_TOKEN`（router 开了 launcher 鉴权才下发）；launcher 进程启动时从自身 env 读的是 `VIBE_EGRESS_LOCAL_PORT`（默认 8118）与 `VIBE_LAUNCHER_BOOT_TIMEOUT`（默认 120s），生产只取默认。
 
-**router env 增量**（全量见 README_CUSTOM.md）：`VIBE_ASK_LOG`(默认 /var/lib/cube-router/ask_log.jsonl)、`VIBE_EGRESS_KEY_FILE`、`VIBE_EGRESS_SSH_DEST`、`VIBE_SWEEP_STALE_TEMPLATES`(默认 1，回滚模板前置 0)、`VIBE_CUBEMASTERCLI`，以及上表加粗值的同名覆盖项。
+**router env 增量**（全量见 README_CUSTOM.md）：`VIBE_ASK_LOG`(默认 /var/lib/cube-router/ask_log.jsonl)、`VIBE_EGRESS_KEY_FILE`、`VIBE_EGRESS_SSH_DEST`、`VIBE_SWEEP_STALE_TEMPLATES`(默认 1，回滚模板前置 0)、`VIBE_CUBEMASTERCLI`、`VIBE_ACTIVE_QUEUE_WAIT_S`(120)、`VIBE_POLL_FAIL_MAX`(10) / `VIBE_POLL_FAIL_MAX_S`(120)、`VIBE_PUMP_READ_TIMEOUT_S`(90)、`VIBE_FORGET_TOMBSTONE_S`(2592000) / `VIBE_FORGET_LOCK_WAIT_S`(10)、`VIBE_LAUNCHER_AUTH`(0)、`VIBE_MEMORY_LOCK_TIMEOUT_S`(5)、`VIBE_BYOK_CONTEXT_WINDOW_TOKENS`，以及第一张表的同名覆盖项。
 
 ## 10. 排障手册：按 attempt_id 五步追查
 
-首选路径：admin → 运营 Tab → 深度引擎 → 点最近明细任意一行——详情页已含瀑布图与三个在线日志面板，**通常到此为止**。需要下机器时：
+首选路径：laicai 深度引擎看板 `/app/admin/deep-engine` → 点明细行进调用详情 `/app/admin/deep-run/$id`（瀑布图、逐工具、数据缺失）→ 执行 Trace 页 `/app/admin/deep-trace/$id`（在线 trace、swarm 事件、输入 prompt），多数问题到此为止。router 调用日志与引擎日志没有页面（§7.3 的 curl），需要它们或下机器时：
 
 ```bash
 # ① laicai 生产库拿 attempt_id / 会话 id
@@ -392,4 +422,4 @@ less /data/shared/vibe/$TK/sessions/<vibe_session_id>/trace.jsonl
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8990/healthz | jq .
 ```
 
-常见结论速查：`web_search` 大量 errors → 看 `/health` 的 `egress_tunnel` 与 B 端 tinyproxy；`data_gaps` 带 `rate_limited` → tushare 限频（节流器/积分档位）；`early_finalize=true` 高频 → 预算太紧或迭代太慢，对照瀑布图看时间去向；`outcome=incomplete` → 客户端（laicai）在终帧前断开，`engine_cancelled=true` 表示引擎确认止损生效，false 时看 `engine_cancel_status`（`no_active_loop` = 引擎侧已无在途 attempt，`unreachable` = 沙箱不可达）；`outcome=engine_failed` → 引擎 attempt 自身失败（`error` 里是引擎的 `attempt.error`），去 trace 找 `end` 事件前的最后一个错误；`outcome=error` 且 detail 为「问题过长」→ laicai 注入的持仓上下文 + 问题超过 20000 字符；`/obs/*` 突然返回空而宿主上文件明明在 → 检查该路径或其父目录是否变成了 symlink（守卫按不存在处理）。
+常见结论速查：`web_search` 大量 errors → 看 `/health` 的 `egress_tunnel` 与 B 端 tinyproxy；`data_gaps` 带 `rate_limited` → tushare 限频（节流器/积分档位）；`early_finalize=true` 高频 → 预算太紧或迭代太慢，对照瀑布图看时间去向；`outcome=incomplete` → 客户端（laicai）在终帧前断开，`engine_cancelled=true` 表示引擎确认止损生效，false 时看 `engine_cancel_status`（`no_active_loop` = 引擎侧已无在途 attempt，`unreachable` = 沙箱不可达）；`outcome=engine_failed` → 引擎 attempt 自身失败（`error` 里是引擎的 `attempt.error`），去 trace 找 `end` 事件前的最后一个错误；`outcome=error` 且 detail 为「问题过长」→ laicai 注入的持仓上下文 + 问题超过 20000 字符；`/obs/*` 突然返回空而宿主上文件明明在 → 检查该路径本身是否变成了 symlink，或它（经父目录的链接）解析到了租户目录之外（守卫按不存在处理）；`outcome=forgotten` → 该 uid 已注销、在墓碑期内；`outcome=busy` 看 `busy_reason`（`active_queue_full` 多为并发上限太低，`instances_full` 为 RUNNING 沙箱满，`model_switch` 为同租户在途请求用着另一套 LLM 配置）；`poll_errors` / `pump_reconnects` 偏高 → cube-proxy 或沙箱网络抖动；`stale_events_dropped` 非零属正常（续聊时引擎回放了上一轮的事件，已被过滤）。
