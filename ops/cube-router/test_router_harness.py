@@ -70,6 +70,7 @@ def fake_cube(monkeypatch, tmp_path):
     async def sbx_pause(sandbox_id):
         await asyncio.sleep(0.005)
         calls["pause"].append(sandbox_id)
+        return True
 
     async def sbx_delete(sandbox_id):
         calls["delete"].append(sandbox_id)
