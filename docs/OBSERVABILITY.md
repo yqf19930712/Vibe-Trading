@@ -42,6 +42,7 @@ flowchart LR
 | 引擎 | `<VIBE_DATA_DIR>/sessions/<sid>/trace.jsonl` | 逐事件 trace（含逐工具 `elapsed_ms` 与收口 `attempt_stats`） | 同上 |
 | 引擎 | `<run_dir>/llm_usage.json` | 逐迭代 token 用量 | 同上 |
 | 引擎 | `<VIBE_DATA_DIR>/.swarm/runs/<id>/billed.json` | swarm run 已上报的 token 数（按 run 增量计费的账） | 同上，随 run 目录删除 |
+| 引擎 | `<VIBE_DATA_DIR>/sessions/<sid>/swarm_tail_pending.json` | 结束时会话里没有 attempt 在跑的 swarm 尾段用量，等该会话下一次 attempt 开始时补发（§3.3） | 补发即删；随会话删除 |
 | router | `/var/lib/cube-router/ask_log.jsonl` | 每次 `/ask` 一行：分段计时 + outcome | 20MB 轮转（`.jsonl.1`） |
 | router | 进程内计数器 | asks_total/ok/timeout/busy/error + 近 100 次成功 p50/p95 | 重启清零，`/healthz` 输出 |
 | laicai | `deep_engine_runs` 表 | 每次调用一行（成功/失败/超时都写） | 永久（`user_query` 列另有 laicai 侧保留期） |
@@ -121,6 +122,7 @@ AgentLoop 在 **attempt 结束时**（成功/失败/取消/异常四条路径都
   "offload_failures": 0,    // 工具结果落盘失败次数
   "output_truncations": 1,  // finish_reason=length（输出被 max_tokens 截断）的轮数
   "truncated_tool_calls": 2, // 因截断而拒绝执行的工具调用个数
+  "usage_estimates": 1,     // 用量按估算记账的模型调用数（deadline 截流、厂商用量缺失，§4）
   "budget_truncated": true, // 可选：有一轮模型输出在 attempt deadline 处被截断（§4）
   "token_estimate_ratio": 1.37, // 可选：厂商实报 input_tokens ÷ 同一请求本地估算 的 EMA（测到才出现）
   "background_tasks": [    // 可选：本 attempt 起的后台任务（上限 20 条），status 取 attempt 结束时的现状
@@ -152,7 +154,7 @@ AgentLoop 在 **attempt 结束时**（成功/失败/取消/异常四条路径都
 - `tool_calls_truncated`：`{iter, tools, attempt, max_continuations}` —— 被输出上限截断的那一轮带着工具调用：参数已被截坏，全部不执行，每个调用回 `tool_call_truncated` 结构化错误（提示拆小重发、长文用 `write_file` 的 `mode="append"` 分段写），计入续写次数；轨迹里保留 tool_use / tool_result 配对，超长字符串参数缩为首尾两段；
 - `llm_deadline_cut`：`{iter, chars, discarded_tool_calls}` —— 模型输出流在 attempt deadline 处被截断：已流出的正文成为答案（末尾「（时间预算耗尽，输出被截断）」），部分工具调用丢弃不执行；
 - `deadline_exhausted`：`{iter}` —— deadline 已过、不再开新一轮；此时没有任何答案则 attempt 以 `deadline_exhausted` 失败收口；
-- `compact_skipped`：`{iter, reason, …}` —— `reason=budget`（剩余不足两轮，跳过 L3，带 `remaining_s`）或 `reason=context_small`（模型调 `compact` 时上下文不足阈值一半，带 `tokens`）；
+- `compact_skipped`：`{iter, reason, …}` —— `reason=budget`（剩余不足两轮，跳过 L3，带 `remaining_s`）、`reason=context_small`（模型调 `compact` 时上下文不足阈值一半，带 `tokens`）或 `reason=cooldown`（上一次 L3 重建后仍超阈值，上下文还没长到再压的点，带 `tokens` 与 `rearm_at`，见 PRODUCT_DESIGN §7；不计入 `attempt_stats.compact_skips`）；
 - `goal_continuation_suppressed`：`{iter, goal_id, continuations, reason?|progress?}` —— 研究目标续跑被抑制：`reason=budget` 表示下一轮会越过收尾轮或预算（答案末尾附「研究目标尚未完成」），否则是次数用尽或没有新进展。
 
 既有事件的字段增量：
@@ -160,7 +162,7 @@ AgentLoop 在 **attempt 结束时**（成功/失败/取消/异常四条路径都
 - `compact` 带 `input_messages_dropped` —— L3 摘要输入按 token 预算从**旧端**裁掉的消息条数；
 - swarm 的 `tool_result` 事件 `status` 按 `_is_error_result` 判定，与主循环的 ok/error 双态口径一致；
 - `attempt_stats` 的 `compact_failures` / `offload_failures` 只在非零时出现（落盘失败 = 盘满/只读时工具结果降级为带标记的纯截断）；
-- SSE `llm_usage`：增量 `input_tokens` / `output_tokens`，原生通道另带非零才出现的 `cache_read_tokens` / `cache_creation_tokens`（都包含在 `input_tokens` 之内，不能再相加）。swarm 用量带 `source="swarm"`、按 run 增量上报（`billed.json` 记已报数，续等到终态只报剩余）；attempt 停止等待后仍在跑的 run 由尾段计量线程盯到结束（最长 `SWARM_TIMEOUT + 600s`，run 被删即停），把剩余用量以 `source="swarm_tail"` 报一次——带的是上一轮的 `attempt_id`，router 放行并计入当时在流的 ask；run 结束时没有 ask 在流，这条事件只留在会话缓冲里、不会被后来那一轮的 attempt 窗口回放（它早于那一轮的锚点），这部分用量只记在 §3.1 那行引擎日志里；
+- SSE `llm_usage`：增量 `input_tokens` / `output_tokens`，原生通道另带非零才出现的 `cache_read_tokens` / `cache_creation_tokens`（都包含在 `input_tokens` 之内，不能再相加）。在 deadline 处被截流的那次调用拿不到完整用量时，缺的部分按估算补并带 `estimated: true`（§4），调用方照常累加。swarm 用量带 `source="swarm"`、按 run 增量上报（`billed.json` 记已报数，续等到终态只报剩余）；attempt 停止等待后仍在跑的 run 由尾段计量线程盯到结束（最长 `SWARM_TIMEOUT + 600s`，run 被删即停），把剩余用量以 `source="swarm_tail"` 报一次，带上一轮的 `attempt_id` 与 `tail_key`（`<run_id>:<报后累计 input>:<报后累计 output>`，同一份尾段的稳定名字）。送达由会话决定：会话当时有 attempt 在跑（从 `attempt.started` 到写回执之前）就在它的流上发出，router 放行并计入当时在流的 ask；没有就暂存到会话目录的 `swarm_tail_pending.json`（按 `tail_key` 去重），在该会话下一次 attempt 的 `attempt.started` 之后补发一次，另带 `deferred: true`，取出即删文件（最多补发一次）。之后续等同一个 run 时增量为 0，不会再报。会话此后再无提问，这部分用量只记在 §3.1 那行引擎日志里；
 - swarm worker 事件：`worker_output_truncated` 带 `tool_calls_refused`（被截断的工具调用同样不执行）；`worker_context_wrap_up`（上下文估算超过 60k 硬上限的 85%，注入一次收尾提示，此后只执行 `write_file` / `edit_file`，其余调用回 `context_budget_reached`）；`worker_token_limit` 与 `worker_completed{token_limit:true}`（到达硬上限时 `report.md` 已满足产出契约则按完成收口，否则 `status=token_limit`）；`worker_text` 按 0.5s 或 2000 字符批量发送，而不是每个 token 一条。
 
 ### 3.4 fetch_stats 收集器（`src/core/fetch_stats.py`）
@@ -181,7 +183,8 @@ budget 的姊妹模块：`AgentLoop.run()` 开头把自己的 `threading.Event` 
 
 ### 3.7 事件流：回放范围与有损队列（`src/session/events.py`）
 
-- 每个会话一个事件缓冲（500 条）。`GET /sessions/<sid>/events?replay=active` 在会话最后一个 attempt 仍在跑时只回放**该 attempt** 的窗口：从它的 `attempt.created` 起，剔除带其他 `attempt_id` 的事件（锚点已被挤出缓冲时退化为按 `attempt_id` 过滤）；attempt 窗口里保留锚点之后到达的 `swarm_tail` 用量。带 `Last-Event-ID` 重连时回放该 id 之后的事件，该 id 已出缓冲就回放整个 attempt 窗口——调用方按事件 id 去重（router 与上游前端都已去重）。
+- 事件 id 为 `<epoch>-<seq>`：epoch 是每个引擎进程随机取的 8 位十六进制，seq 在同一进程内按发布顺序严格递增（跨会话共用一个计数器）。编号与投递订阅队列在同一把锁里完成，所以每个订阅者都按 id 顺序收到事件；订阅时的回放快照与登记队列也在同一把锁里，回放与实时部分不会重复。
+- 每个会话一个事件缓冲（500 条）。`GET /sessions/<sid>/events?replay=active` 在会话最后一个 attempt 仍在跑时只回放**该 attempt** 的窗口：从它的 `attempt.created` 起，剔除带其他 `attempt_id` 的事件；锚点已被挤出缓冲时退化为按 `attempt_id` 过滤。两种情况都保留缓冲里的 `swarm_tail` 用量：窗口内的晚于锚点；锚点被挤出时，留在缓冲里的不可丢事件都晚于它。带 `Last-Event-ID` 重连时，本进程签发的 id 从它之后续传，即使该事件已被挤出缓冲；其他 id（上一个引擎进程的、附加转发帧的）在缓冲里找，找不到就回放整个 attempt 窗口。调用方按事件 id 去重：router 用高水位（PRODUCT_DESIGN §3.1「事件流断线续传」），上游前端按 id 集合。
 - 可丢事件只有流式增量：`text_delta`、`tool_progress`、`elapsed_s`、`heartbeat` 与 `swarm.event(worker_text)`。订阅队列满时新来的可丢事件直接丢，新来的不可丢事件挤掉最旧的一条可丢事件，队列里全是不可丢事件时允许超过上限；缓冲超限时同样先淘汰可丢事件。`llm_usage`、`attempt_stats`、`attempt.*` 永不丢。
 
 ## 4. 预算体系与提前收敛
@@ -203,7 +206,7 @@ laicai timeoutS（laicai 每次显式发：standard 900s / deep_team 7200s；不
 
 1. **收尾提示**（剩余 < 25% 总预算，**每轮**）：从跌破 25% 起，每次迭代都把 `[SYSTEM] Less than 25% of the time budget remains (~Ns)…` 并入该轮的 `<agent_status>` 状态栏（状态栏用后即弃，所以轨迹里始终只有一条），引导模型收敛、不再开新调查线。独立于「迭代数 80% 收尾提示」——后者按迭代计数，迭代慢时开火太晚。
 2. **强制收敛 early_finalize**（剩余 < max(`VIBE_FINALIZE_RESERVE_S`=60s, 1.2×平均迭代耗时)）：本轮按「最后一轮」处理——工具定义保留、以 `tool_choice=none` 禁止调用来强制出文本，并注入提示要求**基于已有材料立即作答、明确标注未完成/未验证部分**。trace/事件只在首次触发时写一次，提示行随状态栏持续到 run 结束。宁可给部分答案，不让调用方超时拿到空文案。
-3. **模型调用本身受 deadline 约束**：`stream_chat(timeout=…)` 是真正的墙钟预算——每收到一个 chunk 检查一次，到点就关流、返回已流出的部分（`LLMResponse.interrupted="deadline"`），到点之后的传输异常也按截断处理；同时经 `bind(timeout=…)` 收紧 SDK 的请求超时，只收紧、不放宽（基准 `TIMEOUT_SECONDS`）。主循环的取消检查同时看 cancel 与 deadline：被截断的那一轮，已流出的正文作为答案、末尾附「（时间预算耗尽，输出被截断）」（trace `llm_deadline_cut`、`attempt_stats.budget_truncated`），部分工具调用不执行；deadline 之后不再开新一轮（`deadline_exhausted`），此时仍没有任何答案则以 `deadline_exhausted` 失败收口。剩余风险：原生通道在完全没有 chunk 的静默期（首 token 前的预填充）不会轮询检查，思考过程持续流出 thinking delta 时每个 delta 都会触发检查。
+3. **模型调用本身受 deadline 约束**：`stream_chat(timeout=…)` 是真正的墙钟预算——每收到一个 chunk 检查一次，到点就关流、返回已流出的部分（`LLMResponse.interrupted="deadline"`），到点之后的传输异常也按截断处理；同时经 `bind(timeout=…)` 收紧 SDK 的请求超时，只收紧、不放宽（基准 `TIMEOUT_SECONDS`）。主循环的取消检查同时看 cancel 与 deadline：被截断的那一轮，已流出的正文作为答案、末尾附「（时间预算耗尽，输出被截断）」（trace `llm_deadline_cut`、`attempt_stats.budget_truncated`），部分工具调用不执行。这次调用照样记账：截流后通常拿不到完整用量（OpenAI 兼容通道的用量在最后一个 chunk，原生通道只有 `message_start` 带的 input），缺的部分按估算补——input 取本轮请求的本地估算、output 取已流出的正文 + 思考 + 工具参数的估算，两者都乘本 attempt 实测的估算比例，且不低于厂商已报的值；这条 `llm_usage` 带 `estimated: true`，`llm_usage.json` 的对应迭代同样标记，`attempt_stats.usage_estimates` 计数；deadline 之后不再开新一轮（`deadline_exhausted`），此时仍没有任何答案则以 `deadline_exhausted` 失败收口。剩余风险：原生通道在完全没有 chunk 的静默期（首 token 前的预填充）不会轮询检查，思考过程持续流出 thinking delta 时每个 delta 都会触发检查。
 
 router 侧的 `max(60, …)` 下限意味着引擎拿到的 `deadline_s` 永远不少于 60s，哪怕调用方预算已在排队/冷启中耗尽。注意 early_finalize 的判定从**第 2 轮**起才生效（`loop.py` 的 `iteration > 1`——需要先有一轮的平均耗时）：第 1 轮照常跑工具，只是工具窗被 `cap_timeout` 钳到 `_TOOL_CAP_FLOOR_S`=10s 地板；第 2 轮才强制收敛、用剩下的时间出一段部分答案。
 
@@ -341,9 +344,9 @@ laicai 目前只在执行 Trace 页（`/app/admin/deep-trace/$id`）用 `/obs/tr
 
 laicai 侧实现在主仓库（桥接 `app/src/server/vibe-trading.ts`、落库 `deep-engine-runs.ts`、在线回读 `deep-run-debug.ts`、聚合 `ops-analytics.ts`），此处只列契约要点：
 
-- `askVibeTrading` 解析终帧 `stats:{router,engine}` 并全路径计时/状态分类（`ok/timeout/busy/engine_error/router_unavailable/connection_failed/empty_answer/not_configured`），每次调用（含失败）落 `deep_engine_runs` 一行；token 列只记引擎 `llm_usage` 实报值（估算兜底只进 `ai_token_usage`，不污染测量口径）。
+- `askVibeTrading` 解析终帧 `stats:{router,engine}` 并全路径计时/状态分类（`ok/timeout/busy/engine_error/router_unavailable/connection_failed/empty_answer/not_configured`），每次调用（含失败）落 `deep_engine_runs` 一行；token 列只记引擎 `llm_usage` 实报值（估算兜底只进 `ai_token_usage`，不污染测量口径）。引擎自己在截流时补的估算用量带 `estimated: true`：计入 `ai_token_usage` 照常，要保持 token 列的测量口径就需把它排除在外。
 - `attempt_meta` 帧一到就给 `status=running` 的占位行补上 attempt_id 与会话 id，并以它为本轮 attempt 的归属锚点；laicai 在 router 之外再按 `data.attempt_id` 做一道过滤（第二道防线）。**这道过滤必须对 `llm_usage` 的 `source="swarm_tail"` 开例外**（它带的是上一轮的 attempt_id，router 有意放行，见 §3.3），否则 swarm 尾段的 token 不进用户用量。
-- error 帧：`code=query_too_long` / `query_rejected` 是可处置的拒绝，转述 detail、不说「稍后重试」；`code=busy`（带 `busy_reason`）对应 503；`code=tenant_forgotten`（410）表示账号已注销，不应重试、也不当作引擎故障告警。
+- error 帧：`code=query_too_long` / `query_rejected` 是可处置的拒绝，转述 detail、不说「稍后重试」；`code=busy`（带 `busy_reason` 与 `retry_after_s`）对应 503，批量调用方（作战室计划）应至少隔 `retry_after_s` 按退避重试；`code=tenant_forgotten`（410）表示账号已注销，不应重试、也不当作引擎故障告警。
 - 深度引擎看板 `/app/admin/deep-engine`：30 天请求/成功率/超时率/P50·P95/冷启占比/平均迭代/状态分布 + 分页明细。
 - 调用详情页 `/app/admin/deep-run/$id`（只读 laicai 的 `deep_engine_runs`）：链路瀑布（排队/沙箱就绪/建会话/引擎执行/传输）、引擎内部 LLM vs 工具分解、逐工具耗时错误表、data_fetches/gaps 表、提前收敛徽标。
 - 执行 Trace 页 `/app/admin/deep-trace/$id`：经 `/obs/trace`、`/obs/swarm-events`、`/obs/prompt` 在线读租户 trace、swarm 事件（甘特图）与完整输入 prompt，运行中即可看——大多数排障不需要 SSH；router 调用日志与引擎日志见 §7.3。
@@ -397,7 +400,7 @@ laicai 侧实现在主仓库（桥接 `app/src/server/vibe-trading.ts`、落库 
 
 **launcher env**：`/boot` 时消费、弹出后不进引擎的是 `VIBE_EGRESS_SSH_KEY_B64` / `VIBE_EGRESS_SSH_DEST`（router 下发）、`VIBE_EGRESS_REMOTE`（默认 127.0.0.1:8888，router 不下发，生产只取默认）与 `VIBE_LAUNCHER_AUTH` / `VIBE_LAUNCHER_TOKEN`（router 开了 launcher 鉴权才下发）；launcher 进程启动时从自身 env 读的是 `VIBE_EGRESS_LOCAL_PORT`（默认 8118）与 `VIBE_LAUNCHER_BOOT_TIMEOUT`（默认 120s），生产只取默认。
 
-**router env 增量**（全量见 README_CUSTOM.md）：`VIBE_ASK_LOG`(默认 /var/lib/cube-router/ask_log.jsonl)、`VIBE_EGRESS_KEY_FILE`、`VIBE_EGRESS_SSH_DEST`、`VIBE_SWEEP_STALE_TEMPLATES`(默认 1，回滚模板前置 0)、`VIBE_CUBEMASTERCLI`、`VIBE_ACTIVE_QUEUE_WAIT_S`(120)、`VIBE_POLL_FAIL_MAX`(10) / `VIBE_POLL_FAIL_MAX_S`(120)、`VIBE_PUMP_READ_TIMEOUT_S`(90)、`VIBE_FORGET_TOMBSTONE_S`(2592000) / `VIBE_FORGET_LOCK_WAIT_S`(10)、`VIBE_LAUNCHER_AUTH`(0)、`VIBE_MEMORY_LOCK_TIMEOUT_S`(5)、`VIBE_BYOK_CONTEXT_WINDOW_TOKENS`，以及第一张表的同名覆盖项。
+**router env 增量**（全量见 README_CUSTOM.md）：`VIBE_ASK_LOG`(默认 /var/lib/cube-router/ask_log.jsonl)、`VIBE_EGRESS_KEY_FILE`、`VIBE_EGRESS_SSH_DEST`、`VIBE_SWEEP_STALE_TEMPLATES`(默认 1，回滚模板前置 0)、`VIBE_CUBEMASTERCLI`、`VIBE_ACTIVE_QUEUE_WAIT_S`(120) / `VIBE_ACTIVE_QUEUE_BUDGET_RATIO`(0.2)、`VIBE_BUSY_RETRY_AFTER_S`(30)、`VIBE_POLL_FAIL_MAX_S`(120) / `VIBE_POLL_FAIL_BUDGET_RATIO`(0.05)、`VIBE_PUMP_READ_TIMEOUT_S`(90)、`VIBE_FORGET_TOMBSTONE_S`(2592000) / `VIBE_FORGET_LOCK_WAIT_S`(10)、`VIBE_LAUNCHER_AUTH`(0)、`VIBE_MEMORY_LOCK_TIMEOUT_S`(5)、`VIBE_BYOK_CONTEXT_WINDOW_TOKENS`，以及第一张表的同名覆盖项。
 
 ## 10. 排障手册：按 attempt_id 五步追查
 

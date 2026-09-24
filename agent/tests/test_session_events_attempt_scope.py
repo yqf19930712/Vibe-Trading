@@ -109,13 +109,15 @@ def test_swarm_tail_usage_after_the_anchor_is_replayed() -> None:
     assert early_tail not in replayed
 
 
-def test_swarm_tail_is_left_out_when_the_anchor_is_gone() -> None:
+def test_swarm_tail_is_kept_when_the_anchor_is_gone() -> None:
+    """Lossless events leave the buffer oldest-first: whatever outlived the
+    anchor, the tail included, was published after it."""
     bus = EventBus(max_buffer_size=4)
     bus.emit("s", "attempt.created", {"attempt_id": "B"})
-    bus.emit("s", "llm_usage", {"input_tokens": 7, "source": "swarm_tail", "attempt_id": "A"})
+    tail = bus.emit("s", "llm_usage", {"input_tokens": 7, "source": "swarm_tail", "attempt_id": "A"})
     kept = [bus.emit("s", "tool_call", {"i": i, "attempt_id": "B"}) for i in range(3)]
 
-    assert bus.replay("s", replay_all=True, since_attempt="B") == kept
+    assert bus.replay("s", replay_all=True, since_attempt="B") == [tail, *kept]
 
 
 def test_reconnect_with_an_evicted_id_replays_the_attempt_window() -> None:

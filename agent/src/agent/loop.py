@@ -346,6 +346,15 @@ CONTEXT_WINDOW_SAFETY = 0.8
 # Lowest threshold the window cap may produce (below it Layer 3 would fire
 # on every turn).
 _MIN_EFFECTIVE_THRESHOLD = 4000
+# Layer 3 cooldown. A window-capped threshold can sit below what a rebuilt
+# trajectory needs (system prompt + summary + pinned request + protected
+# tail); summarising again on the next turn would produce the same size at
+# the cost of one more model call every turn. When the rebuild is still
+# above the threshold, Layer 3 next fires only once the context has grown by
+# this share of the threshold past the rebuilt size — and, with the window
+# cap on, no later than ``threshold / CONTEXT_WINDOW_SAFETY`` (the window the
+# cap keeps its reserve from).
+L3_REGROW_RATIO = 0.25
 
 logger = logging.getLogger(__name__)
 
@@ -425,13 +434,56 @@ def _new_llm_usage_summary(llm: Any) -> dict[str, Any]:
     }
 
 
+def _deadline_cut_usage(
+    usage: Any, response: Any, sent_estimate: int, ratio: Optional[float]
+) -> tuple[Any, bool]:
+    """Usage to bill for a model call cut off at the attempt deadline.
+
+    A cut stream rarely carries complete usage: OpenAI-compatible channels
+    send it in the last chunk (never received), the native Anthropic channel
+    only has ``message_start``'s input count. What the provider did not
+    report is estimated — input from this request's estimate, output from
+    what was streamed (text, reasoning, tool-call arguments), both scaled by
+    the attempt's measured real/estimate ratio — and never below what it did
+    report. Returns ``(usage, estimated)``; ``usage`` is unchanged when the
+    report was already complete.
+    """
+    reported = _normalize_llm_usage(usage) or {}
+    scale = ratio or 1.0
+    streamed = [getattr(response, "content", None) or "", getattr(response, "reasoning_content", None) or ""]
+    for call in getattr(response, "tool_calls", None) or []:
+        try:
+            streamed.append(json.dumps(getattr(call, "arguments", None), ensure_ascii=False, default=str))
+        except (TypeError, ValueError):
+            pass
+    est_in = int(max(0, sent_estimate) * scale)
+    est_out = int(estimate_text_tokens("".join(streamed)) * scale)
+    reported_in = reported.get("input_tokens", 0)
+    reported_out = reported.get("output_tokens", 0)
+    input_tokens = reported_in or est_in
+    output_tokens = max(reported_out, est_out)
+    if input_tokens == reported_in and output_tokens == reported_out:
+        return usage, False
+    filled: dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+    details = usage.get("input_token_details") if isinstance(usage, dict) else None
+    if isinstance(details, dict):
+        filled["input_token_details"] = details
+    return filled, True
+
+
 def _record_llm_usage(
     run_dir: Path,
     summary: dict[str, Any],
     usage: Any,
     iteration: int,
+    *,
+    estimated: bool = False,
 ) -> dict[str, int] | None:
-    """Accumulate and persist one provider-reported usage event."""
+    """Accumulate and persist one usage event (``estimated``: see ``_deadline_cut_usage``)."""
     normalized = _normalize_llm_usage(usage)
     if normalized is None:
         return None
@@ -444,7 +496,11 @@ def _record_llm_usage(
     for _source_key, out_key in _CACHE_USAGE_FIELDS:
         if normalized.get(out_key):
             totals[out_key] = int(totals.get(out_key) or 0) + normalized[out_key]
-    summary.setdefault("per_iteration", []).append({"iter": iteration, **normalized})
+    entry: dict[str, Any] = {"iter": iteration, **normalized}
+    if estimated:
+        entry["estimated"] = True
+        totals["estimated_calls"] = int(totals.get("estimated_calls") or 0) + 1
+    summary.setdefault("per_iteration", []).append(entry)
     summary["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     try:
@@ -1444,6 +1500,9 @@ class AgentLoop:
         self._microcompact_state: Dict[str, Any] = {}
         # Layer 2 fold-boundary state (stride batching), reset by Layer 3.
         self._collapse_state: Dict[str, Any] = {}
+        # Size of the last Layer 3 rebuild when it stayed above the
+        # threshold (None otherwise); see L3_REGROW_RATIO.
+        self._l3_floor: Optional[int] = None
         # Provider input_tokens / local estimate, EMA over the attempt (None
         # until a call reported usage), and the tool schemas' estimate.
         self._token_ratio: Optional[float] = None
@@ -1530,6 +1589,7 @@ class AgentLoop:
         self._grounding_results = []
         self._microcompact_state = {}
         self._collapse_state = {}
+        self._l3_floor = None
         self._token_ratio = None
         self._tools_tokens = None
         self._consecutive_failures = {}
@@ -1680,9 +1740,21 @@ class AgentLoop:
                     tokens = estimate_tokens(messages, count_reasoning=count_reasoning)
 
                 # Layer 3: auto_compact (token threshold exceeded)
-                if tokens > threshold:
-                    logger.info(f"Auto compact triggered: {tokens} tokens > {threshold}")
+                l3_trigger = self._l3_trigger(threshold)
+                if tokens > l3_trigger:
+                    logger.info(f"Auto compact triggered: {tokens} tokens > {l3_trigger}")
                     self._auto_compact(messages, run_dir, trace, iteration=current_iter)
+                elif tokens > threshold:
+                    _best_effort(
+                        trace.write,
+                        {
+                            "type": "compact_skipped",
+                            "iter": current_iter,
+                            "reason": "cooldown",
+                            "tokens": tokens,
+                            "rearm_at": l3_trigger,
+                        },
+                    )
 
                 logger.info(f"ReAct iteration {iteration}/{self.max_iterations}")
 
@@ -1911,22 +1983,29 @@ class AgentLoop:
                     break
 
                 usage = getattr(response, "usage_metadata", None)
+                usage_estimated = False
+                if getattr(response, "interrupted", None):
+                    # Cut at the deadline (a cancel ended the run above): the
+                    # provider still charges the call, usually without having
+                    # sent the usage block.
+                    usage, usage_estimated = _deadline_cut_usage(
+                        usage, response, sent_estimate, self._token_ratio
+                    )
                 usage_delta = _record_llm_usage(
                     run_dir,
                     llm_usage_summary,
                     usage,
                     current_iter,
+                    estimated=usage_estimated,
                 )
                 if usage_delta and not getattr(response, "interrupted", None):
                     self._observe_token_ratio(usage_delta.get("input_tokens", 0), sent_estimate)
                 if usage_delta:
-                    self._emit(
-                        "llm_usage",
-                        {
-                            **usage_delta,
-                            "iter": current_iter,
-                        },
-                    )
+                    usage_event: Dict[str, Any] = {**usage_delta, "iter": current_iter}
+                    if usage_estimated:
+                        usage_event["estimated"] = True
+                        self._stats["usage_estimates"] = self._stats.get("usage_estimates", 0) + 1
+                    self._emit("llm_usage", usage_event)
                 if active_goal_id and session_id:
                     token_delta = int(usage_delta.get("total_tokens") or 0) if usage_delta else 0
                     turn_delta = 0 if goal_turn_accounted else 1
@@ -2388,6 +2467,16 @@ class AgentLoop:
             threshold = max(_MIN_EFFECTIVE_THRESHOLD, min(threshold, cap))
         return threshold
 
+    def _l3_trigger(self, threshold: int) -> int:
+        """Context size above which Layer 3 runs this turn (see L3_REGROW_RATIO)."""
+        floor = self._l3_floor
+        if floor is None or floor <= threshold:
+            return threshold
+        trigger = floor + int(threshold * L3_REGROW_RATIO)
+        if CONTEXT_WINDOW_TOKENS > 0:
+            trigger = min(trigger, int(threshold / CONTEXT_WINDOW_SAFETY))
+        return max(threshold, trigger)
+
     def _observe_token_ratio(self, real_input_tokens: int, estimate: int) -> None:
         """Fold one (provider input_tokens, local estimate) pair into the EMA.
 
@@ -2505,14 +2594,16 @@ class AgentLoop:
             stats["verify_warnings"] = self._stats["verify_warnings"]
         # Degradation counters (only present when non-zero): L3 summary call
         # failures, oversized-result offload failures, replies cut by the
-        # output ceiling and the tool calls refused because of it; counted
-        # into _stats and emitted here.
+        # output ceiling and the tool calls refused because of it, model
+        # calls whose usage was estimated (cut at the deadline); counted into
+        # _stats and emitted here.
         for counter in (
             "compact_failures",
             "compact_skips",
             "offload_failures",
             "output_truncations",
             "truncated_tool_calls",
+            "usage_estimates",
         ):
             if self._stats.get(counter):
                 stats[counter] = int(self._stats[counter])
@@ -3240,6 +3331,9 @@ class AgentLoop:
         # The rebuilt list starts a new fold / prune history.
         self._collapse_state = {}
         self._microcompact_state = {}
+        # Still above the threshold: hold Layer 3 until the context grows.
+        rebuilt = estimate_tokens(messages, count_reasoning=count_reasoning)
+        self._l3_floor = rebuilt if rebuilt > self._effective_threshold() else None
 
         # The duplicate-call guard keys on the tool-result
         # message OBJECT. Results compressed into the summary are gone from

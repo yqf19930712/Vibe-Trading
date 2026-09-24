@@ -307,6 +307,80 @@ def test_turn_cut_at_deadline_keeps_the_streamed_text(tmp_path: Path) -> None:
     assert any(e.get("type") == "answer" for e in trace)
 
 
+def _usage_events(events: list) -> list[dict]:
+    return [d for ev, d in events if ev == "llm_usage"]
+
+
+def test_cut_turn_without_usage_bills_an_estimate(tmp_path: Path) -> None:
+    """OpenAI-compatible channels send usage in the last chunk, which a cut
+    stream never receives: the call is billed from the estimates."""
+    from src.core.token_estimate import estimate_text_tokens
+
+    partial = "这是被截断的长答案。" * 200
+    llm = _BudgetLLM([LLMResponse(content=partial, interrupted="deadline")])
+    agent, events = _loop(llm, tmp_path)
+
+    agent.run("q", deadline=time.monotonic() + 600)
+
+    usage = _usage_events(events)
+    assert len(usage) == 1 and usage[0]["estimated"] is True
+    assert usage[0]["input_tokens"] > 0
+    assert usage[0]["output_tokens"] == estimate_text_tokens(partial)
+    stats = [d for ev, d in events if ev == "attempt_stats"][-1]
+    assert stats["usage_estimates"] == 1
+    assert stats["tokens"]["output"] == usage[0]["output_tokens"]
+    ledger = json.loads((tmp_path / "run" / "llm_usage.json").read_text())
+    assert ledger["per_iteration"][0]["estimated"] is True
+    assert ledger["totals"]["estimated_calls"] == 1
+
+
+def test_cut_turn_with_only_the_input_count_estimates_the_output(tmp_path: Path) -> None:
+    """The native Anthropic channel has message_start's input and nothing else."""
+    llm = _BudgetLLM([LLMResponse(
+        content="partial answer " * 100, interrupted="deadline",
+        usage_metadata={"input_tokens": 30000, "output_tokens": 1, "total_tokens": 30001},
+    )])
+    agent, events = _loop(llm, tmp_path)
+
+    agent.run("q", deadline=time.monotonic() + 600)
+
+    usage = _usage_events(events)[0]
+    assert usage["input_tokens"] == 30000
+    assert usage["output_tokens"] > 1
+    assert usage["estimated"] is True
+
+
+def test_complete_usage_on_a_cut_turn_is_billed_as_reported(tmp_path: Path) -> None:
+    llm = _BudgetLLM([LLMResponse(
+        content="short", interrupted="deadline",
+        usage_metadata={"input_tokens": 120, "output_tokens": 900, "total_tokens": 1020},
+    )])
+    agent, events = _loop(llm, tmp_path)
+
+    agent.run("q", deadline=time.monotonic() + 600)
+
+    usage = _usage_events(events)[0]
+    assert (usage["input_tokens"], usage["output_tokens"]) == (120, 900)
+    assert "estimated" not in usage
+    assert "usage_estimates" not in [d for ev, d in events if ev == "attempt_stats"][-1]
+
+
+def test_deadline_cut_estimate_counts_tool_arguments_and_the_ratio() -> None:
+    from src.core.token_estimate import estimate_text_tokens
+
+    response = LLMResponse(
+        content="", interrupted="deadline",
+        tool_calls=[ToolCallRequest(id="c", name="write_file", arguments={"content": "x" * 400})],
+    )
+    usage, estimated = loop_mod._deadline_cut_usage(None, response, 1000, 1.5)
+
+    args = json.dumps({"content": "x" * 400}, ensure_ascii=False)
+    assert estimated is True
+    assert usage["input_tokens"] == 1500
+    assert usage["output_tokens"] == int(estimate_text_tokens(args) * 1.5)
+    assert usage["total_tokens"] == usage["input_tokens"] + usage["output_tokens"]
+
+
 def test_partial_tool_calls_at_deadline_are_not_executed(tmp_path: Path) -> None:
     tool = _Write()
     llm = _BudgetLLM([

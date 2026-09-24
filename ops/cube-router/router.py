@@ -88,19 +88,43 @@ GUEST_DATA_DIR = "/home/vibe/.vibe-trading"
 GUEST_UID = GUEST_GID = 1000  # the image's `vibe` user
 MAX_RUNNING = int(os.environ.get("VIBE_MAX_INSTANCES", "3"))          # concurrent RUNNING sandboxes
 MAX_CONCURRENT_ACTIVE = int(os.environ.get("VIBE_MAX_CONCURRENT_ACTIVE", "2"))
-# An /ask beyond MAX_CONCURRENT_ACTIVE queues for a slot, at most this long;
-# past it the ask ends with the same 503 busy frame as a full RUNNING cap.
+# An /ask beyond MAX_CONCURRENT_ACTIVE queues for a slot, at most
+# max(ACTIVE_QUEUE_WAIT_S, ACTIVE_QUEUE_BUDGET_RATIO × its budget) (never
+# past the budget itself): a two-hour deep_team waits out a morning batch
+# that a 15-minute question gives up on. Past it the ask ends with the same
+# 503 busy frame as a full RUNNING cap. Every busy frame carries
+# ``retry_after_s`` (BUSY_RETRY_AFTER_S), the earliest sensible retry.
 ACTIVE_QUEUE_WAIT_S = float(os.environ.get("VIBE_ACTIVE_QUEUE_WAIT_S", "120"))
+ACTIVE_QUEUE_BUDGET_RATIO = float(os.environ.get("VIBE_ACTIVE_QUEUE_BUDGET_RATIO", "0.2"))
+BUSY_RETRY_AFTER_S = int(os.environ.get("VIBE_BUSY_RETRY_AFTER_S", "30"))
+
+
+def active_queue_wait_s(timeout_s: float) -> float:
+    """How long an ask with this budget queues for a processing slot."""
+    budget = float(timeout_s)
+    return min(budget, max(ACTIVE_QUEUE_WAIT_S, ACTIVE_QUEUE_BUDGET_RATIO * budget))
 IDLE_TTL_S = int(os.environ.get("VIBE_IDLE_TTL_S", str(20 * 60)))     # pause after idle
 READY_TIMEOUT_S = int(os.environ.get("VIBE_READY_TIMEOUT_S", "180"))  # create+boot budget
 POLL_INTERVAL_S = float(os.environ.get("VIBE_POLL_INTERVAL_S", "3"))
-# Answer-poll tolerance: a failing poll (transport error, non-JSON body,
-# non-200 from cube-proxy or the engine) is retried until the failures have
-# lasted POLL_FAIL_MAX_S seconds or POLL_FAIL_MAX_CONSECUTIVE polls in a row,
-# whichever comes first. A launcher that reports the engine process stopped
-# ends the wait at once — that attempt is gone.
-POLL_FAIL_MAX_CONSECUTIVE = int(os.environ.get("VIBE_POLL_FAIL_MAX", "10"))
+# Answer-poll tolerance. A failing poll (transport error, non-JSON body,
+# non-200 from cube-proxy or the engine) is followed by a launcher /health
+# probe, which decides:
+#   engine=stopped     → 502 at once (the attempt died with the process);
+#   engine=running     → the engine is healthy from inside the sandbox and
+#                        only the path to it fails: keep waiting;
+#   anything else      → (launcher unreachable too, or engine unresponsive)
+#                        tolerated for a window of max(POLL_FAIL_MAX_S,
+#                        POLL_FAIL_BUDGET_RATIO × the ask's budget) of
+#                        continuous failure — a two-hour deep_team rides out
+#                        a longer outage than a 15-minute question.
+# The answer deadline bounds every case. An engine 401 is a 502 at once.
 POLL_FAIL_MAX_S = float(os.environ.get("VIBE_POLL_FAIL_MAX_S", "120"))
+POLL_FAIL_BUDGET_RATIO = float(os.environ.get("VIBE_POLL_FAIL_BUDGET_RATIO", "0.05"))
+
+
+def poll_fail_window_s(timeout_s: float) -> float:
+    """Seconds of unexplained poll failure an ask with this budget tolerates."""
+    return max(POLL_FAIL_MAX_S, POLL_FAIL_BUDGET_RATIO * float(timeout_s))
 # The message list is a cheap read; a poll that hangs longer than this is a
 # transport problem, not a slow engine.
 POLL_HTTP_TIMEOUT = httpx.Timeout(10.0, read=30.0)
@@ -1180,15 +1204,17 @@ async def _wait_answer(
     """Poll the engine's message list until this attempt's answer appears.
 
     ``deadline`` (monotonic) overrides ``timeout_s`` so the caller can anchor
-    the window to when the ask arrived. Poll failures are tolerated per
-    POLL_FAIL_MAX_CONSECUTIVE / POLL_FAIL_MAX_S; while they last the launcher
-    is probed so a stopped engine fails the ask immediately instead of after
-    the tolerance window. ``stats["poll_errors"]`` counts failed polls.
+    the window to when the ask arrived. After a failed poll the launcher is
+    probed (see POLL_FAIL_MAX_S): a stopped engine fails the ask at once, a
+    running one keeps it waiting, anything else is tolerated for
+    ``poll_fail_window_s(timeout_s)`` of continuous failure.
+    ``stats["poll_errors"]`` counts failed polls.
     """
     if deadline is None:
         deadline = time.monotonic() + timeout_s
+    window_s = poll_fail_window_s(timeout_s)
     streak = 0
-    streak_t0 = 0.0
+    unexplained_t0: Optional[float] = None
     while time.monotonic() < deadline:
         if failed is None:
             await asyncio.sleep(POLL_INTERVAL_S)
@@ -1201,9 +1227,6 @@ async def _wait_answer(
                 raise _EngineFailed(failed.error or "attempt failed")
         msgs, problem = await _poll_messages(inst, sid)
         if msgs is None:
-            now = time.monotonic()
-            if streak == 0:
-                streak_t0 = now
             streak += 1
             if stats is not None:
                 stats["poll_errors"] = int(stats.get("poll_errors") or 0) + 1
@@ -1213,12 +1236,20 @@ async def _wait_answer(
                         sid, problem, streak, engine_state or "unreachable")
             if engine_state == "stopped":
                 raise HTTPException(502, "deep engine process stopped during the attempt")
-            if streak >= POLL_FAIL_MAX_CONSECUTIVE or now - streak_t0 >= POLL_FAIL_MAX_S:
+            now = time.monotonic()
+            if engine_state == "running":
+                unexplained_t0 = None
+            elif unexplained_t0 is None:
+                unexplained_t0 = now
+            elif now - unexplained_t0 >= window_s:
                 raise HTTPException(
-                    502, f"deep engine unreachable ({problem}; {streak} failed polls)"
+                    502,
+                    f"deep engine unreachable ({problem}; {streak} failed polls "
+                    f"over {int(now - unexplained_t0)}s)",
                 )
             continue
         streak = 0
+        unexplained_t0 = None
         for msg in reversed(msgs):
             kind, text = _classify_answer_message(msg, attempt_id)
             if kind == "answer":
@@ -1234,6 +1265,60 @@ PUMP_READ_TIMEOUT_S = float(os.environ.get("VIBE_PUMP_READ_TIMEOUT_S", "90"))
 PUMP_RECONNECT_MIN_DELAY_S = 0.5
 PUMP_RECONNECT_MAX_DELAY_S = 10.0
 _PUMP_SEEN_IDS = 4096
+# Engine event ids ``<epoch>-<seq>``: seq strictly increases in publish order
+# within one engine process (epoch). Older engines send opaque ids.
+_ENGINE_SEQ_ID_RE = re.compile(r"([0-9a-f]{8})-(\d+)")
+
+
+class _EventDedup:
+    """Per-ask record of the engine event ids already forwarded.
+
+    Sequenced ids (``<epoch>-<seq>``) are deduplicated by a high-water mark:
+    the engine delivers them in order, so anything at or below the highest
+    forwarded seq of the same epoch is a replay. Opaque ids from an older
+    engine go into a set; the ids of metered events (``llm_usage`` /
+    ``attempt_stats``) are kept for the whole ask, the rest only for the
+    newest ``_PUMP_SEEN_IDS`` — a replay that reaches back further than that
+    may repeat a progress event, never a billed one.
+    """
+
+    def __init__(self) -> None:
+        self.epoch: Optional[str] = None
+        self.hwm = 0
+        self.hwm_id: Optional[str] = None
+        self.last_opaque_id: Optional[str] = None
+        self._seen: set[str] = set()
+        self._seen_order: "deque[str]" = deque()
+        self._metered: set[str] = set()
+
+    @property
+    def resume_id(self) -> Optional[str]:
+        """``Last-Event-ID`` for a reconnect: the high-water mark when there is one."""
+        return self.hwm_id or self.last_opaque_id
+
+    def admit(self, ev_id: Optional[str], name: str) -> bool:
+        """Whether an event with this id is new; records it when it is."""
+        if not ev_id:
+            return True
+        match = _ENGINE_SEQ_ID_RE.fullmatch(ev_id)
+        if match is not None:
+            epoch, seq = match.group(1), int(match.group(2))
+            if epoch == self.epoch and seq <= self.hwm:
+                return False
+            # A new epoch is a restarted engine process: its counter starts over.
+            self.epoch, self.hwm, self.hwm_id = epoch, seq, ev_id
+            return True
+        if ev_id in self._seen or ev_id in self._metered:
+            return False
+        if name in _METERED_EVENTS:
+            self._metered.add(ev_id)
+        else:
+            self._seen.add(ev_id)
+            self._seen_order.append(ev_id)
+            if len(self._seen_order) > _PUMP_SEEN_IDS:
+                self._seen.discard(self._seen_order.popleft())
+        self.last_opaque_id = ev_id
+        return True
 
 
 async def _pump_events(
@@ -1241,17 +1326,16 @@ async def _pump_events(
 ) -> None:
     """Forward the engine's session SSE stream into ``q`` until cancelled.
 
-    A dropped stream is reopened with ``Last-Event-ID`` set to the last event
-    id seen, so the engine replays only what was missed (its per-session
-    buffer); before any id has been seen it reopens with ``replay=active``
-    exactly like the first connect. Event ids already forwarded are skipped,
-    so a replay never duplicates a metered event. The pump runs until the
-    ask cancels it; reconnects back off up to PUMP_RECONNECT_MAX_DELAY_S.
-    ``stats["pump_reconnects"]`` counts reopened streams.
+    A dropped stream is reopened with ``Last-Event-ID`` set to the highest
+    event id forwarded, so the engine replays only what was missed (its
+    per-session buffer); before any id has been seen it reopens with
+    ``replay=active`` exactly like the first connect. Ids already forwarded
+    are skipped (``_EventDedup``), so a replay never duplicates a metered
+    event. The pump runs until the ask cancels it; reconnects back off up to
+    PUMP_RECONNECT_MAX_DELAY_S. ``stats["pump_reconnects"]`` counts reopened
+    streams.
     """
-    last_id: Optional[str] = None
-    seen: set[str] = set()
-    seen_order: "deque[str]" = deque()
+    dedup = _EventDedup()
     delay = PUMP_RECONNECT_MIN_DELAY_S
     first = True
     while True:
@@ -1261,8 +1345,8 @@ async def _pump_events(
             await asyncio.sleep(delay)
         first = False
         headers = _engine_headers(inst)
-        if last_id:
-            headers["Last-Event-ID"] = last_id
+        if dedup.resume_id:
+            headers["Last-Event-ID"] = dedup.resume_id
         delivered = False
         try:
             async with http.stream(
@@ -1291,14 +1375,8 @@ async def _pump_events(
                             payload = raw
                         this_id, ev_id = ev_id, None
                         name, ev_type = ev_type or "message", None
-                        if this_id:
-                            if this_id in seen:
-                                continue
-                            seen.add(this_id)
-                            seen_order.append(this_id)
-                            if len(seen_order) > _PUMP_SEEN_IDS:
-                                seen.discard(seen_order.popleft())
-                            last_id = this_id
+                        if not dedup.admit(this_id, name):
+                            continue
                         q.put_nowait({"ev": name, "data": payload})
                         delivered = True
             reason = "stream closed"
@@ -1335,10 +1413,11 @@ def _event_belongs_to_ask(ev: dict, attempt_id: Optional[str]) -> bool:
 
     One foreign event passes: a swarm tail's ``llm_usage``
     (``source="swarm_tail"``). A swarm the previous attempt stopped waiting
-    for keeps running; the engine reports its remaining tokens once, when it
-    ends, stamped with that earlier attempt's id, and never replays it into a
-    later attempt's window. Arriving during this ask, it is billed to this
-    ask — dropping it would leave those tokens unbilled.
+    for keeps running; the engine reports its remaining tokens once, stamped
+    with that earlier attempt's id — on the stream of the attempt running
+    when the swarm ends, or, when none is, at the start of the session's
+    next attempt (``deferred: true``). Arriving during this ask, it is
+    billed to this ask — dropping it would leave those tokens unbilled.
     """
     if attempt_id is None:
         return True
@@ -1505,7 +1584,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
 
     try:
         _check_not_forgotten(tk)
-        async with _active_slot(min(ACTIVE_QUEUE_WAIT_S, float(timeout_s)), stats):
+        async with _active_slot(active_queue_wait_s(timeout_s), stats):
             meta: dict[str, Any] = {}
             try:
                 inst = await get_or_create(tk, body.model, body.llm, meta=meta)
@@ -1674,6 +1753,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
         if isinstance(e, _Busy):
             stats["busy_reason"] = e.busy_reason
             frame["busy_reason"] = e.busy_reason
+            frame["retry_after_s"] = BUSY_RETRY_AFTER_S
         frame["stats"] = {"router": dict(stats), "engine": engine_stats}
         yield _frame(frame)
     except Exception as e:  # noqa: BLE001 - surface as an error frame, not a broken stream

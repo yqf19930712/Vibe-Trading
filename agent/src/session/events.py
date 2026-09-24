@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -29,6 +30,13 @@ SUBSCRIBER_QUEUE_SIZE = 200
 # ``llm_usage`` source of a swarm run that finished after its attempt stopped
 # waiting (``src.tools.swarm_tool``); see ``EventBus._attempt_window``.
 SWARM_TAIL_SOURCE = "swarm_tail"
+# Published event ids are ``<epoch>-<seq>``: ``epoch`` is 8 hex chars drawn
+# once per bus (i.e. per engine process), ``seq`` a decimal counter that
+# strictly increases in publish order across every session of the bus. Within
+# one epoch a larger seq is a later event, so a consumer can keep a
+# high-water mark instead of a set of seen ids, and a reconnect can resume
+# after an id that has already left the buffer.
+_SEQ_ID_RE = re.compile(r"([0-9a-f]{8})-(\d+)")
 
 
 def _is_swarm_tail_usage(event: "SSEEvent") -> bool:
@@ -40,11 +48,13 @@ class SSEEvent:
     """Server-sent event.
 
     Attributes:
-        event_id: Globally unique event ID used for last_event_id recovery.
+        event_id: Globally unique event ID used for last_event_id recovery;
+            ``EventBus.publish`` replaces it with ``<epoch>-<seq>``.
         event_type: Event type stored in the SSE ``event`` field.
         data: Event payload.
         session_id: Owning session ID.
         timestamp: Event timestamp.
+        seq: Publish order within the bus; set by ``EventBus.publish``.
     """
 
     event_id: Optional[str] = field(default_factory=lambda: uuid.uuid4().hex[:16])
@@ -52,6 +62,7 @@ class SSEEvent:
     data: Dict[str, Any] = field(default_factory=dict)
     session_id: str = ""
     timestamp: float = field(default_factory=time.time)
+    seq: Optional[int] = None
 
     @property
     def lossy(self) -> bool:
@@ -146,6 +157,8 @@ class EventBus:
         self._subscribers: Dict[str, List[_SubscriberQueue]] = {}
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._epoch = uuid.uuid4().hex[:8]
+        self._seq = 0
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Set the asyncio event loop, usually during api_server startup.
@@ -158,11 +171,20 @@ class EventBus:
     def publish(self, event: SSEEvent) -> None:
         """Publish an event to a session channel in a thread-safe way.
 
+        Stamps the event with the next sequence number and its
+        ``<epoch>-<seq>`` id. Subscriber hand-off happens under the same lock
+        as the numbering, so every subscriber receives events in id order
+        even when several threads publish at once — a consumer that keeps a
+        high-water mark would otherwise drop the one that lost the race.
+
         Args:
             event: Event to publish.
         """
         session_id = event.session_id
         with self._lock:
+            self._seq += 1
+            event.seq = self._seq
+            event.event_id = f"{self._epoch}-{self._seq}"
             if session_id not in self._buffers:
                 self._buffers[session_id] = []
             buffer = self._buffers[session_id]
@@ -170,14 +192,20 @@ class EventBus:
             if len(buffer) > self.max_buffer_size:
                 self._trim(buffer)
 
-            queues = list(self._subscribers.get(session_id, []))
+            # Safely enqueue onto the queue from inside the asyncio loop;
+            # callbacks scheduled from here run in scheduling (= id) order.
+            for queue in self._subscribers.get(session_id, []):
+                if self._loop and self._loop.is_running():
+                    self._loop.call_soon_threadsafe(self._safe_put, queue, event)
+                else:
+                    queue.put(event)
 
-        # Safely enqueue onto the queue from inside the asyncio loop.
-        for queue in queues:
-            if self._loop and self._loop.is_running():
-                self._loop.call_soon_threadsafe(self._safe_put, queue, event)
-            else:
-                queue.put(event)
+    def _own_seq(self, event_id: Optional[str]) -> Optional[int]:
+        """Sequence number of an id this bus issued, else None."""
+        match = _SEQ_ID_RE.fullmatch(event_id or "")
+        if match is None or match.group(1) != self._epoch:
+            return None
+        return int(match.group(2))
 
     def _trim(self, buffer: List[SSEEvent]) -> None:
         """Shrink ``buffer`` to ``max_buffer_size``, shedding lossy events first.
@@ -257,25 +285,43 @@ class EventBus:
                 attempt's ``llm_usage`` / ``attempt_stats`` to a caller that
                 bills whatever arrives on the stream.
 
+        A ``last_event_id`` this bus issued resumes right after it, whether
+        or not that event is still buffered. Any other id (a relayed frame,
+        a previous engine process) is looked up in the buffer; not found,
+        ``replay_all`` replays the whole window.
+
         Returns:
             List of events that should be replayed.
         """
         with self._lock:
-            buffer = self._buffers.get(session_id, [])
-            if replay_all and since_attempt:
-                buffer = self._attempt_window(buffer, since_attempt)
-            if not last_event_id:
-                return list(buffer) if replay_all else []  # First connect: history loaded via REST by default.
-            found = False
-            result: List[SSEEvent] = []
-            for event in buffer:
-                if found:
-                    result.append(event)
-                elif event.event_id == last_event_id:
-                    found = True
-            if not found and replay_all:
-                return list(buffer)
-            return result
+            return self._replay_locked(session_id, last_event_id, replay_all, since_attempt)
+
+    def _replay_locked(
+        self,
+        session_id: str,
+        last_event_id: Optional[str],
+        replay_all: bool,
+        since_attempt: Optional[str],
+    ) -> List[SSEEvent]:
+        """``replay`` body; the caller holds ``self._lock``."""
+        buffer = self._buffers.get(session_id, [])
+        if replay_all and since_attempt:
+            buffer = self._attempt_window(buffer, since_attempt)
+        if not last_event_id:
+            return list(buffer) if replay_all else []  # First connect: history loaded via REST by default.
+        last_seq = self._own_seq(last_event_id)
+        if last_seq is not None:
+            return [e for e in buffer if e.seq is not None and e.seq > last_seq]
+        found = False
+        result: List[SSEEvent] = []
+        for event in buffer:
+            if found:
+                result.append(event)
+            elif event.event_id == last_event_id:
+                found = True
+        if not found and replay_all:
+            return list(buffer)
+        return result
 
     @staticmethod
     def _attempt_window(buffer: List[SSEEvent], attempt_id: str) -> List[SSEEvent]:
@@ -283,14 +329,14 @@ class EventBus:
 
         One foreign event is kept inside the window: a swarm tail's
         ``llm_usage`` (``source="swarm_tail"``). It carries the id of the
-        attempt that stopped waiting for the run, is reported once when the
-        run ends, and is billed to whichever request is streaming then —
-        after the anchor that is this one.
+        attempt that stopped waiting for the run and is billed to the
+        request streaming when it is published — this one, when it comes
+        after the anchor.
 
         When the anchor itself has left the buffer, every remaining event is
         newer than it (lossless events are only evicted oldest-first, after
-        every lossy one), so the attempt-id filter alone is enough; a tail
-        there may predate this attempt and is left out.
+        every lossy one), so the attempt-id filter plus the swarm-tail
+        exception is enough.
         """
         start = 0
         for index, event in enumerate(buffer):
@@ -298,7 +344,10 @@ class EventBus:
                 start = index
                 break
         else:
-            return [e for e in buffer if e.data.get("attempt_id") == attempt_id]
+            return [
+                e for e in buffer
+                if e.data.get("attempt_id") == attempt_id or _is_swarm_tail_usage(e)
+            ]
         return [
             e for e in buffer[start:]
             if e.data.get("attempt_id") in (None, "", attempt_id) or _is_swarm_tail_usage(e)
@@ -326,15 +375,18 @@ class EventBus:
         """
         queue = _SubscriberQueue()
 
+        # Registering and taking the replay snapshot under one lock: every
+        # event is either in the replay or in the queue, never both, and the
+        # stream stays in id order.
         with self._lock:
             if session_id not in self._subscribers:
                 self._subscribers[session_id] = []
             self._subscribers[session_id].append(queue)
+            replay_events = self._replay_locked(
+                session_id, last_event_id, replay_all, since_attempt
+            )
 
         try:
-            replay_events = self.replay(
-                session_id, last_event_id, replay_all=replay_all, since_attempt=since_attempt
-            )
             for event in replay_events:
                 yield event
 

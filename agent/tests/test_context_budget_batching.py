@@ -9,6 +9,8 @@
 * The ``compact`` tool does not summarise a small context.
 * ``VIBE_CONTEXT_WINDOW_TOKENS`` caps the threshold, counting tool schemas
   and the measured real/estimate token ratio, which ``attempt_stats`` reports.
+* Layer 3 whose rebuild stays above the threshold waits for the context to
+  grow by ``L3_REGROW_RATIO`` of it before summarising again.
 """
 
 from __future__ import annotations
@@ -171,3 +173,79 @@ def test_token_ratio_is_measured_and_reported(tmp_path: Path) -> None:
 
     stats = [d for ev, d in events if ev == "attempt_stats"][-1]
     assert 1.5 <= stats["token_estimate_ratio"] <= 2.1
+
+
+# ── Layer 3 cooldown when a rebuild cannot get under the threshold ──────────
+
+
+class TestLayer3Cooldown:
+    def test_trigger_waits_for_growth_past_an_oversized_rebuild(self, monkeypatch) -> None:
+        agent = AgentLoop(registry=ToolRegistry(), llm=_LLM([]), max_iterations=1)
+        assert agent._l3_trigger(10_000) == 10_000
+
+        agent._l3_floor = 12_000
+        assert agent._l3_trigger(10_000) == 12_000 + int(10_000 * loop_mod.L3_REGROW_RATIO)
+
+        # With the window cap on, never later than the window itself.
+        monkeypatch.setattr(loop_mod, "CONTEXT_WINDOW_TOKENS", 32_000)
+        assert agent._l3_trigger(10_000) == int(10_000 / loop_mod.CONTEXT_WINDOW_SAFETY)
+
+        agent._l3_floor = 9_000  # the rebuild fit: back to the plain threshold
+        assert agent._l3_trigger(10_000) == 10_000
+
+    def test_small_window_does_not_summarise_every_turn(self, tmp_path: Path, monkeypatch) -> None:
+        """Threshold far below the system prompt + request: before the
+        cooldown every turn after the first summary ran another one."""
+        from src.agent.tools import BaseTool
+        from src.providers.chat import ToolCallRequest
+
+        class _Read(BaseTool):
+            name = "read_file"
+            description = "r"
+            is_readonly = True
+            parameters = {"type": "object", "properties": {"path": {"type": "string"}}}
+
+            def execute(self, **kwargs: Any) -> str:
+                return json.dumps({"status": "ok", "text": "y" * 200})
+
+        turns = 12
+
+        class _SummaryLLM(_LLM):
+            def __init__(self) -> None:
+                super().__init__([])
+                self.summaries = 0
+
+            def stream_chat(self, messages, tools=None, **_: Any) -> LLMResponse:
+                self.calls += 1
+                if self.calls > turns:
+                    return LLMResponse(content="done")
+                return LLMResponse(content="", tool_calls=[
+                    ToolCallRequest(id=f"c{self.calls}", name="read_file",
+                                    arguments={"path": f"f{self.calls}"}),
+                ])
+
+            def summarize(self, messages, *, timeout=None, should_cancel=None) -> LLMResponse:
+                self.summaries += 1
+                return LLMResponse(content="## Goal\nsummary")
+
+        monkeypatch.setattr(AgentLoop, "_effective_threshold", lambda self: 1_500)
+        registry = ToolRegistry()
+        registry.register(_Read())
+        llm = _SummaryLLM()
+        agent = AgentLoop(registry=registry, llm=llm, max_iterations=turns + 2)
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        agent.memory.run_dir = str(run_dir)
+
+        result = agent.run("请分析" * 300)
+
+        assert result["status"] == "success"
+        trace = [json.loads(line) for line in (run_dir / "trace.jsonl").read_text().splitlines()]
+        compacts = [e for e in trace if e.get("type") == "compact"]
+        held = [e for e in trace if e.get("type") == "compact_skipped" and e.get("reason") == "cooldown"]
+        # Without the cooldown: a summary on every turn from the first one on
+        # (11 of 12 here).
+        assert llm.summaries == len(compacts)
+        assert 1 <= len(compacts) <= turns // 3
+        assert len(held) >= turns // 2
+        assert all(e["tokens"] <= e["rearm_at"] for e in held)

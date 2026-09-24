@@ -140,12 +140,13 @@ systemctl daemon-reload && systemctl enable --now cube-router
 | `VIBE_HOST_DATA_ROOT` | | 租户引擎数据在**宿主**上的根目录，默认 `/data/shared/vibe`。每租户一个子目录（名 = tenant_key），建沙箱时 bind-mount 到 `/home/vibe/.vibe-trading`。必须落在 `allowed_host_mount_prefixes` 之内 |
 | `VIBE_MAX_INSTANCES` | | 并发 RUNNING 沙箱上限，默认 3（8G 宿主机的安全值） |
 | `VIBE_MAX_CONCURRENT_ACTIVE` | | 并发 `/ask` 处理上限，默认 2 |
-| `VIBE_ACTIVE_QUEUE_WAIT_S` | | 超出上一项的 `/ask` 排队等处理槽的上限，默认 120（且不超过本问预算）；等不到回 503 busy 帧（`code=busy`、`busy_reason=active_queue_full`），与 RUNNING 满的 503 同形 |
+| `VIBE_ACTIVE_QUEUE_WAIT_S` / `VIBE_ACTIVE_QUEUE_BUDGET_RATIO` | | 超出上一项的 `/ask` 排队等处理槽的上限：`max(VIBE_ACTIVE_QUEUE_WAIT_S, VIBE_ACTIVE_QUEUE_BUDGET_RATIO × 本问预算)`，且不超过本问预算；默认 120 与 0.2（标准问答 900s 预算排 180s，deep_team 7200s 排 1440s）。等不到回 503 busy 帧（`code=busy`、`busy_reason=active_queue_full`），与 RUNNING 满的 503 同形 |
+| `VIBE_BUSY_RETRY_AFTER_S` | | 每个 503 busy 帧带的 `retry_after_s`（建议的最早重试间隔），默认 30 |
 | `VIBE_IDLE_TTL_S` | | 空闲 pause 阈值，默认 1200 |
 | `VIBE_READY_TIMEOUT_S` / `VIBE_POLL_INTERVAL_S` / `VIBE_ASK_TIMEOUT_S` | | 就绪预算 180s / 轮询间隔 3s / 单问默认超时 900s（= `intent=standard` 的预算档，只对不带 `timeoutS` 的调用方生效，见下一行） |
 | `VIBE_SWARM_ASK_TIMEOUT_S` | | `intent=deep_team`（多智能体团队）的预算档，默认 7200。`BUDGET_BY_INTENT` 与下发给租户引擎的 `SWARM_TIMEOUT` env 都从它派生。**但 ask 预算以请求里显式的 `timeoutS` 为准**，而 laicai 现在每次都显式发（缺省按 intent 取 900 / 7200，数值写在 laicai 的 `vibe-trading.ts` 与 `swarm-directive.ts`），ask_log 的 `budget_source` 对 laicai 流量恒为 `explicit`——所以改这两个 `VIBE_*_ASK_TIMEOUT_S` 只改变不带 `timeoutS` 的调用方的预算与引擎的 `SWARM_TIMEOUT`，laicai 流量的 ask 预算不变；要改 laicai 的档位，两边一起改 |
-| `VIBE_POLL_FAIL_MAX` / `VIBE_POLL_FAIL_MAX_S` | | 等答案轮询的失败容忍：传输异常、非 200、非 JSON 都算一次失败，连续失败 10 次或持续 120s（先到者）才判 502；失败期间每次都探 launcher `/health`，报 `engine=stopped` 立即 502，引擎回 401（被绕过 router 重启过）也立即 502 |
-| `VIBE_PUMP_READ_TIMEOUT_S` | | 引擎事件流的读超时，默认 90（引擎空闲时每 30s 发心跳，读不到即当死连接）；断开后带 `Last-Event-ID` 退避重连（0.5s 起、最长 10s），已转发的事件 id 去重 |
+| `VIBE_POLL_FAIL_MAX_S` / `VIBE_POLL_FAIL_BUDGET_RATIO` | | 等答案轮询的失败容忍：传输异常、非 200、非 JSON 都算一次失败，每次失败都探 launcher `/health`——报 `engine=stopped` 立即 502，引擎回 401（被绕过 router 重启过）也立即 502；报 `engine=running`（沙箱内引擎健康、只是到它的链路不通）就一直等到答案截止；其余情况（launcher 也不可达、引擎无响应）连续失败超过 `max(VIBE_POLL_FAIL_MAX_S, VIBE_POLL_FAIL_BUDGET_RATIO × 本问预算)` 才判 502，默认 120s 与 0.05（标准问答 120s，deep_team 7200s 预算为 360s）。不再按失败次数判定，旧的 `VIBE_POLL_FAIL_MAX` 不再读取 |
+| `VIBE_PUMP_READ_TIMEOUT_S` | | 引擎事件流的读超时，默认 90（引擎空闲时每 30s 发心跳，读不到即当死连接）；断开后带已转发的最大事件 id 作 `Last-Event-ID` 退避重连（0.5s 起、最长 10s），按 id 高水位去重（旧引擎的不透明 id 按集合去重，计量事件整个 ask 不淘汰；见 PRODUCT_DESIGN §3.1） |
 | `VIBE_FORGET_TOMBSTONE_S` / `VIBE_FORGET_LOCK_WAIT_S` | | `/forget` 墓碑有效期，默认 2592000（30 天：期内该租户的 `/ask` 回 410、不重建任何东西；router 启动时清理已过期且不再指向沙箱的墓碑行）/ `/forget` 等租户锁的上限，默认 10s（低于 laicai 的 30s 调用超时；等不到照常清理） |
 | `VIBE_LAUNCHER_AUTH` | | 默认 `0`。`1` = 新建沙箱的 launcher 在首次 `/boot` 采纳 router 派生的 token，此后 `/boot` `/stop` 必须带它；开关计入 LLM 指纹。开启与回滚顺序见「launcher 鉴权：开启与回滚」 |
 | `VIBE_MEMORY_LOCK_TIMEOUT_S` | | `/memory/delete` 取记忆索引锁的上限，默认 5s（非阻塞 + 重试），超时记 warning 后不加锁照删，见「已知坑」 |
