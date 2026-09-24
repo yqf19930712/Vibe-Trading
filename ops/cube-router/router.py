@@ -1234,6 +1234,60 @@ PUMP_READ_TIMEOUT_S = float(os.environ.get("VIBE_PUMP_READ_TIMEOUT_S", "90"))
 PUMP_RECONNECT_MIN_DELAY_S = 0.5
 PUMP_RECONNECT_MAX_DELAY_S = 10.0
 _PUMP_SEEN_IDS = 4096
+# Engine event ids ``<epoch>-<seq>``: seq strictly increases in publish order
+# within one engine process (epoch). Older engines send opaque ids.
+_ENGINE_SEQ_ID_RE = re.compile(r"([0-9a-f]{8})-(\d+)")
+
+
+class _EventDedup:
+    """Per-ask record of the engine event ids already forwarded.
+
+    Sequenced ids (``<epoch>-<seq>``) are deduplicated by a high-water mark:
+    the engine delivers them in order, so anything at or below the highest
+    forwarded seq of the same epoch is a replay. Opaque ids from an older
+    engine go into a set; the ids of metered events (``llm_usage`` /
+    ``attempt_stats``) are kept for the whole ask, the rest only for the
+    newest ``_PUMP_SEEN_IDS`` — a replay that reaches back further than that
+    may repeat a progress event, never a billed one.
+    """
+
+    def __init__(self) -> None:
+        self.epoch: Optional[str] = None
+        self.hwm = 0
+        self.hwm_id: Optional[str] = None
+        self.last_opaque_id: Optional[str] = None
+        self._seen: set[str] = set()
+        self._seen_order: "deque[str]" = deque()
+        self._metered: set[str] = set()
+
+    @property
+    def resume_id(self) -> Optional[str]:
+        """``Last-Event-ID`` for a reconnect: the high-water mark when there is one."""
+        return self.hwm_id or self.last_opaque_id
+
+    def admit(self, ev_id: Optional[str], name: str) -> bool:
+        """Whether an event with this id is new; records it when it is."""
+        if not ev_id:
+            return True
+        match = _ENGINE_SEQ_ID_RE.fullmatch(ev_id)
+        if match is not None:
+            epoch, seq = match.group(1), int(match.group(2))
+            if epoch == self.epoch and seq <= self.hwm:
+                return False
+            # A new epoch is a restarted engine process: its counter starts over.
+            self.epoch, self.hwm, self.hwm_id = epoch, seq, ev_id
+            return True
+        if ev_id in self._seen or ev_id in self._metered:
+            return False
+        if name in _METERED_EVENTS:
+            self._metered.add(ev_id)
+        else:
+            self._seen.add(ev_id)
+            self._seen_order.append(ev_id)
+            if len(self._seen_order) > _PUMP_SEEN_IDS:
+                self._seen.discard(self._seen_order.popleft())
+        self.last_opaque_id = ev_id
+        return True
 
 
 async def _pump_events(
@@ -1241,17 +1295,16 @@ async def _pump_events(
 ) -> None:
     """Forward the engine's session SSE stream into ``q`` until cancelled.
 
-    A dropped stream is reopened with ``Last-Event-ID`` set to the last event
-    id seen, so the engine replays only what was missed (its per-session
-    buffer); before any id has been seen it reopens with ``replay=active``
-    exactly like the first connect. Event ids already forwarded are skipped,
-    so a replay never duplicates a metered event. The pump runs until the
-    ask cancels it; reconnects back off up to PUMP_RECONNECT_MAX_DELAY_S.
-    ``stats["pump_reconnects"]`` counts reopened streams.
+    A dropped stream is reopened with ``Last-Event-ID`` set to the highest
+    event id forwarded, so the engine replays only what was missed (its
+    per-session buffer); before any id has been seen it reopens with
+    ``replay=active`` exactly like the first connect. Ids already forwarded
+    are skipped (``_EventDedup``), so a replay never duplicates a metered
+    event. The pump runs until the ask cancels it; reconnects back off up to
+    PUMP_RECONNECT_MAX_DELAY_S. ``stats["pump_reconnects"]`` counts reopened
+    streams.
     """
-    last_id: Optional[str] = None
-    seen: set[str] = set()
-    seen_order: "deque[str]" = deque()
+    dedup = _EventDedup()
     delay = PUMP_RECONNECT_MIN_DELAY_S
     first = True
     while True:
@@ -1261,8 +1314,8 @@ async def _pump_events(
             await asyncio.sleep(delay)
         first = False
         headers = _engine_headers(inst)
-        if last_id:
-            headers["Last-Event-ID"] = last_id
+        if dedup.resume_id:
+            headers["Last-Event-ID"] = dedup.resume_id
         delivered = False
         try:
             async with http.stream(
@@ -1291,14 +1344,8 @@ async def _pump_events(
                             payload = raw
                         this_id, ev_id = ev_id, None
                         name, ev_type = ev_type or "message", None
-                        if this_id:
-                            if this_id in seen:
-                                continue
-                            seen.add(this_id)
-                            seen_order.append(this_id)
-                            if len(seen_order) > _PUMP_SEEN_IDS:
-                                seen.discard(seen_order.popleft())
-                            last_id = this_id
+                        if not dedup.admit(this_id, name):
+                            continue
                         q.put_nowait({"ev": name, "data": payload})
                         delivered = True
             reason = "stream closed"

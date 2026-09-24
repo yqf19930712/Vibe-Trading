@@ -2299,10 +2299,12 @@ async def session_events(
     event_id = header_id or last_event_id
     replay_active = (replay or "").lower() == "active"
     replay_all = False
-    # Also on a reconnect (Last-Event-ID set): when that id has already left
-    # the buffer, the running attempt's window is replayed instead of
-    # nothing, so events emitted while disconnected (an ``llm_usage``
-    # included) are not lost. Callers skip ids they already hold.
+    # Also on a reconnect (Last-Event-ID set): an id this process issued
+    # resumes right after it, even once that event has left the buffer (ids
+    # are ``<epoch>-<seq>``, see src.session.events); any other id falls back
+    # to the running attempt's whole window instead of nothing, so events
+    # emitted while disconnected (an ``llm_usage`` included) are not lost.
+    # Callers skip ids they already hold.
     if replay_active and session.last_attempt_id:
         attempt = svc.store.get_attempt(session_id, session.last_attempt_id)
         attempt_status = getattr(attempt.status, "value", attempt.status) if attempt else None

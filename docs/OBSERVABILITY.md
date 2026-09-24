@@ -181,7 +181,8 @@ budget 的姊妹模块：`AgentLoop.run()` 开头把自己的 `threading.Event` 
 
 ### 3.7 事件流：回放范围与有损队列（`src/session/events.py`）
 
-- 每个会话一个事件缓冲（500 条）。`GET /sessions/<sid>/events?replay=active` 在会话最后一个 attempt 仍在跑时只回放**该 attempt** 的窗口：从它的 `attempt.created` 起，剔除带其他 `attempt_id` 的事件（锚点已被挤出缓冲时退化为按 `attempt_id` 过滤）；attempt 窗口里保留锚点之后到达的 `swarm_tail` 用量。带 `Last-Event-ID` 重连时回放该 id 之后的事件，该 id 已出缓冲就回放整个 attempt 窗口——调用方按事件 id 去重（router 与上游前端都已去重）。
+- 事件 id 为 `<epoch>-<seq>`：epoch 是每个引擎进程随机取的 8 位十六进制，seq 在同一进程内按发布顺序严格递增（跨会话共用一个计数器）。编号与投递订阅队列在同一把锁里完成，所以每个订阅者都按 id 顺序收到事件；订阅时的回放快照与登记队列也在同一把锁里，回放与实时部分不会重复。
+- 每个会话一个事件缓冲（500 条）。`GET /sessions/<sid>/events?replay=active` 在会话最后一个 attempt 仍在跑时只回放**该 attempt** 的窗口：从它的 `attempt.created` 起，剔除带其他 `attempt_id` 的事件；锚点已被挤出缓冲时退化为按 `attempt_id` 过滤。两种情况都保留缓冲里的 `swarm_tail` 用量：窗口内的晚于锚点；锚点被挤出时，留在缓冲里的不可丢事件都晚于它。带 `Last-Event-ID` 重连时，本进程签发的 id 从它之后续传，即使该事件已被挤出缓冲；其他 id（上一个引擎进程的、附加转发帧的）在缓冲里找，找不到就回放整个 attempt 窗口。调用方按事件 id 去重：router 用高水位（PRODUCT_DESIGN §3.1「事件流断线续传」），上游前端按 id 集合。
 - 可丢事件只有流式增量：`text_delta`、`tool_progress`、`elapsed_s`、`heartbeat` 与 `swarm.event(worker_text)`。订阅队列满时新来的可丢事件直接丢，新来的不可丢事件挤掉最旧的一条可丢事件，队列里全是不可丢事件时允许超过上限；缓冲超限时同样先淘汰可丢事件。`llm_usage`、`attempt_stats`、`attempt.*` 永不丢。
 
 ## 4. 预算体系与提前收敛

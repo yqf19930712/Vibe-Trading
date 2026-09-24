@@ -294,6 +294,81 @@ class TestPumpReconnect:
         assert [g["ev"] for g in got] == ["heartbeat", "text_delta"]
         assert "Last-Event-ID" not in fake.calls[1]["headers"]
 
+    def test_sequenced_ids_resume_from_the_high_water_mark(self, monkeypatch):
+        first = (_sse("0a0b0c0d-1", "attempt.created", {"attempt_id": "a1"})
+                 + _sse("0a0b0c0d-2", "llm_usage", {"attempt_id": "a1", "input_tokens": 5})
+                 + _sse("0a0b0c0d-3", "text_delta", {"attempt_id": "a1"})
+                 # A relayed frame with an opaque id must not become the resume point.
+                 + _sse("f00dfacef00dface", "mandate.proposal", {}))
+        second = (_sse("0a0b0c0d-2", "llm_usage", {"attempt_id": "a1", "input_tokens": 5})
+                  + _sse("0a0b0c0d-3", "text_delta", {"attempt_id": "a1"})
+                  + _sse("0a0b0c0d-7", "attempt_stats", {"attempt_id": "a1"}))
+        got, fake, _ = self._pump(monkeypatch, [
+            {"lines": first, "then_raise": httpx.RemoteProtocolError("peer closed")},
+            {"lines": second, "hang": True},
+        ], want=5)
+
+        assert [g["ev"] for g in got] == [
+            "attempt.created", "llm_usage", "text_delta", "mandate.proposal", "attempt_stats",
+        ]
+        assert fake.calls[1]["headers"]["Last-Event-ID"] == "0a0b0c0d-3"
+
+    def test_replayed_window_after_eviction_bills_nothing_twice(self, monkeypatch):
+        """Reconnect after more than _PUMP_SEEN_IDS events: the engine may replay
+        the attempt window from its start; none of its usage is forwarded again."""
+        monkeypatch.setattr(router, "_PUMP_SEEN_IDS", 50)
+        ep = "0a0b0c0d"
+        lines: list[str] = []
+        seq = 0
+
+        def add(name, data):
+            nonlocal seq
+            seq += 1
+            lines.extend(_sse(f"{ep}-{seq}", name, {"attempt_id": "a1", **data}))
+
+        add("attempt.created", {})
+        for _ in range(20):
+            add("llm_usage", {"input_tokens": 1000})
+            for _ in range(15):
+                add("tool_heartbeat", {})
+            for _ in range(20):
+                add("text_delta", {"delta": "字"})
+        replay = [ln for ln in lines]  # the whole window again, oldest first
+        before = seq
+        add("llm_usage", {"input_tokens": 7})
+        got, _, _ = self._pump(monkeypatch, [
+            {"lines": lines[: before * 4], "then_raise": httpx.ReadTimeout("x")},
+            {"lines": replay[: before * 4] + lines[before * 4:], "hang": True},
+        ], want=before + 1)
+
+        usage = [g["data"]["input_tokens"] for g in got if g["ev"] == "llm_usage"]
+        assert sum(usage) == 20 * 1000 + 7
+        assert len(got) == before + 1
+
+    def test_opaque_ids_keep_metered_events_for_the_whole_ask(self, monkeypatch):
+        """Older engines send opaque ids; a replay past the bounded window must
+        still not re-forward an llm_usage."""
+        monkeypatch.setattr(router, "_PUMP_SEEN_IDS", 10)
+        head = (_sse("u1", "llm_usage", {"attempt_id": "a1", "input_tokens": 100})
+                + _sse("s1", "attempt_stats", {"attempt_id": "a1"}))
+        chatter = [ln for i in range(30) for ln in _sse(f"t{i}", "tool_call", {"attempt_id": "a1"})]
+        got, fake, _ = self._pump(monkeypatch, [
+            {"lines": head + chatter, "then_raise": httpx.ReadTimeout("x")},
+            {"lines": head + _sse("t30", "tool_call", {"attempt_id": "a1"}), "hang": True},
+        ], want=33)
+
+        assert [g["ev"] for g in got].count("llm_usage") == 1
+        assert [g["ev"] for g in got].count("attempt_stats") == 1
+        assert fake.calls[1]["headers"]["Last-Event-ID"] == "t29"
+
+    def test_a_new_engine_epoch_starts_a_new_mark(self, monkeypatch):
+        got, _, _ = self._pump(monkeypatch, [
+            {"lines": _sse("0a0b0c0d-900", "text_delta", {"attempt_id": "a1"}),
+             "then_raise": httpx.ReadTimeout("x")},
+            {"lines": _sse("1a1b1c1d-3", "attempt.failed", {"attempt_id": "a1"}), "hang": True},
+        ], want=2)
+        assert [g["ev"] for g in got] == ["text_delta", "attempt.failed"]
+
 
 # ── /ask stream harness (every upstream call stubbed) ────────────────────────
 
