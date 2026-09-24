@@ -378,6 +378,29 @@ class TestEventAttribution:
         # No attempt id from the engine: nothing to filter on.
         assert router._event_belongs_to_ask(stale, None)
 
+    def test_swarm_tail_usage_of_an_earlier_attempt_is_billed_here(self):
+        tail = {"ev": "llm_usage", "data": {"attempt_id": "a0", "input_tokens": 5,
+                                            "source": "swarm_tail", "run_id": "r1"}}
+        swarm = {"ev": "llm_usage", "data": {"attempt_id": "a0", "input_tokens": 5, "source": "swarm"}}
+        tail_stats = {"ev": "attempt_stats", "data": {"attempt_id": "a0", "source": "swarm_tail"}}
+        assert router._event_belongs_to_ask(tail, "a1")
+        assert not router._event_belongs_to_ask(swarm, "a1")
+        assert not router._event_belongs_to_ask(tail_stats, "a1")
+
+    def test_swarm_tail_reaches_the_caller(self, monkeypatch):
+        h = _AskHarness(monkeypatch)
+        tail = {"attempt_id": "a0", "input_tokens": 70000, "output_tokens": 9000,
+                "source": "swarm_tail", "run_id": "r1"}
+        h.events = [
+            {"ev": "attempt.started", "data": {"attempt_id": "a1"}},
+            {"ev": "llm_usage", "data": tail},
+            {"ev": "llm_usage", "data": {"attempt_id": "a1", "input_tokens": 10, "output_tokens": 2}},
+        ]
+        frames = h.run()
+        usage = [f["data"] for f in frames if f["t"] == "progress" and f["ev"] == "llm_usage"]
+        assert tail in usage and len(usage) == 2
+        assert frames[-1]["stats"]["router"].get("stale_events_dropped", 0) == 0
+
     def test_replayed_previous_attempt_is_neither_forwarded_nor_counted(self, monkeypatch):
         h = _AskHarness(monkeypatch)
         prev_stats = {"attempt_id": "a0", "status": "success", "iterations": 9}

@@ -224,8 +224,9 @@ def _truncated_tool_call_error(tool_name: str) -> str:
                 "limit (finish_reason=length) while its arguments were still "
                 "being written, so they are incomplete. Re-issue it with "
                 "shorter arguments — split long content into several smaller "
-                "calls (write a long file in parts, keep scripts short) and "
-                "keep the text before the call brief."
+                "calls (a long file: write_file with the first part, then "
+                "write_file mode='append' for each further part; keep scripts "
+                "short) and keep the text before the call brief."
             ),
         },
         ensure_ascii=False,
@@ -481,9 +482,10 @@ def _redact_trace_result(result: str) -> str:
 def _best_effort(fn: Any, *args: Any, **kwargs: Any) -> None:
     """Call ``fn`` and swallow any exception (debug-logged).
 
-    For the trace / state writes on a failure path: they run when the disk
-    may already be the problem, and a second exception there would replace
-    the ``failed`` result with a bare crash.
+    For trace / state bookkeeping where the disk may be the problem: on a
+    failure path a second exception would replace the ``failed`` result with
+    a bare crash, and on a path that already holds answer text it would
+    throw the answer away.
     """
     try:
         fn(*args, **kwargs)
@@ -1995,7 +1997,7 @@ class AgentLoop:
                         "chars": len(response.content or ""),
                         "has_tool_calls": response.has_tool_calls,
                     }
-                    trace.write({"type": "output_truncated", **truncated_payload})
+                    _best_effort(trace.write, {"type": "output_truncated", **truncated_payload})
                     self._emit("output_truncated", truncated_payload)
                     self._stats["output_truncations"] = (
                         self._stats.get("output_truncations", 0) + 1
@@ -2031,7 +2033,12 @@ class AgentLoop:
                     continue
 
                 if not response.has_tool_calls:
+                    # A whitespace-only reply is no reply: it takes the
+                    # empty-response path (nudge, then empty_model_response)
+                    # instead of passing as a blank answer.
                     final_content = response.content or ""
+                    if not final_content.strip():
+                        final_content = ""
                     if (
                         finish_reason == "length"
                         and final_content
@@ -2044,19 +2051,23 @@ class AgentLoop:
                         # indexed by ``iter``).
                         length_continuations += 1
                         truncated_parts.append(final_content)
-                        trace.write_text_entry(
+                        # Best effort from here on: this branch already holds
+                        # answer text, which a full disk must not cost.
+                        _best_effort(
+                            trace.write_text_entry,
                             {"type": "message", "iter": current_iter, "role": "assistant"},
                             field="content",
                             value=final_content,
                             offload_kind=f"assistant-message-{current_iter}",
                         )
-                        trace.write(
+                        _best_effort(
+                            trace.write,
                             {
                                 "type": "output_truncated_continue",
                                 "iter": current_iter,
                                 "attempt": length_continuations,
                                 "max_continuations": LENGTH_CONTINUATIONS,
-                            }
+                            },
                         )
                         messages.append({"role": "assistant", "content": final_content})
                         messages.append({"role": "user", "content": _LENGTH_CONTINUE_NUDGE})
@@ -2129,14 +2140,15 @@ class AgentLoop:
                         # and say the goal is not finished.
                         should_continue_goal = False
                         final_content += GOAL_UNFINISHED_MARK
-                        trace.write(
+                        _best_effort(
+                            trace.write,
                             {
                                 "type": "goal_continuation_suppressed",
                                 "iter": current_iter,
                                 "goal_id": active_goal_id,
                                 "reason": "budget",
                                 "continuations": goal_continuations,
-                            }
+                            },
                         )
 
                     if should_continue_goal and continuation_snapshot is not None:
@@ -2148,17 +2160,19 @@ class AgentLoop:
                         if goal_continuations >= GOAL_MAX_CONTINUATIONS or (
                             no_new_progress and goal_continuations > 0
                         ):
-                            trace.write(
+                            _best_effort(
+                                trace.write,
                                 {
                                     "type": "goal_continuation_suppressed",
                                     "iter": current_iter,
                                     "goal_id": active_goal_id,
                                     "progress": current_progress,
                                     "continuations": goal_continuations,
-                                }
+                                },
                             )
                         else:
-                            trace.write_text_entry(
+                            _best_effort(
+                                trace.write_text_entry,
                                 {
                                     "type": "goal_intermediate_answer",
                                     "iter": current_iter,
@@ -2169,7 +2183,8 @@ class AgentLoop:
                                 value=final_content,
                                 offload_kind=f"goal-intermediate-answer-{current_iter}",
                             )
-                            trace.write_text_entry(
+                            _best_effort(
+                                trace.write_text_entry,
                                 {"type": "message", "iter": current_iter, "role": "assistant"},
                                 field="content",
                                 value=final_content,

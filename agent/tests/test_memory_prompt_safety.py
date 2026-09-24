@@ -74,14 +74,17 @@ def test_legacy_long_index_lines_are_clipped_on_render(tmp_path: Path) -> None:
     assert len(snap) < 1200
 
 
-def test_snapshot_has_a_character_budget(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(persistent_mod, "MAX_SNAPSHOT_CHARS", 1500)
+def test_snapshot_has_a_token_budget(tmp_path: Path, monkeypatch) -> None:
+    from src.core.token_estimate import estimate_text_tokens
+
+    monkeypatch.setattr(persistent_mod, "MAX_SNAPSHOT_TOKENS", 400)
     pm = PersistentMemory(memory_dir=tmp_path)
     for i in range(40):
-        pm.add(f"note {i:02d}", "b", "project", description="x" * 100)
+        pm.add(f"笔记 {i:02d}", "b", "project", description="说明" * 50)
     snap = PersistentMemory(memory_dir=tmp_path).snapshot
-    assert len(snap) <= 1500 + 120
+    assert estimate_text_tokens(snap) <= 400
     assert "more saved notes not listed" in snap
+    assert snap.endswith("</memory-index>")
 
 
 def test_expired_entries_leave_the_snapshot_at_load(tmp_path: Path, monkeypatch) -> None:

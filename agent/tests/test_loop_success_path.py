@@ -116,3 +116,40 @@ def test_compaction_degrades_when_the_transcript_cannot_be_written(tmp_path: Pat
     assert messages == before
     assert agent._stats["compact_failures"] == 1
     assert trace.events[-1]["type"] == "compact_failed"
+
+
+def test_whitespace_only_reply_is_not_an_answer(tmp_path: Path) -> None:
+    """Loop and SessionService agree: blank text is no answer (not ``ok``)."""
+    llm = _LLM([LLMResponse(content="  \n\n  ")])
+
+    result = _agent(llm, tmp_path).run("q")
+
+    # The nudge retry ran, then the run failed with the real reason.
+    assert llm.calls == 2
+    assert result["status"] == "failed"
+    assert result["reason"].startswith("empty_model_response")
+    assert result["content"] == ""
+
+
+def test_length_continuation_survives_failing_trace_writes(tmp_path: Path, monkeypatch) -> None:
+    class _BrokenTrace(loop_mod.TraceWriter):
+        def write_text_entry(self, entry, **kwargs):
+            if entry.get("role") == "assistant":
+                raise OSError(28, "No space left on device")
+            return super().write_text_entry(entry, **kwargs)
+
+        def write(self, entry):
+            if entry.get("type") in ("output_truncated", "output_truncated_continue"):
+                raise OSError(28, "No space left on device")
+            return super().write(entry)
+
+    monkeypatch.setattr(loop_mod, "TraceWriter", _BrokenTrace)
+    llm = _LLM([
+        LLMResponse(content="第一段", finish_reason="length"),
+        LLMResponse(content="第二段"),
+    ])
+
+    result = _agent(llm, tmp_path).run("q")
+
+    assert result["status"] == "success"
+    assert result["content"] == "第一段第二段"

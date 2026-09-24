@@ -25,10 +25,14 @@ Two independent concerns live here:
    ``*_SECRET`` / ``*_PASSWORD`` or an ``api_key``/``token``-style marker)
    that is at least ``SECRET_VALUE_MIN_LEN`` chars long is replaced by
    ``[redacted:<KEYNAME>]`` in tool output before it reaches the trajectory.
+   One secret is not in that env: the in-guest egress tunnel key, which the
+   sandbox launcher writes to ``EGRESS_KEY_FILE`` and removes from the
+   engine's env; its lines and its base64 form are scrubbed as well.
 """
 
 from __future__ import annotations
 
+import base64
 import os
 import sys
 import sysconfig
@@ -257,10 +261,41 @@ def refresh_secret_values() -> None:
     _secret_values_cache = None
 
 
+#: Egress tunnel key written by the sandbox launcher
+#: (``ops/cube-engine/launcher.py``) from the boot env, which it then strips
+#: from the engine's env — so the env scan never sees it, while the shell
+#: tools (same uid) can read the file.
+EGRESS_KEY_FILE = "~/.ssh/egress_key"
+EGRESS_KEY_NAME = "VIBE_EGRESS_SSH_KEY"
+_KEY_FILE_MAX_BYTES = 64 * 1024
+
+
+def _key_file_values(path: str, name: str) -> list[tuple[str, str]]:
+    """``(value, name)`` pairs for a private key file: its text, each body
+    line (a partial print still matches) and its base64 form (the boot-env
+    encoding). An absent or unreadable file yields nothing."""
+    try:
+        raw = Path(path).expanduser().read_bytes()[:_KEY_FILE_MAX_BYTES]
+    except OSError:
+        return []
+    text = raw.decode("utf-8", "replace").strip()
+    if len(text) < SECRET_VALUE_MIN_LEN:
+        return []
+    values = {text, base64.b64encode(raw).decode("ascii")}
+    for line in text.splitlines():
+        line = line.strip()
+        # PEM armour lines ("-----BEGIN … KEY-----") are not secret.
+        if len(line) >= SECRET_VALUE_MIN_LEN and not line.startswith("-----"):
+            values.add(line)
+    return [(value, name) for value in values]
+
+
 def _secret_values() -> list[tuple[str, str]]:
     global _secret_values_cache
     if _secret_values_cache is None:
-        _secret_values_cache = _collect_secret_values()
+        pairs = _collect_secret_values() + _key_file_values(EGRESS_KEY_FILE, EGRESS_KEY_NAME)
+        pairs.sort(key=lambda kv: len(kv[0]), reverse=True)
+        _secret_values_cache = pairs
     return _secret_values_cache
 
 

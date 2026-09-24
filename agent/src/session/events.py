@@ -26,6 +26,13 @@ LOSSY_EVENT_TYPES = frozenset({"text_delta", "tool_progress", "elapsed_s", "hear
 # high-frequency, the lifecycle events inside it are kept.
 _LOSSY_SWARM_EVENT_TYPES = frozenset({"worker_text"})
 SUBSCRIBER_QUEUE_SIZE = 200
+# ``llm_usage`` source of a swarm run that finished after its attempt stopped
+# waiting (``src.tools.swarm_tool``); see ``EventBus._attempt_window``.
+SWARM_TAIL_SOURCE = "swarm_tail"
+
+
+def _is_swarm_tail_usage(event: "SSEEvent") -> bool:
+    return event.event_type == "llm_usage" and event.data.get("source") == SWARM_TAIL_SOURCE
 
 
 @dataclass
@@ -274,9 +281,16 @@ class EventBus:
     def _attempt_window(buffer: List[SSEEvent], attempt_id: str) -> List[SSEEvent]:
         """Events of ``attempt_id``: from its ``attempt.created`` on, foreign attempts excluded.
 
+        One foreign event is kept inside the window: a swarm tail's
+        ``llm_usage`` (``source="swarm_tail"``). It carries the id of the
+        attempt that stopped waiting for the run, is reported once when the
+        run ends, and is billed to whichever request is streaming then —
+        after the anchor that is this one.
+
         When the anchor itself has left the buffer, every remaining event is
         newer than it (lossless events are only evicted oldest-first, after
-        every lossy one), so the attempt-id filter alone is enough.
+        every lossy one), so the attempt-id filter alone is enough; a tail
+        there may predate this attempt and is left out.
         """
         start = 0
         for index, event in enumerate(buffer):
@@ -287,7 +301,7 @@ class EventBus:
             return [e for e in buffer if e.data.get("attempt_id") == attempt_id]
         return [
             e for e in buffer[start:]
-            if e.data.get("attempt_id") in (None, "", attempt_id)
+            if e.data.get("attempt_id") in (None, "", attempt_id) or _is_swarm_tail_usage(e)
         ]
 
     async def subscribe(

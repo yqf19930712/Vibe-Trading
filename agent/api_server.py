@@ -2299,7 +2299,11 @@ async def session_events(
     event_id = header_id or last_event_id
     replay_active = (replay or "").lower() == "active"
     replay_all = False
-    if replay_active and not event_id and session.last_attempt_id:
+    # Also on a reconnect (Last-Event-ID set): when that id has already left
+    # the buffer, the running attempt's window is replayed instead of
+    # nothing, so events emitted while disconnected (an ``llm_usage``
+    # included) are not lost. Callers skip ids they already hold.
+    if replay_active and session.last_attempt_id:
         attempt = svc.store.get_attempt(session_id, session.last_attempt_id)
         attempt_status = getattr(attempt.status, "value", attempt.status) if attempt else None
         replay_all = attempt_status == "running"

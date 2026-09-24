@@ -497,6 +497,130 @@ class TestSessionsDelete:
                 router.SessionDeleteBody(uid=UID, session_id="sess0001"), authorization=None))
         assert ei.value.status_code == 401
 
+    @staticmethod
+    def _swarm_run(tenant: Path, run_id: str, session_id: object) -> Path:
+        d = tenant / ".swarm" / "runs" / run_id
+        d.mkdir(parents=True)
+        run = {"id": run_id, "preset": "p", "user_vars": {"goal": "用户的原话"}}
+        if session_id is not None:
+            run["session_id"] = session_id
+        (d / "run.json").write_text(json.dumps(run))
+        (d / "billed.json").write_text("{}")
+        return d
+
+    def test_offline_mode_removes_the_sessions_swarm_runs(self, tenant, tmp_path):
+        (tenant / "sessions" / "sess0004").mkdir(parents=True)
+        mine = self._swarm_run(tenant, "swarm-a", "sess0004")
+        other = self._swarm_run(tenant, "swarm-b", "sess9999")
+        legacy = self._swarm_run(tenant, "swarm-c", None)
+        outside = tmp_path.parent / "host-swarm-run"
+        outside.mkdir(exist_ok=True)
+        (outside / "run.json").write_text(json.dumps({"session_id": "sess0004"}))
+        (tenant / ".swarm" / "runs" / "swarm-link").symlink_to(outside)
+        router.pool.pop(router.tenant_key(UID), None)
+
+        out = _run(router.sessions_delete(
+            router.SessionDeleteBody(uid=UID, session_id="sess0004"), authorization=AUTH))
+
+        assert out == {"ok": True, "mode": "offline", "deleted": True}
+        assert not mine.exists()
+        assert other.exists() and legacy.exists()  # no owner = only /forget removes it
+        assert (outside / "run.json").exists()
+
+    def test_swarm_runs_under_a_symlinked_swarm_dir_are_not_followed(self, tenant, tmp_path):
+        host = tmp_path.parent / "host-swarm-root"
+        (host / "runs" / "r1").mkdir(parents=True, exist_ok=True)
+        (host / "runs" / "r1" / "run.json").write_text(json.dumps({"session_id": "sess0005"}))
+        (tenant / ".swarm").symlink_to(host)
+        (tenant / "sessions" / "sess0005").mkdir(parents=True)
+        router.pool.pop(router.tenant_key(UID), None)
+
+        out = _run(router.sessions_delete(
+            router.SessionDeleteBody(uid=UID, session_id="sess0005"), authorization=AUTH))
+
+        assert out["ok"] is True
+        assert (host / "runs" / "r1" / "run.json").exists()
+
+    def test_offline_delete_leaves_the_engines_tombstone(self, tenant):
+        (tenant / "sessions" / "sess0006").mkdir(parents=True)
+        router.pool.pop(router.tenant_key(UID), None)
+
+        _run(router.sessions_delete(
+            router.SessionDeleteBody(uid=UID, session_id="sess0006"), authorization=AUTH))
+
+        # Same marker the engine writes (src/session/tombstone.py): an empty
+        # file sessions/.deleted/<sid>; the engine refuses every later write.
+        marker = tenant / "sessions" / ".deleted" / "sess0006"
+        assert marker.is_file() and marker.stat().st_size == 0
+        # A repeat (laicai retries) is idempotent.
+        assert _run(router.sessions_delete(
+            router.SessionDeleteBody(uid=UID, session_id="sess0006"), authorization=AUTH,
+        )) == {"ok": True, "mode": "offline", "deleted": False}
+        assert marker.is_file()
+
+    def test_tombstone_is_written_even_when_the_dir_is_already_gone(self, tenant):
+        # A paused attempt may still write the session back on resume.
+        (tenant / "sessions").mkdir()
+        router.pool.pop(router.tenant_key(UID), None)
+        _run(router.sessions_delete(
+            router.SessionDeleteBody(uid=UID, session_id="sess0007"), authorization=AUTH))
+        assert (tenant / "sessions" / ".deleted" / "sess0007").is_file()
+
+    def test_no_tombstone_for_a_tenant_without_sessions(self, tenant):
+        router.pool.pop(router.tenant_key(UID), None)
+        _run(router.sessions_delete(
+            router.SessionDeleteBody(uid=UID, session_id="sess0008"), authorization=AUTH))
+        assert not (tenant / "sessions").exists()
+
+    def test_symlinked_tombstone_dir_is_refused(self, tenant, tmp_path):
+        host = tmp_path.parent / "host-tomb"
+        host.mkdir(exist_ok=True)
+        (tenant / "sessions" / "sess0009").mkdir(parents=True)
+        (tenant / "sessions" / ".deleted").symlink_to(host)
+        router.pool.pop(router.tenant_key(UID), None)
+
+        out = _run(router.sessions_delete(
+            router.SessionDeleteBody(uid=UID, session_id="sess0009"), authorization=AUTH))
+
+        assert out == {"ok": True, "mode": "offline", "deleted": True}
+        assert not (host / "sess0009").exists()
+
+    def test_symlinked_marker_is_not_followed(self, tenant, tmp_path):
+        target = tmp_path.parent / "host-marker-target"
+        target.unlink(missing_ok=True)
+        tomb = tenant / "sessions" / ".deleted"
+        tomb.mkdir(parents=True)
+        (tomb / "sess0010").symlink_to(target)
+        router.pool.pop(router.tenant_key(UID), None)
+
+        _run(router.sessions_delete(
+            router.SessionDeleteBody(uid=UID, session_id="sess0010"), authorization=AUTH))
+
+        assert not target.exists()
+
+    def test_engine_mode_also_leaves_the_tombstone(self, tenant, monkeypatch):
+        tk = router.tenant_key(UID)
+        router.pool[tk] = router.Instance(tk, "sbx", None, "key")
+        (tenant / "sessions" / "sess0011").mkdir(parents=True)
+
+        class _Resp:
+            status_code = 404
+            text = ""
+
+        async def _fake_vibe(inst_, method, path, **kw):
+            return _Resp()
+
+        monkeypatch.setattr(router, "_vibe", _fake_vibe)
+        try:
+            out = _run(router.sessions_delete(
+                router.SessionDeleteBody(uid=UID, session_id="sess0011"), authorization=AUTH))
+        finally:
+            router.pool.pop(tk, None)
+
+        assert out["mode"] == "engine"
+        assert (tenant / "sessions" / ".deleted" / "sess0011").is_file()
+        assert not (tenant / "sessions" / "sess0011").exists()
+
 
 class TestWatermarkIsConsumable:
     def test_usage_lists_offending_tk8s_and_disk_pct(self, tmp_path, monkeypatch):
@@ -545,6 +669,7 @@ class TestForwardedEnv:
         monkeypatch.setenv("VIBE_LENGTH_CONTINUATIONS", "3")
         monkeypatch.setenv("VIBE_MEMORY_TTL_DAYS", "180")
         monkeypatch.setenv("VIBE_CONTEXT_WINDOW_TOKENS", "128000")
+        monkeypatch.setenv("TOKEN_THRESHOLD", "36000")
         monkeypatch.setenv("TICKFLOW_BASE_URL", "https://tickflow.example")
         monkeypatch.setenv("NOT_FORWARDED_SETTING", "x")
         monkeypatch.setenv("VIBE_ROUTER_SECRET", "must-stay-on-host")
@@ -559,6 +684,7 @@ class TestForwardedEnv:
         assert env["VIBE_LENGTH_CONTINUATIONS"] == "3"
         assert env["VIBE_MEMORY_TTL_DAYS"] == "180"
         assert env["VIBE_CONTEXT_WINDOW_TOKENS"] == "128000"
+        assert env["TOKEN_THRESHOLD"] == "36000"
         assert env["TICKFLOW_BASE_URL"] == "https://tickflow.example"
         assert "NOT_FORWARDED_SETTING" not in env
         assert "VIBE_ROUTER_SECRET" not in env
@@ -591,10 +717,35 @@ class TestForwardedEnv:
         env, _ = router.engine_env(None, None)
         assert env["VIBE_CONTEXT_WINDOW_TOKENS"] == "128000"
         assert router.llm_fingerprint(None, None, env) != router.llm_fingerprint(None, None, base_env)
-        # BYOK keeps it too (it describes the window, not a credential).
+
+    def test_byok_does_not_inherit_the_builtin_window(self, monkeypatch):
+        """The router's window describes the builtin models, not the user's."""
+        monkeypatch.setenv("VIBE_CONTEXT_WINDOW_TOKENS", "64000")
+        monkeypatch.delenv("VIBE_BYOK_CONTEXT_WINDOW_TOKENS", raising=False)
         llm = router.LlmOverride(provider="deepseek", model="deepseek-chat",
                                  apiKey="k" * 10, baseUrl="https://api.deepseek.com")
-        assert router.engine_env(None, llm)[0]["VIBE_CONTEXT_WINDOW_TOKENS"] == "128000"
+
+        byok_env, _ = router.engine_env(None, llm)
+        builtin_env, _ = router.engine_env("claude-x", None)
+
+        assert "VIBE_CONTEXT_WINDOW_TOKENS" not in byok_env  # engine's own threshold
+        assert builtin_env["VIBE_CONTEXT_WINDOW_TOKENS"] == "64000"
+        assert "VIBE_BYOK_CONTEXT_WINDOW_TOKENS" not in router.forwarded_env_names()
+
+    def test_byok_gets_the_byok_window_when_configured(self, monkeypatch):
+        monkeypatch.setenv("VIBE_CONTEXT_WINDOW_TOKENS", "1000000")
+        llm = router.LlmOverride(provider="deepseek", model="deepseek-chat",
+                                 apiKey="k" * 10, baseUrl="https://api.deepseek.com")
+        monkeypatch.delenv("VIBE_BYOK_CONTEXT_WINDOW_TOKENS", raising=False)
+        before, _ = router.engine_env(None, llm)
+        monkeypatch.setenv("VIBE_BYOK_CONTEXT_WINDOW_TOKENS", "56000")
+
+        env, _ = router.engine_env(None, llm)
+
+        assert env["VIBE_CONTEXT_WINDOW_TOKENS"] == "56000"
+        assert "VIBE_BYOK_CONTEXT_WINDOW_TOKENS" not in env
+        # Part of the BYOK fingerprint: setting it reboots BYOK engines.
+        assert router.llm_fingerprint(None, llm, env) != router.llm_fingerprint(None, llm, before)
 
     def test_byok_still_strips_the_builtin_anthropic_credentials(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "builtin")
