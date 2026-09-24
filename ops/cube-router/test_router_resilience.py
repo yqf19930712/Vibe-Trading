@@ -20,6 +20,8 @@ No CubeAPI, no sandbox, no engine: every upstream call is an async fake.
     reboots once and retries.
   · Waiting for a processing slot is bounded (VIBE_ACTIVE_QUEUE_WAIT_S);
     every 503 busy frame carries code=busy + busy_reason.
+  · A pause CubeAPI refuses leaves the sandbox counted as RUNNING; eviction
+    moves on to the next victim and the reaper retries next sweep.
 """
 from __future__ import annotations
 
@@ -750,3 +752,64 @@ class TestActiveSlotQueue:
         frames = h.run()
         assert frames[-1]["code"] == "busy" and frames[-1]["busy_reason"] == "instances_full"
         assert frames[-1]["status"] == 503
+
+
+# ── a refused pause is not counted as paused ─────────────────────────────────
+
+
+class TestPauseRefused:
+    def test_sbx_pause_reads_the_status(self, monkeypatch):
+        answers = iter([_Resp(204), _Resp(409), _Resp(404), _Resp(500, None, "not in normal state")])
+
+        class _Api:
+            async def post(self, path):
+                return next(answers)
+
+        monkeypatch.setattr(router, "api", _Api())
+        assert [_run(router.sbx_pause("sbx")) for _ in range(4)] == [True, True, True, False]
+
+        class _DeadApi:
+            async def post(self, path):
+                raise httpx.ConnectError("cube api down")
+
+        monkeypatch.setattr(router, "api", _DeadApi())
+        assert _run(router.sbx_pause("sbx")) is False
+
+    def _pool(self, monkeypatch, clean_state, refuse: set[str]):
+        monkeypatch.setattr(router, "MAX_RUNNING", 2)
+        pauses: list[str] = []
+
+        async def sbx_pause(sandbox_id):
+            pauses.append(sandbox_id)
+            return sandbox_id not in refuse
+
+        monkeypatch.setattr(router, "sbx_pause", sbx_pause)
+        now = time.monotonic()
+        out = []
+        for name, idle in (("a", 300), ("b", 100)):
+            inst = router.Instance(name, f"sbx-{name}", None, "key")
+            inst.last_activity = now - idle
+            router.pool[name] = inst
+            out.append(inst)
+        return out, pauses
+
+    def test_eviction_moves_on_to_the_next_victim(self, monkeypatch, clean_state):
+        (a, b), pauses = self._pool(monkeypatch, clean_state, refuse={"sbx-a"})
+        _run(router._evict_for_capacity())
+        assert pauses == ["sbx-a", "sbx-b"]
+        assert a.paused is False and b.paused is True
+
+    def test_all_refused_is_busy_not_a_spin(self, monkeypatch, clean_state):
+        (a, b), pauses = self._pool(monkeypatch, clean_state, refuse={"sbx-a", "sbx-b"})
+        with pytest.raises(HTTPException) as ei:
+            _run(router._evict_for_capacity())
+        assert ei.value.status_code == 503
+        assert pauses == ["sbx-a", "sbx-b"]
+        assert not a.paused and not b.paused
+
+    def test_reaper_keeps_counting_a_refused_victim(self, monkeypatch, clean_state):
+        monkeypatch.setattr(router, "IDLE_TTL_S", 10)
+        (a, b), _ = self._pool(monkeypatch, clean_state, refuse={"sbx-a"})
+        paused = _run(router._reap_idle_once())
+        assert paused == [b]
+        assert a.paused is False and b.paused is True

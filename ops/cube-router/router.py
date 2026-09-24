@@ -379,11 +379,22 @@ async def sbx_resume(sandbox_id: str) -> bool:
     return r.status_code in (200, 201, 204, 409)  # 409 = already running
 
 
-async def sbx_pause(sandbox_id: str) -> None:
+async def sbx_pause(sandbox_id: str) -> bool:
+    """Pause a sandbox. Returns whether it is no longer running.
+
+    CubeAPI answers a refused pause with a 5xx that httpx does not raise on;
+    the caller must not count such a sandbox as paused (it still holds its
+    memory against VIBE_MAX_INSTANCES). 409 = already paused, 404 = gone.
+    """
     try:
-        await api.post(f"/sandboxes/{sandbox_id}/pause")
-    except Exception as e:
+        r = await api.post(f"/sandboxes/{sandbox_id}/pause")
+    except Exception as e:  # noqa: BLE001
         log.warning("pause %s failed: %s", sandbox_id[:12], e)
+        return False
+    if r.status_code in (200, 201, 202, 204, 404, 409):
+        return True
+    log.warning("pause %s -> %s %s", sandbox_id[:12], r.status_code, r.text[:200])
+    return False
 
 
 async def sbx_delete(sandbox_id: str) -> bool:
@@ -736,6 +747,7 @@ async def _evict_for_capacity() -> None:
     nor is one whose per-instance lock is held (a request is inside the
     engine — e.g. a session delete — even though its refcount is 0).
     """
+    refused: set[int] = set()  # victims CubeAPI would not pause, this round
     while True:
         running = [i for i in pool.values() if not i.paused]
         if len(running) < MAX_RUNNING:
@@ -744,6 +756,7 @@ async def _evict_for_capacity() -> None:
             (
                 i for i in running
                 if i.refcount == 0 and not i.booting and not i.lock.locked()
+                and id(i) not in refused
             ),
             key=lambda i: i.last_activity,
         )
@@ -752,9 +765,12 @@ async def _evict_for_capacity() -> None:
         victim = idle[0]
         log.info("pausing LRU tenant %s (%s)", victim.tk[:8], victim.sandbox_id[:12])
         # Counted out before the pause call yields, so a concurrent count
-        # cannot hand the same slot to two callers.
+        # cannot hand the same slot to two callers; counted back in if the
+        # pause is refused (the sandbox is still running).
         victim.paused = True
-        await sbx_pause(victim.sandbox_id)
+        if not await sbx_pause(victim.sandbox_id):
+            victim.paused = False
+            refused.add(id(victim))
 
 
 # ── Vibe session helpers (unchanged semantics from v1) ───────────────────────
@@ -2238,7 +2254,7 @@ async def healthz(authorization: Optional[str] = Header(None)):
 
 # ── Background reaper: pause idle sandboxes ──────────────────────────────────
 async def _reap_idle_once() -> list[Instance]:
-    """Pause every idle instance past IDLE_TTL_S.
+    """Pause every idle instance past IDLE_TTL_S; returns the ones paused.
 
     A booting instance is not idle, and neither is one whose lock is held.
     """
@@ -2249,11 +2265,15 @@ async def _reap_idle_once() -> list[Instance]:
         and not i.lock.locked()
         and (now - i.last_activity) > IDLE_TTL_S
     ]
+    paused: list[Instance] = []
     for v in victims:
         log.info("pausing idle tenant %s (idle %ds)", v.tk[:8], round(now - v.last_activity))
         v.paused = True
-        await sbx_pause(v.sandbox_id)
-    return victims
+        if await sbx_pause(v.sandbox_id):
+            paused.append(v)
+        else:
+            v.paused = False  # still running: keep counting it; retried next sweep
+    return paused
 
 
 async def _reaper():
