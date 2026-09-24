@@ -1767,9 +1767,19 @@ def _rmtree_tenant_dir(path: Path) -> Optional[str]:
 # ── Per-session deletion (laicai "删除对话" → engine session) ────────────────
 # laicai deletes a chat thread; the bound engine session (messages.jsonl,
 # trace.jsonl with every prompt, transcript_*.jsonl compaction dumps,
-# handoff.json) and the ``runs/<id>`` directories it produced (linked through
-# ``req.json`` ``context.session_id``) go with it — otherwise the only purge
-# path would be the whole-tenant /forget at account deletion.
+# handoff.json), the ``runs/<id>`` directories it produced (linked through
+# ``req.json`` ``context.session_id``) and its swarm runs under
+# ``.swarm/runs/<id>`` (linked through ``run.json`` ``session_id``; runs
+# written before the engine recorded an owner have none and only go with
+# /forget) go with it — otherwise the only purge path would be the
+# whole-tenant /forget at account deletion.
+#
+# Before anything is removed the session is tombstoned the way the engine
+# does it (``src/session/tombstone.py``): an empty marker file
+# ``sessions/.deleted/<sid>`` owned by the guest user. An attempt frozen in a
+# paused sandbox resumes into an engine that refuses every write for that
+# session, instead of recreating the directory just removed. The engine
+# prunes markers older than 30 days at start.
 #
 # Two modes, chosen by the router, reported back in ``mode``:
 #   engine  — the tenant's sandbox is up: DELETE /sessions/{id} on the engine,
@@ -1819,6 +1829,94 @@ def _session_run_dirs(root: Path, session_id: str) -> list[Path]:
     return out
 
 
+def _session_swarm_run_dirs(root: Path, session_id: str) -> list[Path]:
+    """``.swarm/runs/<id>`` dirs under the tenant whose ``run.json`` names ``session_id``.
+
+    Same rules as :func:`_session_run_dirs`: every candidate passes
+    :func:`_safe_tenant_path`, symlinks are skipped, never followed.
+    """
+    swarm = _safe_tenant_path(root, root / ".swarm")
+    runs = _safe_tenant_path(root, root / ".swarm" / "runs") if swarm is not None else None
+    if runs is None or not runs.is_dir():
+        return []
+    out: list[Path] = []
+    for d in runs.iterdir():
+        if d.is_symlink() or not d.is_dir() or _safe_tenant_path(runs, d) is None:
+            continue
+        run_file = _safe_tenant_path(d, d / "run.json")
+        if run_file is None or not run_file.is_file():
+            continue
+        try:
+            data = json.loads(run_file.read_text("utf-8", "replace"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("session_id") == session_id:
+            out.append(d)
+    return out
+
+
+SESSION_TOMBSTONE_DIR = ".deleted"
+
+
+def _tombstone_session(root: Path, session_id: str) -> Optional[str]:
+    """Write the engine's tombstone marker ``sessions/.deleted/<sid>``.
+
+    Only for a tenant whose ``sessions`` dir exists (no engine ever ran
+    otherwise, so nothing can write the session back). The marker and a
+    ``.deleted`` dir created here are handed to the guest user, so the engine
+    can add its own markers next to it and prune them. Every step is
+    relative to an already-opened directory with ``O_NOFOLLOW``: a live
+    sandbox can swap ``sessions`` or ``.deleted`` for a symlink at any
+    moment, and the router must never create or chown a file outside the
+    tenant as root.
+
+    Returns:
+        ``None`` when written (or not needed), else the reason it was not.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    fds: list[int] = []
+    try:
+        try:
+            root_fd = os.open(root, dir_flags)
+        except FileNotFoundError:
+            return None
+        fds.append(root_fd)
+        try:
+            sessions_fd = os.open("sessions", dir_flags, dir_fd=root_fd)
+        except FileNotFoundError:
+            return None
+        fds.append(sessions_fd)
+        created = False
+        try:
+            os.mkdir(SESSION_TOMBSTONE_DIR, 0o755, dir_fd=sessions_fd)
+            created = True
+        except FileExistsError:
+            pass
+        tomb_fd = os.open(SESSION_TOMBSTONE_DIR, dir_flags, dir_fd=sessions_fd)
+        fds.append(tomb_fd)
+        if created:
+            _fchown_guest(tomb_fd)
+        marker_fd = os.open(session_id, os.O_WRONLY | os.O_CREAT | nofollow, 0o644, dir_fd=tomb_fd)
+        fds.append(marker_fd)
+        _fchown_guest(marker_fd)
+    except OSError as e:
+        return f"tombstone not written: {e}"
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+    return None
+
+
+def _fchown_guest(fd: int) -> None:
+    try:
+        os.fchown(fd, GUEST_UID, GUEST_GID)
+    except OSError:
+        # Unprivileged (tests, a non-root dev router): the engine can still
+        # read the marker; only its own pruning of it needs the ownership.
+        log.debug("cannot chown tombstone to %d:%d", GUEST_UID, GUEST_GID)
+
+
 def _rmtree_collect(path: Path, failures: list[str]) -> None:
     def _onerror(_fn: Any, p: Any, exc_info: Any) -> None:
         failures.append(f"{Path(str(p)).name}: {exc_info[1]}")
@@ -1827,20 +1925,24 @@ def _rmtree_collect(path: Path, failures: list[str]) -> None:
 
 
 def _remove_session_dir(uid: str, session_id: str) -> tuple[bool, Optional[str]]:
-    """Remove ``DATA_ROOT/<tk>/sessions/<sid>`` and the session's run dirs.
+    """Tombstone the session, then remove its dir, run dirs and swarm runs.
 
     Returns:
         ``(removed, error)`` — ``removed`` is False when no session dir was
         there (its runs, if any, are still removed); ``error`` is set when a
         dir exists but could not be removed (or the session dir is a symlink,
-        which is refused rather than followed).
+        which is refused rather than followed). A tombstone that could not be
+        written is logged, not an error: the data is still removed.
     """
     root = _tenant_root(uid)
     candidate = root / "sessions" / session_id
     if candidate.is_symlink():
         return False, f"session dir {session_id} is a symlink; refusing to remove"
+    tomb_err = _tombstone_session(root, session_id)
+    if tomb_err:
+        log.warning("sessions/delete tenant %s sid %s: %s", root.name[:8], session_id, tomb_err)
     failures: list[str] = []
-    for run_dir in _session_run_dirs(root, session_id):
+    for run_dir in _session_run_dirs(root, session_id) + _session_swarm_run_dirs(root, session_id):
         _rmtree_collect(run_dir, failures)
         if run_dir.exists():
             failures.append(f"{run_dir.name}: still present")
