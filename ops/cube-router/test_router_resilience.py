@@ -18,6 +18,8 @@ No CubeAPI, no sandbox, no engine: every upstream call is an async fake.
     under a boot-pending fingerprint (adopted if the engine came up with it,
     rebooted otherwise); an engine 401 marks the instance stale, and /ask
     reboots once and retries.
+  · Waiting for a processing slot is bounded (VIBE_ACTIVE_QUEUE_WAIT_S);
+    every 503 busy frame carries code=busy + busy_reason.
 """
 from __future__ import annotations
 
@@ -681,3 +683,70 @@ class TestAskRebootsOnRejectedKey:
         monkeypatch.setattr(router, "_reboot_engine", reboot)
         frames = h.run()
         assert frames[-1]["t"] == "error" and frames[-1]["status"] == 502
+
+
+# ── the queue for a processing slot is bounded ───────────────────────────────
+
+
+class TestActiveSlotQueue:
+    def _saturate(self, monkeypatch, wait_s):
+        monkeypatch.setattr(router, "ACTIVE_QUEUE_WAIT_S", wait_s)
+
+    def test_saturated_slots_answer_503_busy_after_the_bound(self, monkeypatch):
+        h = _AskHarness(monkeypatch)
+        self._saturate(monkeypatch, 0.05)
+
+        async def go():
+            sem = asyncio.Semaphore(1)
+            monkeypatch.setattr(router, "active_sem", sem)
+            await sem.acquire()  # a long deep_team ask holds the only slot
+            import json as _json
+
+            body = router.AskBody(uid="u-ask", query="q")
+            return [_json.loads(line) async for line in router._ask_stream(body, 900)], sem
+
+        frames, sem = _run(go())
+        assert len(frames) == 1
+        err = frames[0]
+        assert err["t"] == "error" and err["status"] == 503
+        assert err["code"] == "busy" and err["busy_reason"] == "active_queue_full"
+        assert err["stats"]["router"]["outcome"] == "busy"
+        assert err["stats"]["router"]["queue_wait_ms"] >= 40
+        assert h.recorded and h.recorded[0]["busy_reason"] == "active_queue_full"
+        assert sem._value == 0  # the timed-out waiter took nothing
+
+    def test_slot_freed_within_the_bound_is_taken(self, monkeypatch):
+        h = _AskHarness(monkeypatch)
+        self._saturate(monkeypatch, 5.0)
+
+        async def go():
+            sem = asyncio.Semaphore(1)
+            monkeypatch.setattr(router, "active_sem", sem)
+            await sem.acquire()
+
+            async def release_soon():
+                await asyncio.sleep(0.05)
+                sem.release()
+
+            asyncio.create_task(release_soon())
+            import json as _json
+
+            body = router.AskBody(uid="u-ask", query="q")
+            frames = [_json.loads(line) async for line in router._ask_stream(body, 900)]
+            return frames, sem
+
+        frames, sem = _run(go())
+        assert frames[-1]["t"] == "answer"
+        assert frames[-1]["stats"]["router"]["queue_wait_ms"] >= 40
+        assert sem._value == 1  # released after the ask
+
+    def test_capacity_503_carries_the_same_busy_code(self, monkeypatch):
+        h = _AskHarness(monkeypatch)
+
+        async def full(tk, model, llm, meta=None):
+            raise router._Busy("instances_full", "all instances busy; retry shortly")
+
+        monkeypatch.setattr(router, "get_or_create", full)
+        frames = h.run()
+        assert frames[-1]["code"] == "busy" and frames[-1]["busy_reason"] == "instances_full"
+        assert frames[-1]["status"] == 503

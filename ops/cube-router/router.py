@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import fcntl
 import hashlib
 import hmac
@@ -83,6 +84,9 @@ GUEST_DATA_DIR = "/home/vibe/.vibe-trading"
 GUEST_UID = GUEST_GID = 1000  # the image's `vibe` user
 MAX_RUNNING = int(os.environ.get("VIBE_MAX_INSTANCES", "3"))          # concurrent RUNNING sandboxes
 MAX_CONCURRENT_ACTIVE = int(os.environ.get("VIBE_MAX_CONCURRENT_ACTIVE", "2"))
+# An /ask beyond MAX_CONCURRENT_ACTIVE queues for a slot, at most this long;
+# past it the ask ends with the same 503 busy frame as a full RUNNING cap.
+ACTIVE_QUEUE_WAIT_S = float(os.environ.get("VIBE_ACTIVE_QUEUE_WAIT_S", "120"))
 IDLE_TTL_S = int(os.environ.get("VIBE_IDLE_TTL_S", str(20 * 60)))     # pause after idle
 READY_TIMEOUT_S = int(os.environ.get("VIBE_READY_TIMEOUT_S", "180"))  # create+boot budget
 POLL_INTERVAL_S = float(os.environ.get("VIBE_POLL_INTERVAL_S", "3"))
@@ -459,6 +463,34 @@ def _spawn(coro: Any) -> "asyncio.Task[Any]":
     return task
 
 
+class _Busy(HTTPException):
+    """503 busy with a machine-readable reason (``busy_reason``)."""
+
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(503, detail)
+        self.busy_reason = reason
+
+
+@contextlib.asynccontextmanager
+async def _active_slot(wait_s: float, stats: dict):
+    """Hold one of the MAX_CONCURRENT_ACTIVE processing slots, queueing at most
+    ``wait_s``; the wait (granted or not) is recorded as ``queue_wait_ms``."""
+    t0 = time.monotonic()
+    try:
+        await asyncio.wait_for(active_sem.acquire(), timeout=max(0.0, wait_s))
+    except asyncio.TimeoutError:
+        raise _Busy(
+            "active_queue_full",
+            "deep engine busy: every processing slot is taken; retry shortly",
+        ) from None
+    finally:
+        stats["queue_wait_ms"] = int((time.monotonic() - t0) * 1000)
+    try:
+        yield
+    finally:
+        active_sem.release()
+
+
 async def _launcher_health(inst: Instance) -> Optional[dict]:
     try:
         r = await http.get(f"{inst.launcher_url}/health", timeout=8.0)
@@ -594,7 +626,7 @@ async def _ensure_ready(
                 meta["boot_adopted"] = True
             return
     if inst.refcount > 0 and inst.llm_fp != fp:
-        raise HTTPException(503, "instance busy; retry to switch model")
+        raise _Busy("model_switch", "instance busy; retry to switch model")
     if meta is not None:
         meta["booted"] = True
     await _boot_engine(inst, fp, env, api_key)
@@ -716,7 +748,7 @@ async def _evict_for_capacity() -> None:
             key=lambda i: i.last_activity,
         )
         if not idle:
-            raise HTTPException(503, "all instances busy; retry shortly")
+            raise _Busy("instances_full", "all instances busy; retry shortly")
         victim = idle[0]
         log.info("pausing LRU tenant %s (%s)", victim.tk[:8], victim.sandbox_id[:12])
         # Counted out before the pause call yields, so a concurrent count
@@ -1238,9 +1270,7 @@ async def _ask_stream(body: AskBody, timeout_s: int):
             stats["iterations"] = engine_stats.get("iterations")
 
     try:
-        sem_t0 = time.monotonic()
-        async with active_sem:
-            stats["queue_wait_ms"] = int((time.monotonic() - sem_t0) * 1000)
+        async with _active_slot(min(ACTIVE_QUEUE_WAIT_S, float(timeout_s)), stats):
             meta: dict[str, Any] = {}
             try:
                 inst = await get_or_create(tk, body.model, body.llm, meta=meta)
@@ -1388,10 +1418,13 @@ async def _ask_stream(body: AskBody, timeout_s: int):
         stats["outcome"] = _classify_status(e.status_code, e)
         stats["error"] = str(e.detail)[:300]
         stats["total_ms"] = int((time.monotonic() - t_req) * 1000)
-        yield _frame({
-            "t": "error", "status": e.status_code, "detail": str(e.detail),
-            "stats": {"router": dict(stats), "engine": engine_stats},
-        })
+        frame: dict[str, Any] = {"t": "error", "status": e.status_code, "detail": str(e.detail)}
+        if isinstance(e, _Busy):
+            stats["busy_reason"] = e.busy_reason
+            frame["code"] = "busy"
+            frame["busy_reason"] = e.busy_reason
+        frame["stats"] = {"router": dict(stats), "engine": engine_stats}
+        yield _frame(frame)
     except Exception as e:  # noqa: BLE001 - surface as an error frame, not a broken stream
         log.exception("ask failed (tenant %s)", tk[:8])
         stats["outcome"] = "exception"
