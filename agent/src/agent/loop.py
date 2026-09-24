@@ -93,6 +93,12 @@ MICROCOMPACT_KEEP_BUDGET_RATIO = 0.25  # keep newest tool results up to this bud
 # threshold, not every turn".
 MICROCOMPACT_RELEASE_RATIO = 0.35  # disarm once the estimate falls back here
 MICROCOMPACT_ARMED_KEEP_RATIO = 0.15  # deeper cut while armed
+# Batching while armed. The release line sits below the usual unprunable
+# floor (system prompt + request + replayed history + protected results), so
+# in practice the layer rarely disarms; re-cutting every turn would then
+# rewrite a message near the tail each time. Instead, after a cut the layer
+# waits until the context has grown by this share of the threshold.
+MICROCOMPACT_BATCH_RATIO = 0.15
 KEEP_RECENT = 3  # hard floor: newest N tool results are always kept intact
 # Tool results that are never pruned by microcompact. Rationale: these carry
 # the run's grounding data or its key deliverables — re-fetching them is
@@ -287,6 +293,10 @@ def truncated_tool_call_messages(
 # Layer 2: Context collapse thresholds
 COLLAPSE_THRESHOLD = int(TOKEN_THRESHOLD * 0.7)
 COLLAPSE_PRESERVE_RECENT = 6
+# In the loop the fold boundary advances in steps of this many messages
+# (roughly three tool rounds) instead of one message per turn, so the prefix
+# before it stays byte-identical in between (see ``_context_collapse``).
+COLLAPSE_STRIDE = 6
 COLLAPSE_TEXT_MIN = 2400
 COLLAPSE_HEAD = 900
 COLLAPSE_TAIL = 500
@@ -314,6 +324,27 @@ TAIL_TOKEN_FLOOR = 10_000
 REQUEST_SUMMARY_INPUT_SHARE = 0.5
 # A request that stays in the tail is quoted to the summariser up to this size.
 REQUEST_QUOTE_MAX_TOKENS = 1500
+
+# The model-initiated ``compact`` tool summarises only once the context has
+# reached this share of the threshold; below it the call is answered with a
+# "not needed" result instead of an LLM summary.
+COMPACT_TOOL_MIN_RATIO = MICROCOMPACT_TRIGGER_RATIO
+
+# Model context window. ``TOKEN_THRESHOLD`` is a cost budget for the messages
+# in estimator units; it assumes a window far larger than itself (true for
+# every model the product ships). ``VIBE_CONTEXT_WINDOW_TOKENS`` — the input
+# tokens the model accepts, i.e. its window minus the output ceiling — caps
+# the threshold for a smaller one: the cap counts the tool schemas and
+# converts to estimator units with the attempt's measured real/estimate ratio
+# (see ``_observe_token_ratio``), keeping CONTEXT_WINDOW_SAFETY in reserve.
+try:
+    CONTEXT_WINDOW_TOKENS = max(0, int(os.getenv("VIBE_CONTEXT_WINDOW_TOKENS", "0") or 0))
+except ValueError:
+    CONTEXT_WINDOW_TOKENS = 0
+CONTEXT_WINDOW_SAFETY = 0.8
+# Lowest threshold the window cap may produce (below it Layer 3 would fire
+# on every turn).
+_MIN_EFFECTIVE_THRESHOLD = 4000
 
 logger = logging.getLogger(__name__)
 
@@ -560,6 +591,12 @@ def _microcompact(
     elif state.get("armed"):
         if estimate <= token_threshold * MICROCOMPACT_RELEASE_RATIO:
             state["armed"] = False
+            state.pop("cut_at", None)
+            return
+        last_cut = state.get("cut_at")
+        if last_cut is not None and estimate < last_cut + token_threshold * MICROCOMPACT_BATCH_RATIO:
+            # Batch: leave the trajectory alone until enough new context
+            # has accumulated to be worth another rewrite.
             return
         keep_ratio = MICROCOMPACT_ARMED_KEEP_RATIO
     else:
@@ -570,6 +607,8 @@ def _microcompact(
 
     tool_msgs = [m for m in messages if m.get("role") == "tool"]
     if len(tool_msgs) <= KEEP_RECENT:
+        if state is not None:
+            state["cut_at"] = estimate
         return
 
     keep_budget = token_threshold * keep_ratio
@@ -594,6 +633,8 @@ def _microcompact(
         content = msg.get("content", "")
         if isinstance(content, str) and len(content) > 100:
             msg["content"] = _CLEARED_PLACEHOLDER
+    if state is not None:
+        state["cut_at"] = estimate_tokens(messages, count_reasoning=count_reasoning)
 
 
 # Dynamic status bar. A minute-level timestamp or the WorkspaceMemory "## State"
@@ -648,7 +689,7 @@ def _build_status_message(state_summary: str, nudge_lines: list[str]) -> dict[st
     return {"role": "user", "content": content}
 
 
-def _context_collapse(messages: list) -> None:
+def _context_collapse(messages: list, state: dict | None = None) -> None:
     """Layer 2: fold long text blocks in older messages without LLM call.
 
     Preserves head + tail of large text, collapses the middle.
@@ -661,11 +702,21 @@ def _context_collapse(messages: list) -> None:
 
     Args:
         messages: Message list (mutated in place).
+        state: Caller-owned dict carrying the last fold boundary. With it the
+            boundary only advances once ``COLLAPSE_STRIDE`` more messages have
+            slid out of the recent window, so the message that just slid out
+            is not rewritten every turn; without it every call folds up to
+            the recent window (the stateless behaviour).
     """
     if len(messages) <= COLLAPSE_PRESERVE_RECENT + 1:
         return
     fu_index = first_user_index(messages)
     stop = len(messages) - COLLAPSE_PRESERVE_RECENT
+    if state is not None:
+        last_stop = state.get("stop")
+        if last_stop is not None and last_stop <= stop < last_stop + COLLAPSE_STRIDE:
+            return
+        state["stop"] = stop
     for idx in range(1, stop):
         msg = messages[idx]
         rule = collapse_rule(msg, index=idx, first_user_index=fu_index)
@@ -952,6 +1003,16 @@ def _select_summary_input(head: list[dict]) -> tuple[str, int]:
             "disk.]\n" + text
         )
     return text, dropped
+
+
+def _tool_schema_tokens(registry: Any) -> int:
+    """Estimated size of the tool definitions sent with every request."""
+    try:
+        return estimate_text_tokens(
+            json.dumps(registry.get_definitions(), ensure_ascii=False, default=str)
+        )
+    except Exception:  # noqa: BLE001 - a stand-in registry without definitions
+        return 0
 
 
 def _is_tool_success(result: str) -> bool:
@@ -1379,6 +1440,12 @@ class AgentLoop:
         self._grounding_results: List[tuple[str, str]] = []
         # Layer 1 hysteresis state (armed flag), carried across iterations.
         self._microcompact_state: Dict[str, Any] = {}
+        # Layer 2 fold-boundary state (stride batching), reset by Layer 3.
+        self._collapse_state: Dict[str, Any] = {}
+        # Provider input_tokens / local estimate, EMA over the attempt (None
+        # until a call reported usage), and the tool schemas' estimate.
+        self._token_ratio: Optional[float] = None
+        self._tools_tokens: Optional[int] = None
         # Circuit breaker: call_key -> consecutive failure count. Keyed the
         # same way as the duplicate guard, which only ever registered SUCCESSES
         # — so an identical failing call could repeat until the iteration cap.
@@ -1460,6 +1527,9 @@ class AgentLoop:
         self._stats = _new_run_stats()
         self._grounding_results = []
         self._microcompact_state = {}
+        self._collapse_state = {}
+        self._token_ratio = None
+        self._tools_tokens = None
         self._consecutive_failures = {}
         self._avg_iter_s = None
         run_t0 = _time.perf_counter()
@@ -1586,20 +1656,30 @@ class AgentLoop:
                 # ``reasoning_content`` counts only when the channel sends it.
                 count_reasoning = bool(getattr(self.llm, "sends_reasoning_content", False))
 
+                if self._tools_tokens is None:
+                    self._tools_tokens = _tool_schema_tokens(self.registry)
+                threshold = self._effective_threshold()
+
                 # Layer 1: microcompact (threshold-triggered + armed hysteresis)
                 _microcompact(
-                    messages, state=self._microcompact_state, count_reasoning=count_reasoning
+                    messages,
+                    token_threshold=threshold,
+                    state=self._microcompact_state,
+                    count_reasoning=count_reasoning,
                 )
 
                 # Layer 2: context collapse (fold long text, zero API cost)
                 tokens = estimate_tokens(messages, count_reasoning=count_reasoning)
-                if tokens > COLLAPSE_THRESHOLD:
-                    _context_collapse(messages)
+                collapse_at = (
+                    COLLAPSE_THRESHOLD if threshold >= TOKEN_THRESHOLD else int(threshold * 0.7)
+                )
+                if tokens > collapse_at:
+                    _context_collapse(messages, state=self._collapse_state)
                     tokens = estimate_tokens(messages, count_reasoning=count_reasoning)
 
                 # Layer 3: auto_compact (token threshold exceeded)
-                if tokens > TOKEN_THRESHOLD:
-                    logger.info(f"Auto compact triggered: {tokens} tokens > {TOKEN_THRESHOLD}")
+                if tokens > threshold:
+                    logger.info(f"Auto compact triggered: {tokens} tokens > {threshold}")
                     self._auto_compact(messages, run_dir, trace, iteration=current_iter)
 
                 logger.info(f"ReAct iteration {iteration}/{self.max_iterations}")
@@ -1731,6 +1811,12 @@ class AgentLoop:
                         }
                     )
 
+                # Estimate of this request (trajectory + tool schemas), paired
+                # with the provider's input_tokens below to calibrate.
+                sent_estimate = (
+                    estimate_tokens(messages, count_reasoning=count_reasoning)
+                    + (self._tools_tokens or 0)
+                )
                 llm_t0 = _time.perf_counter()
                 # In-place recovery for transient mid-stream failures
                 # (ReadTimeout, connection reset, relay hiccup, 5xx/429):
@@ -1829,6 +1915,8 @@ class AgentLoop:
                     usage,
                     current_iter,
                 )
+                if usage_delta and not getattr(response, "interrupted", None):
+                    self._observe_token_ratio(usage_delta.get("input_tokens", 0), sent_estimate)
                 if usage_delta:
                     self._emit(
                         "llm_usage",
@@ -2263,6 +2351,37 @@ class AgentLoop:
             result["reason"] = final_reason
         return result
 
+    def _effective_threshold(self) -> int:
+        """Compaction threshold for this turn (estimator units).
+
+        ``TOKEN_THRESHOLD``, capped by the model window when
+        ``VIBE_CONTEXT_WINDOW_TOKENS`` is set (see its comment).
+        """
+        threshold = TOKEN_THRESHOLD
+        if CONTEXT_WINDOW_TOKENS > 0:
+            ratio = self._token_ratio or 1.0
+            cap = int(CONTEXT_WINDOW_TOKENS * CONTEXT_WINDOW_SAFETY / ratio) - (
+                self._tools_tokens or 0
+            )
+            threshold = max(_MIN_EFFECTIVE_THRESHOLD, min(threshold, cap))
+        return threshold
+
+    def _observe_token_ratio(self, real_input_tokens: int, estimate: int) -> None:
+        """Fold one (provider input_tokens, local estimate) pair into the EMA.
+
+        The weighted estimator (ASCII /4, CJK ×0.6) is calibrated on
+        DeepSeek-like tokenizers; other tokenizers (Claude's CJK density in
+        particular) differ. The measured ratio feeds the window cap and is
+        reported as ``attempt_stats.token_estimate_ratio`` so the constants
+        can be recalibrated from production data.
+        """
+        if real_input_tokens <= 0 or estimate <= 0:
+            return
+        ratio = min(4.0, max(0.25, real_input_tokens / estimate))
+        self._token_ratio = (
+            ratio if self._token_ratio is None else 0.7 * self._token_ratio + 0.3 * ratio
+        )
+
     def _round_reserve_s(self) -> float:
         """Seconds one more full iteration is expected to need.
 
@@ -2370,6 +2489,9 @@ class AgentLoop:
         # A model turn was cut at the attempt deadline (only present when so).
         if self._stats.get("budget_truncated"):
             stats["budget_truncated"] = True
+        # Provider input tokens per estimated token (only once measured).
+        if self._token_ratio is not None:
+            stats["token_estimate_ratio"] = round(self._token_ratio, 2)
         collector = _fetch_stats.current()
         if collector is not None:
             fetches, gaps = collector.snapshot()
@@ -2468,6 +2590,25 @@ class AgentLoop:
         for tc in tool_calls:
             # Layer 4: compact tool — mark then defer execution
             if tc.name == "compact":
+                current = estimate_tokens(
+                    messages,
+                    count_reasoning=bool(getattr(self.llm, "sends_reasoning_content", False)),
+                )
+                floor = int(self._effective_threshold() * COMPACT_TOOL_MIN_RATIO)
+                if current < floor:
+                    # A summary of a small context loses detail and costs a
+                    # model call for nothing.
+                    messages.append(context.format_tool_result(tc.id, "compact", json.dumps({
+                        "status": "ok",
+                        "skipped": True,
+                        "message": (
+                            f"Context is small (~{current} tokens, compaction "
+                            f"starts around {floor}); nothing was compressed."
+                        ),
+                    })))
+                    trace.write({"type": "compact_skipped", "iter": iteration,
+                                 "reason": "context_small", "tokens": current})
+                    continue
                 compact_requested = True
                 focus_topic = tc.arguments.get("focus_topic", "")
                 messages.append(context.format_tool_result(tc.id, "compact", '{"status":"ok","message":"Compressing..."}'))
@@ -3056,6 +3197,9 @@ class AgentLoop:
 
         # Fix orphaned tool pairs in the reconstructed message list
         _fix_tool_pairs(messages)
+        # The rebuilt list starts a new fold / prune history.
+        self._collapse_state = {}
+        self._microcompact_state = {}
 
         # The duplicate-call guard keys on the tool-result
         # message OBJECT. Results compressed into the summary are gone from
