@@ -143,11 +143,14 @@ ASK_LOG_MAX_BYTES = 20 * 1024 * 1024
 # cap, usage block, reasoning effort, …) from the LANGCHAIN_* / VIBE_ANTHROPIC_*
 # families, so the prefix rule is what lets router.env tune them without a
 # router code change; the explicit list carries the credentials and the
-# single-name knobs (VIBE_MAX_OUTPUT_TOKENS, VIBE_LENGTH_CONTINUATIONS, …).
+# single-name knobs (VIBE_MAX_OUTPUT_TOKENS, VIBE_LENGTH_CONTINUATIONS,
+# VIBE_CONTEXT_WINDOW_TOKENS — the model's context window the engine sizes
+# its compaction thresholds from, …).
 FORWARD_ENV = [
     "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_MODEL",
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
     "VIBE_MAX_OUTPUT_TOKENS", "VIBE_LENGTH_CONTINUATIONS", "VIBE_MEMORY_TTL_DAYS",
+    "VIBE_CONTEXT_WINDOW_TOKENS",
     "TUSHARE_TOKEN", "VIBE_TRADING_SEARCH_BACKENDS", "JINA_API_KEY",
     "IFIND_MCP_TOKEN", "TICKFLOW_API_KEY", "TICKFLOW_BASE_URL",
 ]

@@ -544,6 +544,7 @@ class TestForwardedEnv:
         monkeypatch.setenv("VIBE_MAX_OUTPUT_TOKENS", "8192")
         monkeypatch.setenv("VIBE_LENGTH_CONTINUATIONS", "3")
         monkeypatch.setenv("VIBE_MEMORY_TTL_DAYS", "180")
+        monkeypatch.setenv("VIBE_CONTEXT_WINDOW_TOKENS", "128000")
         monkeypatch.setenv("TICKFLOW_BASE_URL", "https://tickflow.example")
         monkeypatch.setenv("NOT_FORWARDED_SETTING", "x")
         monkeypatch.setenv("VIBE_ROUTER_SECRET", "must-stay-on-host")
@@ -557,6 +558,7 @@ class TestForwardedEnv:
         assert env["VIBE_MAX_OUTPUT_TOKENS"] == "8192"
         assert env["VIBE_LENGTH_CONTINUATIONS"] == "3"
         assert env["VIBE_MEMORY_TTL_DAYS"] == "180"
+        assert env["VIBE_CONTEXT_WINDOW_TOKENS"] == "128000"
         assert env["TICKFLOW_BASE_URL"] == "https://tickflow.example"
         assert "NOT_FORWARDED_SETTING" not in env
         assert "VIBE_ROUTER_SECRET" not in env
@@ -577,6 +579,22 @@ class TestForwardedEnv:
         assert not [k for k, v in env.items() if v == "leak"]
         assert env["LANGCHAIN_STREAM_USAGE"] == "0"
         assert env["LANGCHAIN_MODEL_NAME"] == "m"
+
+    def test_context_window_is_forwarded_and_part_of_the_fingerprint(self, monkeypatch):
+        """Switching the builtin model to a smaller window via router.env must
+        reach existing engines (the compaction thresholds follow it)."""
+        monkeypatch.delenv("VIBE_CONTEXT_WINDOW_TOKENS", raising=False)
+        base_env, _ = router.engine_env(None, None)
+        assert "VIBE_CONTEXT_WINDOW_TOKENS" not in base_env
+        monkeypatch.setenv("VIBE_CONTEXT_WINDOW_TOKENS", "128000")
+        assert "VIBE_CONTEXT_WINDOW_TOKENS" in router.forwarded_env_names()
+        env, _ = router.engine_env(None, None)
+        assert env["VIBE_CONTEXT_WINDOW_TOKENS"] == "128000"
+        assert router.llm_fingerprint(None, None, env) != router.llm_fingerprint(None, None, base_env)
+        # BYOK keeps it too (it describes the window, not a credential).
+        llm = router.LlmOverride(provider="deepseek", model="deepseek-chat",
+                                 apiKey="k" * 10, baseUrl="https://api.deepseek.com")
+        assert router.engine_env(None, llm)[0]["VIBE_CONTEXT_WINDOW_TOKENS"] == "128000"
 
     def test_byok_still_strips_the_builtin_anthropic_credentials(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "builtin")
