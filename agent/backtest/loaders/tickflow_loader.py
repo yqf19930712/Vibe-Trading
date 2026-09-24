@@ -3,7 +3,7 @@
 Structured column-oriented kline API (https://docs.tickflow.org) — unlike the
 iFinD NL interface there is nothing to parse heuristically. Reachable from
 the mainland without the server-B egress tunnel (Aliyun direct, ~2s incl.
-TLS; verified live 2026-08-25 with INTC, values byte-identical to iFinD).
+TLS; values match iFinD byte for byte on the same symbol).
 Leads the us_equity chain (tickflow → ifind → yfinance → akshare); in
 hk_equity it sits second after ifind because the current plan is US-only —
 for .HK it no-ops and the chain moves on.
@@ -49,8 +49,8 @@ def _api_key() -> str:
 
 # Bare uppercase tickers (AVGO, SPY) reach the us_equity chain via
 # detect_market's bare-ticker route — normalize them to the API's TICKER.US
-# form instead of skipping (attempt f9b0c0cdcded: bare "AVGO" no-opped every
-# domestic source). Yahoo specials (GC=F, ^TNX, DX-Y.NYB) stay unsupported.
+# form instead of skipping (otherwise a bare "AVGO" no-ops every domestic
+# source). Yahoo specials (GC=F, ^TNX, DX-Y.NYB) stay unsupported.
 _BARE_US_RE = re.compile(r"^[A-Z]{1,5}$")
 
 

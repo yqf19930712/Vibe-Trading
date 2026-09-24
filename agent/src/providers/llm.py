@@ -564,13 +564,13 @@ def _ensure_dotenv() -> None:
     """Load `.env` from the first found candidate path.
 
     Skipped entirely for a tenant engine: its whole configuration arrives as
-    process env from the router's ``/boot``, and every candidate is writable
-    by the tenant's own shell tools — ``~/.vibe-trading`` is the tenant's
-    bind-mount, and ``AGENT_DIR`` / the working directory sit in the image's
-    app dir, owned by the same uid the tools run as. A file dropped there
-    would be read into the engine process (which holds the shared LLM
-    credentials) on its next start, filling in any name the router did not
-    set itself.
+    process env from the router's ``/boot``. ``~/.vibe-trading`` is the
+    tenant's own bind-mount, writable by the tenant's shell tools, and a
+    ``.env`` dropped there would be read into the engine process (which
+    holds the shared LLM credentials) on its next start, filling in any
+    name the router did not set itself. ``AGENT_DIR`` / the working
+    directory sit in the image's ``/app``, read-only in the current image;
+    they are skipped as well rather than trusted to stay that way.
     """
     global _dotenv_loaded
     if _dotenv_loaded:

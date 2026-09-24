@@ -1,7 +1,7 @@
 """iFinD (同花顺) MCP loader: US & HK daily OHLCV via the 51ifind MCP service.
 
 Domestic endpoint (``api-mcp.51ifind.com:8643``) — reachable from mainland
-without the server-B egress tunnel. Since 2026-08-25 it leads the hk_equity
+without the server-B egress tunnel. It leads the hk_equity
 chain and backs tickflow in us_equity (US: tickflow → ifind → …;
 HK: ifind → …) — the tunnel-dependent, Yahoo-rate-limited yfinance is
 demoted to fallback in both.
@@ -240,7 +240,7 @@ def _parse_answer_table(answer: str) -> Optional[pd.DataFrame]:
 
 # Bare uppercase tickers (AVGO, SPY) reach the us_equity chain via
 # detect_market's bare-ticker route — treat them as US instead of skipping
-# (attempt f9b0c0cdcded: bare "AVGO" no-opped every domestic source).
+# (otherwise a bare "AVGO" no-ops every domestic source).
 _BARE_US_RE = re.compile(r"^[A-Z]{1,5}$")
 
 

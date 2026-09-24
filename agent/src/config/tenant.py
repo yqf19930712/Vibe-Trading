@@ -1,7 +1,8 @@
 """Tenant-safety profile flags shared by the tool registry, config loading and the API.
 
 ``VIBE_TRADING_TENANT_SAFE=1`` marks a single-user engine instance running
-behind the shared multi-tenant gateway (injected by the vibe-router). It has
+behind the shared multi-tenant gateway (injected by ops/cube-router
+through the launcher ``/boot`` env). It has
 no importers from the tools package on purpose, so ``src.config`` can read
 it without triggering tool discovery.
 

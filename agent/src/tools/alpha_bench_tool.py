@@ -899,7 +899,7 @@ class AlphaBenchTool(BaseTool):
 
     @property
     def timeout_seconds(self) -> float:
-        """Loop-side watchdog bound for alpha_bench (V1).
+        """Loop-side watchdog bound for alpha_bench.
 
         A cold csi300/sp500 bench legitimately runs for many minutes, well past
         the tenant-wide tool timeout, so the loop's 1×/2× write-tool window

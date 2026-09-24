@@ -841,7 +841,7 @@ class PersistentMemory:
             return 0
 
     def maybe_auto_consolidate(self) -> dict | None:
-        """Run one consolidation pass when the index is close to its cap (V2).
+        """Run one consolidation pass when the index is close to its cap.
 
         Called at run end, not per-write: consolidation rewrites entry files,
         and doing that mid-run would churn the session-start snapshot the

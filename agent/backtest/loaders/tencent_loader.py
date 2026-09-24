@@ -1,8 +1,8 @@
 """Tencent Finance loader: free, no-auth A-share & HK data via HTTP API.
 
 Uses Tencent's ifzq.gtimg.cn API which is not blocked by eastmoney's CDN.
-Covers: A-shares (SH/SZ) and HK equities (NNNNN.HK → hkNNNNN; verified live
-2026-08-25 with hk03690).  No API token required, reachable from mainland
+Covers: A-shares (SH/SZ) and HK equities (NNNNN.HK → hkNNNNN).  No API
+token required, reachable from mainland
 without egress.
 
 API format:

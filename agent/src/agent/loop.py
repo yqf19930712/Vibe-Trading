@@ -76,7 +76,7 @@ TOKEN_THRESHOLD = int(os.getenv("TOKEN_THRESHOLD", "40000"))
 # Layer 1 (microcompact) tuning. The old behavior — unconditionally pruning
 # every tool result older than the last 3, every iteration — was a sliding
 # window anti-pattern: the model kept re-fetching data the loop had just
-# thrown away (see the dea1222743ef notes below), and rewriting the middle of
+# thrown away, and rewriting the middle of
 # the trajectory each turn invalidated the provider prompt cache wholesale.
 # Now pruning only triggers past a token threshold, and retention is a token
 # budget instead of a fixed count.
@@ -304,10 +304,10 @@ COLLAPSE_TAIL = 500
 
 # Layer 3: Token-budget tail protection
 TAIL_TOKEN_BUDGET = 20_000
-# Layer 3 summary INPUT budget (V2). The old ``json.dumps(head)[:80000]`` cut
-# from the tail, i.e. it discarded the newest and densest turns in the head —
-# and 80k ASCII chars is only ~20k tokens, so an English-heavy session hit it
-# almost every time. Now the input is filled newest-first against a token
+# Layer 3 summary INPUT budget. A character cut from the tail (e.g.
+# ``json.dumps(head)[:80000]``) would discard the newest and densest turns —
+# and 80k ASCII chars is only ~20k tokens, so an English-heavy session hits it
+# almost every time. Instead the input is filled newest-first against a token
 # budget and the OLDEST turns are the ones dropped (they are already covered
 # by the previous summary and by the full transcript on disk).
 SUMMARY_INPUT_TOKEN_BUDGET = int(TOKEN_THRESHOLD * 0.5)
@@ -562,7 +562,7 @@ def _microcompact(
     ``token_threshold * MICROCOMPACT_TRIGGER_RATIO``; below that the trajectory
     is left byte-identical so the provider prompt cache stays warm.
 
-    Hysteresis (V2): crossing the trigger *arms* the layer, which then cuts to
+    Hysteresis: crossing the trigger *arms* the layer, which then cuts to
     the deeper ``MICROCOMPACT_ARMED_KEEP_RATIO`` water mark and stays armed
     until the estimate falls back under ``MICROCOMPACT_RELEASE_RATIO``. One
     deep cut every so often replaces a shallow cut every single turn, which is
@@ -581,8 +581,8 @@ def _microcompact(
             (the main loop's ``TOKEN_THRESHOLD``; swarm workers pass their own
             ``_MAX_TOKEN_ESTIMATE``).
         state: Caller-owned dict carrying the armed flag across iterations.
-            Omitted (None) reproduces the pre-V2 single-line behavior, so the
-            function stays usable stateless.
+            Omitted (None) gives the stateless single-trigger behavior (no
+            hysteresis), so the function stays usable on its own.
         count_reasoning: See :func:`estimate_tokens`.
     """
     estimate = estimate_tokens(messages, count_reasoning=count_reasoning)
@@ -939,7 +939,7 @@ def _clip_middle(text: str, max_tokens: int, note: str) -> str:
 
 
 def _select_summary_input(head: list[dict]) -> tuple[str, int]:
-    """Serialize the summary input newest-first within a token budget (V2).
+    """Serialize the summary input newest-first within a token budget.
 
     The current request (``vibe_class=request``), when it is in ``head``, is
     reserved first — up to ``REQUEST_SUMMARY_INPUT_SHARE`` of the budget,
@@ -1705,7 +1705,7 @@ class AgentLoop:
                         "If you have partial results, summarize what you have so far."
                     )
 
-                # Batch 3 — wall-clock budget management. Two escalations:
+                # Wall-clock budget management. Two escalations:
                 # (a) <25% of the budget left → wrap-up nudge, independent
                 #     of the iteration counter (which fires far too late when
                 #     iterations are slow);
@@ -2292,7 +2292,7 @@ class AgentLoop:
             # reason instead of passing with a template receipt.
             _best_effort(state_store.mark_success, run_dir)
             final_status = "success"
-            # F1: zero-LLM structural verification. Warnings never flip the
+            # Zero-LLM structural verification. Warnings never flip the
             # success status — they ride attempt_stats / trace / an event so
             # the observability panel can surface suspect runs.
             try:
@@ -2458,8 +2458,10 @@ class AgentLoop:
         is ``None`` only when the run failed before its trace file existed). The
         multi-tenant router forwards it to laicai as a progress frame; laicai
         persists it into ``deep_engine_runs``. ``data_fetches`` / ``data_gaps``
-        are reserved for the data-reliability batch and empty for now, so the
-        frame shape is stable for consumers from day one.
+        / ``skills`` / ``swarm_runs`` / ``background_tasks`` /
+        ``stream_retries`` come from the attempt's fetch_stats collector;
+        counters appear only when non-zero. Fields are only ever added, so
+        consumers ignore what they do not know.
         """
         totals = (llm_usage_summary or {}).get("totals", {}) or {}
         tool_map: dict[str, dict[str, int]] = self._stats.get("tools", {})
@@ -2492,13 +2494,13 @@ class AgentLoop:
             "data_fetches": [],
             "data_gaps": [],
             "early_finalize": bool(self._stats.get("early_finalize")),
-            # F2: set when a write tool blew through its hard timeout and its
+            # Set when a write tool blew through its hard timeout and its
             # result was abandoned — the attempt finished on partial footing.
             "degraded": bool(self._stats.get("degraded")),
             "model": getattr(self.llm, "model_name", None)
             or os.getenv("LANGCHAIN_MODEL_NAME", ""),
         }
-        # F1: structural verification warnings (only present when non-empty).
+        # Structural verification warnings (only present when non-empty).
         if self._stats.get("verify_warnings"):
             stats["verify_warnings"] = self._stats["verify_warnings"]
         # Degradation counters (only present when non-zero): L3 summary call
@@ -2645,11 +2647,11 @@ class AgentLoop:
 
             call_key = _tool_call_key(tc.name, tc.arguments)
 
-            # V2 circuit breaker (book §1.2 "Correct"): the duplicate guard
-            # only ever registered SUCCESSES, so an identical call that keeps
+            # Circuit breaker (book §1.2 "Correct"): the duplicate guard only
+            # registers SUCCESSES, so without it an identical call that keeps
             # failing — a dead upstream, a malformed argument the model won't
             # revise — could repeat until the iteration cap or the wall-clock
-            # budget ran out. After TOOL_CIRCUIT_FAILURE_LIMIT consecutive
+            # budget runs out. After TOOL_CIRCUIT_FAILURE_LIMIT consecutive
             # failures of the SAME (tool, args) pair the call is refused with
             # an actionable structured error instead of being executed again.
             if self._consecutive_failures.get(call_key, 0) >= TOOL_CIRCUIT_FAILURE_LIMIT:
@@ -2988,7 +2990,7 @@ class AgentLoop:
             # _microcompact has since pruned this result (pruned -> re-allow).
             self._called_ok[call_key] = result_msg
             self._consecutive_failures.pop(call_key, None)
-            # F1: keep raw grounding results for the finalization verifier.
+            # Keep raw grounding results for the finalization verifier.
             if tc.name in VERIFY_GROUNDING_TOOLS:
                 self._grounding_results.append((tc.name, result))
                 if len(self._grounding_results) > VERIFY_GROUNDING_MAX_RESULTS:

@@ -55,7 +55,7 @@ def _effective_timeout() -> float:
     )
 
 
-# F4: dangerous-pattern AUDIT blacklist. Matching commands are NOT blocked —
+# Dangerous-pattern AUDIT blacklist. Matching commands are NOT blocked —
 # the sandbox is the enforcement layer — but each match is recorded in the
 # result payload (which lands in the trace via the tool_result entry) and
 # emitted as a progress event, so the observability panel can review what the
@@ -79,7 +79,7 @@ _DANGEROUS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 
 def _audit_command(command: str) -> list[str]:
-    """Return the ids of dangerous patterns matched by ``command`` (F4)."""
+    """Return the ids of dangerous patterns matched by ``command``."""
     return [name for name, pattern in _DANGEROUS_PATTERNS if pattern.search(command)]
 
 
@@ -269,7 +269,7 @@ class BashTool(BaseTool):
         command = kwargs["command"]
         cwd = kwargs.get("run_dir")
 
-        # F4: audit-only dangerous-pattern scan (never blocks — see constant).
+        # Audit-only dangerous-pattern scan (never blocks — see constant).
         audit_findings = _audit_command(str(command))
         if audit_findings:
             emit_progress(
