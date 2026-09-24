@@ -167,17 +167,46 @@ laicai 侧只需在 `web.env` 配 `VIBE_ROUTER_URL=http://<宿主机>:8990` + `V
 
 两条路径的影响面完全不同：
 
-- **只改 router**（`ops/cube-router/router.py`）：scp 覆盖 `/opt/cube-router/router.py` → `systemctl restart cube-router`。沙箱不受影响——重启后从 `state.json` 重挂既有租户沙箱，不泄漏、不丢数据。
+- **只改 router**（`ops/cube-router/router.py`）：scp 覆盖 `/opt/cube-router/router.py` → `systemctl restart cube-router`。沙箱不受影响——重启后从 `state.json` 重挂既有租户沙箱，不泄漏、不丢数据。若新版本改变了 boot env 的内容或指纹格式，每个租户下一问会重启一次引擎（见下一条「只改 LLM 配置」），挑低峰发布。
 - **改引擎代码**（`agent/`）：重建镜像 → push → `cubemastercli tpl create-from-image` 发新模板 → 更新 `VIBE_CUBE_TEMPLATE_ID` → restart cube-router。**不需要动既有沙箱**：router 在 `get_or_create` 里比对 `state.json` 里记的 `template_id`，不一致就删掉旧沙箱、用新模板重建；启动清扫 `_sweep_stale_templates` 同时把旧模板上的沙箱（含 state 之外的孤儿）与旧模板本身删掉。租户数据在宿主 bind-mount 里，重建无损。挑没有在途 `/ask` 的窗口做切换（清扫假定启动时无在途请求）。
 - **回滚模板**：先在 `router.env` 置 `VIBE_SWEEP_STALE_TEMPLATES=0`，再把 `VIBE_CUBE_TEMPLATE_ID` 改回旧值 → restart。不先关清扫，启动时会把「新」模板与其沙箱当作过期物删除，且旧模板若已被上一次清扫删掉则无法回滚——发新模板后先验证再让清扫跑是默认顺序，不要跳过验证。
-- **只改 LLM 配置**（`FORWARD_ENV` 里的凭据/模型）：改 `router.env` → restart cube-router。下一次 `/ask` 时 LLM 指纹变化会自动触发 launcher `/boot` 重启引擎进程，沙箱与会话数据不动。
+- **只改 LLM 配置**（转发名单 / 前缀里的凭据、模型、档位旋钮）：改 `router.env` → restart cube-router。LLM 指纹含整份 boot env 的摘要（`llm_fingerprint` 的 `|env:<sha16>` 段），所以每个既有租户——在跑的、paused 的、router 重启后从 state 重挂的——都在**自己的下一次 `/ask`** 时经 launcher `/boot` 重启一次引擎进程，沙箱与会话数据不动；从没再来的租户不受影响，也就一直带着旧 env（轮换泄露的 key 时，要么等各租户下一问，要么配合一次模板切换重建全部沙箱）。请求带 `llm{}` 的 BYOK 引擎凭据来自请求本身，其余转发值与档位同样在它的指纹里。
+
+### router `state.json` 的形态
+
+不需要迁移脚本，旧 router 也能读新文件：
+
+- 一个租户一行 `{sandbox_id, template_id, llm_fp, api_key}`。`llm_fp` 是 `<byok:sha16 | builtin:<model> | default>|env:<sha16>`；另有两种过渡值：`boot-pending:<fp>`（`/boot` 已发、200 还没确认——冷启时这一行在 `/boot` 之前就写入，引擎确实以该 key 起来了下一问会直接采纳，否则重启）与 `stale`（引擎拒绝了 router 的 key，下次使用前重启）。旧 router 遇到不认识的指纹只会让该租户多重启一次。
+- `/forget` 留下的墓碑行 `{"forgotten_at": <epoch>}`；删沙箱失败时同一行还保留 `sandbox_id` 等字段，夜间重试与 router 启动清扫都会再删。旧 router 忽略墓碑。
+- 要单独重置一个租户：删掉它的沙箱（CubeAPI）并删掉这一行，下一问冷启重建；数据在宿主 bind-mount 上，不受影响。
+
+### launcher 鉴权：开启与回滚
+
+launcher `:8898` 的 `/boot` `/stop` 在 guest 内经 loopback 可达。多租户档的引擎已不信任 loopback，但 guest 里的 shell 仍可以向 launcher `/boot` 一个自己挑的 key 再拿它访问引擎——`VIBE_LAUNCHER_AUTH=1` 关掉这条路。token = `HMAC(VIBE_ROUTER_SECRET, "launcher:"+sandbox_id)`，按沙箱派生、无需存储；router 对 `/boot` 恒带 `Authorization: Bearer <token>`（旧 launcher 忽略这个头），开关打开时 token 另随 boot env 下发。launcher **只从生命周期内的第一次 `/boot` 采纳 token**（此前 guest 里还没有任何租户代码），此后没有正确 token 的 `/boot` `/stop` 一律 401；带正确 token、env 不带 token 的 `/boot` 解除要求。**默认关闭**：已持有 token 的 launcher，回滚到不含这段逻辑的 router 就再也 `/boot` 不了（全部 502），只能靠重建沙箱恢复。
+
+**前提**：带 launcher 鉴权的 router 与模板都已上线并验证通过，且确认不再需要回滚到不含 launcher 鉴权的 router。
+
+开启：
+
+1. `router.env` 加 `VIBE_LAUNCHER_AUTH=1` → `systemctl restart cube-router`。启动日志里不应再有 `VIBE_LAUNCHER_AUTH is off…` warning。
+2. 生效范围：此后**新建**的沙箱在首次 `/boot` 采纳 token。既有沙箱的指纹变了（开关计入指纹），下一问会重启一次引擎，但它们的 launcher 早已 boot 过、不会采纳 token，仍然无鉴权。
+3. 覆盖全部租户：配合一次模板切换（改 `VIBE_CUBE_TEMPLATE_ID` 后重启 router；启动清扫默认销毁旧模板上的全部沙箱），各租户下一问冷启新沙箱、首次 `/boot` 采纳 token。数据在宿主，重建无损，首问多一次冷启。
+4. 验证（新建的沙箱内经 bash 工具）：`curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8898/stop` → `401`；`curl -s http://127.0.0.1:8898/health` → 200 JSON；正常 `/ask` 成功，router 日志没有 `engine boot failed: 401`。
+
+回滚：
+
+- **只关鉴权，router 不回退**：`router.env` 置 `VIBE_LAUNCHER_AUTH=0` → 重启 router。各租户下一问因指纹变化重启引擎，这次 `/boot` 带 Bearer 头、env 不带 token，launcher 随之解除要求。不需要重建；没有再来的租户沙箱仍持有 token，但新 router 总会带头，不受影响。
+- **回退 router.py 到不含 launcher 鉴权的版本**：旧 router 不带 Authorization 头，持 token 的 launcher 一律 401、该租户所有 ask 502，所以必须**同时回退 router.py 与模板 id**：（建议先在新 router 上做一次「只关鉴权」缩小影响面）部署旧 `router.py`，同时把 `VIBE_CUBE_TEMPLATE_ID` 改成**不同于持 token 沙箱所用模板**的 id 再重启——回到旧引擎就用旧镜像重新建一次模板（启动清扫多半已删掉旧模板），只回退 router 就用新镜像再建一个模板拿新 id（新 launcher 在旧 router 下永远收不到 token）。旧 router 的启动清扫（`VIBE_SWEEP_STALE_TEMPLATES` 不为 0 时）会销毁不在当前模板上的全部沙箱；关了清扫时 `get_or_create` 也会在各租户下一问发现 `template_id` 不符、先删后建。验证：挑一个开关开启期间建过沙箱的租户发一问，应冷启成功而不是 `engine boot failed: 401`。
+- 单个租户出现 launcher 401（例如 `VIBE_ROUTER_SECRET` 被改）不会自愈：删掉它的沙箱与 state 行，下一问重建。
+
+**残余面**：launcher 与 bash 工具同为 uid 1000。launcher 启动时 `PR_SET_DUMPABLE=0` 挡住同 uid 的 ptrace 与读内存，但挡不住同 uid 的 `kill`；若 guest 里杀掉 launcher 后 `:8898` 能被租户进程重新监听，伪造的 launcher 会在下一次 `/boot` 收到完整 boot env（含共享 LLM 凭据与出境私钥）。根治要改进程模型（launcher 以 root 运行、降权后再拉起引擎，私钥放 root 专属目录或交给 agent 托管），列在放量前的收紧清单里。可以在沙箱里只观察不动手：`pgrep -af launcher; ps -o pid,ppid,user,cmd -p 1`。
 
 ### 换模型（不需要动代码）
 
 模型名是运行时参数（`LANGCHAIN_MODEL_NAME`）。「哪些模型拒绝 `temperature`」这份策略同样由 env 表达，不需要重建镜像：
 
 ```bash
-# 换模型：改这一行 → systemctl restart cube-router，完事
+# 换模型：改这一行 → systemctl restart cube-router；各租户在下一次 /ask 时重启一次引擎换上新模型
 LANGCHAIN_MODEL_NAME=claude-opus-5
 
 # 如果新模型也拒绝 temperature，而 llm.py 的内置名单还没收录它：
@@ -186,6 +215,8 @@ LANGCHAIN_NO_TEMPERATURE_MODELS=opus-6,某新模型
 # 或者干脆对所有模型都不发 temperature：
 LANGCHAIN_TEMPERATURE=none
 ```
+
+换到上下文窗口明显更小的内置模型（如 128k 一类）时，同时设 `VIBE_CONTEXT_WINDOW_TOKENS=<窗口减去输出上限>`，让引擎的压缩阈值按窗口封顶（引擎只会用它压低阈值：`窗口 × 0.8 ÷ 实测估算比例 − 工具 schema 体积`）。
 
 判定实现见 `agent/src/providers/llm.py` 的 `omit_temperature()`。内置名单 `NO_TEMPERATURE_MODELS` 按**版本**精确匹配（`opus-4-7 / opus-4-8 / opus-5 / sonnet-5 / fable / mythos`）而不是笼统的 `opus`/`sonnet`——Opus 4.6、Sonnet 4.6 及更早仍接受 `temperature`，笼统匹配会让它们悄悄丢掉 `temperature=0`。
 
@@ -205,7 +236,9 @@ tail -f /var/lib/cube-router/ask_log.jsonl
 # 租户引擎日志/trace 在宿主 bind-mount 盘上直读（无需进沙箱）：
 #   /data/shared/vibe/<tk>/logs/engine.jsonl
 #   /data/shared/vibe/<tk>/sessions/<sid>/trace.jsonl
-# 也可经 /obs/* 端点在线取（laicai 管理端详情页就是这么看的）
+# 也可经 /obs/* 端点在线取：laicai 的执行 Trace 页用 /obs/trace、/obs/swarm-events、/obs/prompt；
+# /obs/ask-log 与 /obs/engine-log 目前 laicai 没有页面在用，只能 curl：
+curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8990/obs/ask-log?uid=<laicai userId>&attempt_id=<id>" | jq .
 
 cat /var/lib/cube-router/state.json                   # 租户 → 沙箱映射
 # WebUI http://<宿主机>:12088 可视化查看沙箱列表/状态
@@ -213,7 +246,7 @@ cat /var/lib/cube-router/state.json                   # 租户 → 沙箱映射
 curl -s -H "X-API-Key: e2b_000000" -XPOST http://127.0.0.1:3000/sandboxes/<id>/resume
 ```
 
-日常排障入口优先用 laicai 管理端：运营 Tab「深度引擎」→ 点最近调用明细行 → 详情页有链路瀑布、逐工具耗时、数据缺失表和三个在线日志面板。命令行五步追查见 [docs/OBSERVABILITY.md §10](docs/OBSERVABILITY.md)。
+日常排障入口优先用 laicai 管理端：深度引擎看板 `/app/admin/deep-engine` → 点明细行进调用详情页 `/app/admin/deep-run/$id`（库内数据：链路瀑布、逐工具耗时、数据缺失表）→ 执行 Trace 页 `/app/admin/deep-trace/$id`（经 `/obs/trace`、`/obs/swarm-events`、`/obs/prompt` 在线读租户 trace、swarm 事件与完整输入 prompt）。router 调用日志与引擎日志没有页面，按上面的 curl 或下机器看。命令行五步追查见 [docs/OBSERVABILITY.md §10](docs/OBSERVABILITY.md)。
 
 ## 本地开发（引擎单实例）
 
@@ -227,20 +260,20 @@ vibe-trading serve --host 127.0.0.1 --port 8899
 ```
 
 - `serve` 默认 `--host 0.0.0.0 --port 8000`；本地调试建议显式绑 loopback。
-- 单机模式**不要**设 `VIBE_MULTITENANT=1`（缺 `VIBE_DATA_DIR` 会 fail-loud 拒绝启动，这是设计行为）。
+- 单机模式**不要**设 `VIBE_MULTITENANT=1`（缺 `VIBE_DATA_DIR` 会 fail-loud 拒绝启动，这是设计行为；设了还会取消 loopback 免鉴权）。设了 `VIBE_TRADING_TENANT_SAFE` 或 `VIBE_MULTITENANT` 任一项时引擎不读任何 `.env`，LLM 配置要走进程 env。
 - 上游 Web UI：`frontend/` 下 `npm install && npm run dev`（生产不使用）。
 
 ## 已知坑
 
 - **沙箱 pause 后，数据面流量不会自动唤醒它**（one-click 形态的 cube-proxy 行为）：必须显式 `POST /sandboxes/<id>/resume`。router 已内建处理（launcher 探活失败 → resume → 重试），手工 curl 沙箱调试时要自己 resume。
 - **E2B SDK 默认给沙箱 5 分钟 TTL**（endAt 到期即销毁）。永不过期的沙箱必须用裸 CubeAPI 创建且**不带 timeout**（one-click 的 `default_timeout_insec=-1`），router 即如此；勿用 SDK 默认参数建租户沙箱。
-- **经 cube-proxy 访问引擎不是 loopback**，引擎的 loopback 信任不生效——所有对**引擎** `:8899` 的请求必须带 `Authorization: Bearer <API_AUTH_KEY>`（router 每次 boot 随机生成并持久化在 state.json）。**launcher `:8898` 无鉴权**（`/health` `/boot` `/stop` 裸 HTTP）：它只能经宿主内 split-DNS 解析的 cube-proxy 路由到达，对外没有暴露面，安全边界是宿主而不是 token。
+- **引擎在多租户档不信任任何调用方**：所有对**引擎** `:8899` 的请求必须带 `Authorization: Bearer <API_AUTH_KEY>`（router 每次 boot 随机生成并持久化在 state.json）——经 cube-proxy 进来的本就不是 loopback，而 `VIBE_MULTITENANT=1` 下 guest 内的 loopback 调用（沙箱里手工 curl 调试也算）同样要带 key。引擎进程 non-dumpable，同 uid 读不到它的 `/proc/<pid>/environ`。**launcher `:8898` 默认无鉴权**（`/health` `/boot` `/stop` 裸 HTTP）：宿主外没有暴露面，但 guest 内经 loopback 可达；`VIBE_LAUNCHER_AUTH=1` 让新建沙箱的 launcher 要求 router token（`/health` 始终开放），未开时 router 启动打 warning，见「launcher 鉴权：开启与回滚」。
 - **cube-router 以 root 运行**（`cube-router.service` `User=root`）——它需要读写 `/data/shared/vibe/<tk>`（owner 1000:1000）、调 `cubemastercli`、访问 CubeAPI socket。**TODO：降权**（改成专用用户 + 对 CubeAPI socket/`cubemastercli` 的权限梳理 + 租户目录 gid 共享）；在此之前所有宿主直读直写租户目录的端点都必须过 `_safe_tenant_path` 的 symlink/越界守卫，这是 root 侧唯一的防线。
 - **阿里云北京机房出网限制**：Docker Hub 直连超时（配镜像加速）；镜像内 apt/pip 用 mirrors.huaweicloud.com（`Dockerfile` 已内置）——阿里云镜像站对 HTTP/1.1 客户端（apt、pip）限速到约 100 kB/s，只有 HTTP/2 的 curl 才快，一次构建会拖到小时级；华为云走 HTTP/1.1 有 10 MB/s 以上。境外搜索/雅虎数据现经**沙箱内 SSH 隧道 + B 服务器白名单代理**出境（见 docs/OBSERVABILITY.md §6）；A 股链路 akshare/tushare/mootdx 可能抖动，`market_data` 会沿降级链自动换源。
 - **明文 HTTP 代理跨境必死**：`CONNECT <被墙域名>` 行明文过境会被按关键字重置（实测 duckduckgo 0.13s 秒断、yahoo 通）——出境代理必须走加密隧道，这是隧道端点放进沙箱的根本原因。
 - **B 端 tinyproxy 的域名白名单是全局的**：laicai market-data 的 md 隧道流量同受约束，market-data 新增境外数据域时要同步补 `/etc/tinyproxy/filter`；引擎侧三个消费方（`web_search` 的搜索引擎域、`read_url` 的 `r.jina.ai`、yfinance 的 yahoo/yimg）少放行任何一个，对应工具在沙箱内就会整体失败而不是退回直连。另两个 tinyproxy 坑：Ubuntu 的 AppArmor 只放行规范路径，filter 文件需在 `/etc/apparmor.d/local/tinyproxy` 加 `file r` 规则；conf 无 `LogFile` 时日志在 journald 而非 /var/log。
 - **ddgs 9.x 已移除 google/bing 后端**：传旧列表会 warning 并缩小引擎池；用 `auto`。数据中心出口 IP 被各免费搜索引擎随机反爬属常态，空结果不等于链路故障（先看 launcher `/health` 的 `egress_tunnel`）。
 - **LLM 代理模型名只认短横线**：`claude-opus-4-8` 可用，`claude-opus-4.8` 404。
-- **`VIBE_ROUTER_SECRET` 不可轮换**：它决定每个租户的身份派生（HMAC），轮换等于把所有租户的沙箱与数据全部孤立。
+- **`VIBE_ROUTER_SECRET` 不可轮换**：它决定每个租户的身份派生（HMAC），轮换等于把所有租户的沙箱与数据全部孤立；launcher token 也由它派生，开着 `VIBE_LAUNCHER_AUTH` 时改它会让所有持 token 的沙箱 401。
 - **记忆目录的 `.MEMORY.lock` 不跨宿主/来宾互斥**：租户目录是宿主 bind-mount 进 MicroVM 的，`flock` 只在同一内核内有保证——引擎内多 attempt 之间有效，router `/memory/delete` 的 flock 只防宿主侧并发编辑，两侧之间的竞争靠「索引由条目文件重建」自愈；router 侧取锁有上限（`VIBE_MEMORY_LOCK_TIMEOUT_S`，默认 5s，非阻塞 + 重试），超时记一行 warning 后不加锁照删。
-- **GoalStore 与会话搜索索引共用文件名** `~/.vibe-trading/sessions.db`（上游两处硬编码同名，两个不同对象、不同锁写同一文件有损坏风险）；需要分离时用 `VIBE_TRADING_GOAL_DB_PATH` 指到别处。
+- **GoalStore 与会话搜索索引共用文件名** `~/.vibe-trading/sessions.db`（上游两处硬编码同名，两个不同对象、不同锁写同一文件有损坏风险）；需要分离时用 `VIBE_TRADING_GOAL_DB_PATH` 指到别处——它不在转发名单里，多租户下只能写进镜像 `ENV`。
