@@ -529,12 +529,48 @@ def _load_env_file(path: Path) -> None:
                 os.environ.setdefault(key, value.strip().strip('"').strip("'"))
 
 
+_TRUTHY_ENV = frozenset({"1", "true", "yes"})
+
+
+def _tenant_profile_active() -> bool:
+    """Whether this engine serves one tenant behind the multi-tenant gateway.
+
+    Either marker the router injects qualifies: the tenant-safe profile
+    (``src.config.tenant.tenant_safe_enabled`` — the same check that keeps
+    ``agent.json`` and the backtest Runner's ``load_dotenv`` off the tenant
+    disk) or the multi-tenant data-root flag ``VIBE_MULTITENANT``.
+    """
+    from src.config.tenant import tenant_safe_enabled
+
+    if tenant_safe_enabled():
+        return True
+    return os.getenv("VIBE_MULTITENANT", "").strip().lower() in _TRUTHY_ENV
+
+
 def _ensure_dotenv() -> None:
-    """Load `.env` from the first found candidate path."""
+    """Load `.env` from the first found candidate path.
+
+    Skipped entirely for a tenant engine: its whole configuration arrives as
+    process env from the router's ``/boot``, and every candidate is writable
+    by the tenant's own shell tools — ``~/.vibe-trading`` is the tenant's
+    bind-mount, and ``AGENT_DIR`` / the working directory sit in the image's
+    app dir, owned by the same uid the tools run as. A file dropped there
+    would be read into the engine process (which holds the shared LLM
+    credentials) on its next start, filling in any name the router did not
+    set itself.
+    """
     global _dotenv_loaded
     if _dotenv_loaded:
         return
     loaded = None
+    if _tenant_profile_active():
+        _dotenv_loaded = True
+        logger.info(
+            "dotenv skipped (tenant profile) | provider=%s model=%s",
+            os.getenv("LANGCHAIN_PROVIDER", "(unset)"),
+            os.getenv("LANGCHAIN_MODEL_NAME", "(unset)"),
+        )
+        return
     for candidate in _ENV_CANDIDATES:
         if candidate.exists():
             _load_env_file(candidate)
