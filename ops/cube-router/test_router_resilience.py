@@ -28,6 +28,8 @@ No CubeAPI, no sandbox, no engine: every upstream call is an async fake.
     a racing cold start aborts and removes its sandbox and data dir, and
     later asks for the tenant get 410 until the tombstone expires.
   · uvicorn access-log lines carry tk8 instead of the raw userId.
+  · /boot carries the per-sandbox launcher token as a Bearer header, and in
+    the env only with VIBE_LAUNCHER_AUTH=1 (a fingerprint-changing switch).
 """
 from __future__ import annotations
 
@@ -1019,3 +1021,44 @@ class TestLogPrivacy:
                                  ("1.2.3.4:1", "POST", "/ask", "1.1", 200), None)
         router._AccessLogUidRedactor().filter(rec)
         assert rec.args[2] == "/ask"
+
+
+# ── router → launcher token ──────────────────────────────────────────────────
+
+
+class TestLauncherToken:
+    def _boot(self, monkeypatch, clean_state, flag: bool):
+        monkeypatch.setattr(router, "LAUNCHER_AUTH", flag)
+
+        async def ok():
+            return _Resp(200, {"ok": True})
+
+        fake = _FakeHttp(ok)
+        monkeypatch.setattr(router, "http", fake)
+        inst = router.Instance("t" * 64, "sbx-abc", None, None)
+        router.pool[inst.tk] = inst
+        env, key = router.engine_env(None, None)
+        _run(router._boot_engine(inst, router.llm_fingerprint(None, None, env), env, key))
+        return fake.boots[0], inst, env
+
+    def test_off_by_default_header_only(self, monkeypatch, clean_state):
+        call, inst, env = self._boot(monkeypatch, clean_state, flag=False)
+        assert "VIBE_LAUNCHER_AUTH" not in env
+        assert "VIBE_LAUNCHER_TOKEN" not in call["env"]
+        assert call["headers"]["Authorization"] == f"Bearer {router.launcher_token('sbx-abc')}"
+
+    def test_on_hands_the_per_sandbox_token_to_the_launcher(self, monkeypatch, clean_state):
+        call, inst, env = self._boot(monkeypatch, clean_state, flag=True)
+        token = router.launcher_token("sbx-abc")
+        assert call["env"]["VIBE_LAUNCHER_TOKEN"] == token
+        assert call["headers"]["Authorization"] == f"Bearer {token}"
+        assert token != router.launcher_token("sbx-other")
+        assert token == router.launcher_token("sbx-abc")  # derivable after a restart
+        assert token not in (clean_state / "state.json").read_text()
+
+    def test_switching_the_flag_changes_every_fingerprint(self, monkeypatch):
+        monkeypatch.setattr(router, "LAUNCHER_AUTH", False)
+        off = router.llm_fingerprint(None, None, router.engine_env(None, None)[0])
+        monkeypatch.setattr(router, "LAUNCHER_AUTH", True)
+        on = router.llm_fingerprint(None, None, router.engine_env(None, None)[0])
+        assert off != on

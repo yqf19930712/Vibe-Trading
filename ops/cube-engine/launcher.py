@@ -4,14 +4,23 @@ Listens on :8898 (template probe target) and manages the engine process on
 :8899. The router boots/reboots the engine with per-tenant env via POST /boot,
 so a single template serves every tenant and every LLM configuration.
 
-Endpoints (no authentication — the launcher is reachable only through
-cube-proxy's host routing from the host itself; the engine on :8899 is the
-one that checks `Authorization: Bearer API_AUTH_KEY`):
+Authentication: /health is open (it is the template probe). /boot and /stop
+are open until the router hands over a token: a /boot whose env carries
+VIBE_LAUNCHER_TOKEN makes the launcher require `Authorization: Bearer
+<token>` on every later /boot and /stop (the launcher is reachable from
+inside the guest too, e.g. by the engine's shell tools over loopback). No
+tenant code runs in the guest before the first /boot, so nothing else can
+claim the token first. An authenticated /boot without a token drops the
+requirement again, which is how the router switches it off. The engine on
+:8899 checks its own `Authorization: Bearer API_AUTH_KEY`.
+
+Endpoints:
   GET  /health -> 200 {"launcher": "ok",
                        "engine": "running"|"starting"|"stopped",
                        "egress_tunnel": "up"|"down"|"off"}
                   (also respawns a dead egress tunnel, >=10s apart)
   POST /boot   -> {"env": {...}} kill current engine (if any), pop the
+                  VIBE_LAUNCHER_* keys (token adoption, see above) and the
                   VIBE_EGRESS_* keys out of env and (re)start the ssh egress
                   tunnel with them (key material never reaches the engine),
                   spawn `vibe-trading serve --host 0.0.0.0 --port 8899` with
@@ -21,6 +30,7 @@ one that checks `Authorization: Bearer API_AUTH_KEY`):
 """
 
 import base64
+import hmac
 import json
 import os
 import signal
@@ -41,6 +51,35 @@ _engine = {"proc": None}
 # /boot whose client went away keeps running here; a second /boot (or /stop)
 # arriving meanwhile waits for it instead of interleaving kill/spawn with it.
 _lifecycle_lock = threading.Lock()
+# Router token for /boot and /stop (None = not required yet), see module doc.
+_auth = {"token": None}
+
+
+def _authorized(headers):
+    token = _auth["token"]
+    if not token:
+        return True
+    got = str(headers.get("Authorization") or "")
+    return hmac.compare_digest(got.encode(), ("Bearer " + token).encode())
+
+
+def _adopt_token(extra_env):
+    """Pop the router-auth keys out of a /boot env and apply them."""
+    token = str(extra_env.pop("VIBE_LAUNCHER_TOKEN", "") or "")
+    extra_env.pop("VIBE_LAUNCHER_AUTH", None)
+    _auth["token"] = token or None
+
+
+def _no_dumps():
+    """Keep same-uid processes (the engine's shell tools) from ptrace-ing
+    this process or reading its memory, where the router token lives."""
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE = 4
+    except Exception:  # noqa: BLE001 - not Linux / no libc: nothing to harden
+        pass
 # In-guest encrypted egress tunnel: sandbox -> ssh -> server B's loopback
 # tinyproxy (domain-whitelisted). A plaintext HTTP proxy across the border
 # gets keyword-reset on the CONNECT line for blocked domains; SSH does not.
@@ -219,7 +258,7 @@ class Handler(BaseHTTPRequestHandler):
             tunnel_proc = _tunnel["proc"]
             ssh_alive = tunnel_proc is not None and tunnel_proc.poll() is None
             # "up" requires the forward to actually accept connections — an
-            # alive ssh with a dead forward is what starved run 88e080ef0a46.
+            # alive ssh whose forward is dead still fails every proxied call.
             tunnel = (
                 "off" if not _tunnel["cmd"]
                 else "up" if ssh_alive and _tunnel_port_open()
@@ -230,6 +269,9 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path in ("/boot", "/stop") and not _authorized(self.headers):
+            self._reply(401, {"error": "unauthorized"})
+            return
         if self.path == "/boot":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -241,6 +283,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._reply(400, {"error": str(exc)})
                 return
             with _lifecycle_lock:
+                _adopt_token(extra_env)
                 ok, msg = _boot_engine(extra_env)
             self._reply(200 if ok else 500, {"ok": ok, "detail": msg})
         elif self.path == "/stop":
@@ -255,5 +298,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    _no_dumps()
     threading.Thread(target=_tunnel_keeper, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", LAUNCHER_PORT), Handler).serve_forever()

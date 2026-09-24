@@ -172,6 +172,26 @@ def forwarded_env_names(environ: "dict[str, str] | os._Environ[str]" = os.enviro
         and not k.startswith(FORWARD_ENV_DENY_PREFIXES)
     )
 
+# Router → launcher authentication (opt-in). Each sandbox's launcher token
+# is derived from the router secret and the sandbox id (nothing to store,
+# survives router restarts). The header is always sent — launchers that
+# predate it ignore it. With VIBE_LAUNCHER_AUTH=1 the token also rides in
+# the /boot env, and a launcher that supports it then refuses /boot and
+# /stop without it (the guest's own shell can otherwise reach the launcher
+# over loopback). The flag itself is part of the boot env, so switching it
+# changes every engine fingerprint and each tenant re-boots — adopting or
+# dropping the token — on its next ask. Off by default: once a launcher has
+# adopted a token, a router build without this code can no longer /boot it
+# (see README_CUSTOM for the enable / rollback order).
+LAUNCHER_AUTH = os.environ.get("VIBE_LAUNCHER_AUTH", "0").strip().lower() in {"1", "true", "yes"}
+
+
+def launcher_token(sandbox_id: str) -> str:
+    return hmac.new(
+        ROUTER_SECRET.encode(), f"launcher:{sandbox_id}".encode(), hashlib.sha256
+    ).hexdigest()
+
+
 # In-guest egress tunnel credentials (optional): private key file on the host
 # + ssh destination (server B). Injected into each sandbox via launcher /boot.
 EGRESS_KEY_FILE = os.environ.get("VIBE_EGRESS_KEY_FILE", "")
@@ -335,6 +355,10 @@ def engine_env(model: Optional[str], llm: Optional["LlmOverride"]) -> tuple[dict
     # read_url (r.jina.ai) and the yfinance loader then use
     # VIBE_TRADING_EGRESS_PROXY. Key material is consumed by the launcher and
     # never enters the engine process env.
+    if LAUNCHER_AUTH:
+        # Consumed by the launcher (with the per-sandbox token _boot_engine
+        # adds); here so that switching the flag changes the fingerprint.
+        env["VIBE_LAUNCHER_AUTH"] = "1"
     if _EGRESS_KEY_B64 and EGRESS_SSH_DEST:
         env["VIBE_EGRESS_SSH_KEY_B64"] = _EGRESS_KEY_B64
         env["VIBE_EGRESS_SSH_DEST"] = EGRESS_SSH_DEST
@@ -683,8 +707,12 @@ async def _boot_engine(inst: Instance, fp: Optional[str], env: dict, api_key: st
     inst.api_key = api_key
     inst.llm_fp = _pending_fp(fp)
     _persist_instance(inst)
+    token = launcher_token(inst.sandbox_id)
+    if env.get("VIBE_LAUNCHER_AUTH"):
+        env = {**env, "VIBE_LAUNCHER_TOKEN": token}
     r = await http.post(
         f"{inst.launcher_url}/boot", json={"env": env},
+        headers={"Authorization": f"Bearer {token}"},
         timeout=httpx.Timeout(30.0, read=float(READY_TIMEOUT_S)),
     )
     if r.status_code != 200:
