@@ -5,14 +5,15 @@ Listens on :8898 (template probe target) and manages the engine process on
 so a single template serves every tenant and every LLM configuration.
 
 Authentication: /health is open (it is the template probe). /boot and /stop
-are open until the router hands over a token: a /boot whose env carries
-VIBE_LAUNCHER_TOKEN makes the launcher require `Authorization: Bearer
-<token>` on every later /boot and /stop (the launcher is reachable from
-inside the guest too, e.g. by the engine's shell tools over loopback). No
-tenant code runs in the guest before the first /boot, so nothing else can
-claim the token first. An authenticated /boot without a token drops the
-requirement again, which is how the router switches it off. The engine on
-:8899 checks its own `Authorization: Bearer API_AUTH_KEY`.
+are open unless the router handed over a token with the launcher's FIRST
+/boot (env key VIBE_LAUNCHER_TOKEN); from then on both require
+`Authorization: Bearer <token>` (the launcher is reachable from inside the
+guest too, e.g. by the engine's shell tools over loopback). Only the first
+/boot may set a token: no tenant code runs in the guest before it, whereas
+after it an unauthenticated caller could be guest code, so a launcher that
+started without a token stays without one. An authenticated /boot without
+a token drops the requirement, which is how the router switches it off.
+The engine on :8899 checks its own `Authorization: Bearer API_AUTH_KEY`.
 
 Endpoints:
   GET  /health -> 200 {"launcher": "ok",
@@ -51,8 +52,9 @@ _engine = {"proc": None}
 # /boot whose client went away keeps running here; a second /boot (or /stop)
 # arriving meanwhile waits for it instead of interleaving kill/spawn with it.
 _lifecycle_lock = threading.Lock()
-# Router token for /boot and /stop (None = not required yet), see module doc.
-_auth = {"token": None}
+# Router token for /boot and /stop (None = not required), and how many
+# /boot requests this launcher has taken; see module doc.
+_auth = {"token": None, "boots": 0}
 
 
 def _authorized(headers):
@@ -64,10 +66,16 @@ def _authorized(headers):
 
 
 def _adopt_token(extra_env):
-    """Pop the router-auth keys out of a /boot env and apply them."""
+    """Pop the router-auth keys out of an (already authorized) /boot env.
+
+    The token is set on the first /boot, and changed or dropped by a later
+    one only while a token is in force (the request then carried it).
+    """
     token = str(extra_env.pop("VIBE_LAUNCHER_TOKEN", "") or "")
     extra_env.pop("VIBE_LAUNCHER_AUTH", None)
-    _auth["token"] = token or None
+    if _auth["boots"] == 0 or _auth["token"]:
+        _auth["token"] = token or None
+    _auth["boots"] += 1
 
 
 def _no_dumps():

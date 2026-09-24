@@ -6,9 +6,11 @@ The launcher runs a real ThreadingHTTPServer on an ephemeral loopback port;
 engine spawning is replaced by a recorder, so no `vibe-trading` process and
 no ssh tunnel are started.
 
-  · /boot and /stop are open until a /boot hands over VIBE_LAUNCHER_TOKEN;
-    from then on both require it as a Bearer header, and an authenticated
-    /boot without a token drops the requirement. /health stays open.
+  · /boot and /stop are open unless the FIRST /boot handed over
+    VIBE_LAUNCHER_TOKEN; then both require it as a Bearer header, and an
+    authenticated /boot without a token drops the requirement. A launcher
+    that started without a token cannot be made to adopt one later (that
+    caller could be guest code). /health stays open.
   · The token never reaches the engine env.
   · Engine lifecycle changes (/boot, /stop) are serialized.
 """
@@ -105,6 +107,15 @@ def test_adopted_token_is_required_and_never_reaches_the_engine(launcher):
     assert _call(base, "POST", "/stop", token="tok-123")[0] == 200
     assert _call(base, "POST", "/boot", {"env": {**env, "B": "2"}}, token="tok-123")[0] == 200
     assert booted[-1] == {"A": "1", "B": "2"}
+
+
+def test_a_token_offered_after_the_first_boot_is_ignored(launcher):
+    mod, base, booted, _ = launcher
+    assert _call(base, "POST", "/boot", {"env": {"A": "1"}})[0] == 200
+    # Guest code trying to lock the router out of its own launcher.
+    assert _call(base, "POST", "/boot", {"env": {"VIBE_LAUNCHER_TOKEN": "evil"}})[0] == 200
+    assert _call(base, "POST", "/stop")[0] == 200
+    assert booted[-1] == {}  # the key was still stripped from the engine env
 
 
 def test_authenticated_boot_without_token_drops_the_requirement(launcher):

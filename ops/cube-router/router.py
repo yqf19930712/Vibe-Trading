@@ -179,13 +179,13 @@ def forwarded_env_names(environ: "dict[str, str] | os._Environ[str]" = os.enviro
 # is derived from the router secret and the sandbox id (nothing to store,
 # survives router restarts). The header is always sent — launchers that
 # predate it ignore it. With VIBE_LAUNCHER_AUTH=1 the token also rides in
-# the /boot env, and a launcher that supports it then refuses /boot and
-# /stop without it (the guest's own shell can otherwise reach the launcher
-# over loopback). The flag itself is part of the boot env, so switching it
-# changes every engine fingerprint and each tenant re-boots — adopting or
-# dropping the token — on its next ask. Off by default: once a launcher has
-# adopted a token, a router build without this code can no longer /boot it
-# (see README_CUSTOM for the enable / rollback order).
+# the /boot env; a launcher that supports it takes the token only from its
+# first /boot (i.e. in sandboxes created while the flag is on) and then
+# refuses /boot and /stop without it — the guest's own shell can otherwise
+# reach the launcher over loopback. The flag is part of the boot env, so
+# switching it off changes every engine fingerprint and each tenant re-boots
+# on its next ask, which drops the token again. Off by default: a launcher
+# holding a token cannot be /booted by a router build without this code.
 LAUNCHER_AUTH = os.environ.get("VIBE_LAUNCHER_AUTH", "0").strip().lower() in {"1", "true", "yes"}
 
 
