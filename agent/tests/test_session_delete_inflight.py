@@ -301,3 +301,69 @@ def test_fts_failure_after_the_receipt_does_not_fail_the_attempt(env, monkeypatc
     monkeypatch.setattr(idx, "index_message", _index)
     sid, _aid = _run_one(svc, {"status": "success", "content": "ok"})
     assert "attempt.completed" in events and "attempt.failed" not in events
+
+
+# ── opt-in retention sweep ───────────────────────────────────────────────────
+
+
+def _age(path: Path, days: float) -> None:
+    import os
+    import time
+
+    ts = time.time() - days * 86400
+    for f in path.iterdir():
+        if f.is_file():
+            os.utime(f, (ts, ts))
+
+
+def test_retention_is_off_by_default(env, monkeypatch) -> None:
+    svc, _idx, data = env
+    monkeypatch.delenv("VIBE_SESSION_RETENTION_DAYS", raising=False)
+    sid = svc.create_session("old").session_id
+    _age(data / "sessions" / sid, 400)
+    assert svc.sweep_expired_sessions() == []
+    assert (data / "sessions" / sid).exists()
+
+
+def test_retention_deletes_idle_sessions_through_delete_session(env, monkeypatch) -> None:
+    svc, idx, data = env
+    monkeypatch.setenv("VIBE_SESSION_RETENTION_DAYS", "90")
+    old = svc.create_session("old").session_id
+    idx.index_message(old, "user", "ancient question")
+    fresh = svc.create_session("fresh").session_id
+    _age(data / "sessions" / old, 120)
+    _age(data / "sessions" / fresh, 10)
+
+    assert svc.sweep_expired_sessions() == [old]
+    assert not (data / "sessions" / old).exists()
+    assert (data / "sessions" / fresh).exists()
+    assert _fts_rows(idx, old) == 0
+
+
+def test_retention_dry_run_only_reports(env, monkeypatch) -> None:
+    svc, _idx, data = env
+    monkeypatch.setenv("VIBE_SESSION_RETENTION_DAYS", "90")
+    monkeypatch.setenv("VIBE_SESSION_RETENTION_DRY_RUN", "1")
+    old = svc.create_session("old").session_id
+    _age(data / "sessions" / old, 120)
+    assert svc.sweep_expired_sessions() == [old]
+    assert (data / "sessions" / old).exists()
+
+
+def test_retention_never_touches_a_session_being_messaged(env, monkeypatch) -> None:
+    svc, _idx, data = env
+    monkeypatch.setenv("VIBE_SESSION_RETENTION_DAYS", "90")
+    sid = svc.create_session("old but active").session_id
+    _age(data / "sessions" / sid, 120)
+
+    async def fake_run_with_agent(attempt, **kw):
+        return {"status": "success", "content": "ok"}
+
+    svc._run_with_agent = fake_run_with_agent
+
+    async def main() -> None:
+        await svc.send_message(sid, "back after four months")
+        await asyncio.sleep(0.05)
+
+    asyncio.run(main())
+    assert (data / "sessions" / sid).exists()

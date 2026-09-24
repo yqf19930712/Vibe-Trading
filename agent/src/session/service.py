@@ -17,6 +17,15 @@ _AGENT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_na
 
 logger = logging.getLogger(__name__)
 
+# Session retention: ``VIBE_SESSION_RETENTION_DAYS`` (unset / non-positive =
+# keep forever, the default) deletes sessions idle for longer than that —
+# through ``delete_session``, so runs, swarm runs, FTS rows and the goal
+# ledger go with them. ``VIBE_SESSION_RETENTION_DRY_RUN=1`` only logs what
+# would go. Long-term memory (``memory/``) is never touched by it.
+RETENTION_DAYS_ENV = "VIBE_SESSION_RETENTION_DAYS"
+RETENTION_DRY_RUN_ENV = "VIBE_SESSION_RETENTION_DRY_RUN"
+_RETENTION_INTERVAL_S = 24 * 3600
+
 # Strong references for fire-and-forget tasks: the event loop only keeps
 # weak ones, so an attempt task with no other referrer could be collected
 # mid-flight.
@@ -85,6 +94,7 @@ class SessionService:
         # owned by the API layer), including the late re-sweep after a
         # deleted session's attempt finally exits.
         self._purge_hooks: List[Callable[[str], None]] = []
+        self._last_retention_sweep = 0.0
         self._search_index = get_shared_index()
 
     def add_purge_hook(self, hook: Callable[[str], None]) -> None:
@@ -205,6 +215,87 @@ class SessionService:
                 removed += 1
         return removed
 
+    @staticmethod
+    def _retention_days() -> Optional[float]:
+        import os
+
+        raw = os.getenv(RETENTION_DAYS_ENV, "").strip()
+        if not raw:
+            return None
+        try:
+            days = float(raw)
+        except ValueError:
+            logger.warning("%s=%r is not a number; session retention disabled", RETENTION_DAYS_ENV, raw)
+            return None
+        return days if days > 0 else None
+
+    def sweep_expired_sessions(
+        self, max_age_days: Optional[float] = None, *, dry_run: Optional[bool] = None
+    ) -> list[str]:
+        """Delete sessions idle for more than ``max_age_days`` (see ``RETENTION_DAYS_ENV``).
+
+        Idle age is the newest mtime of the session's own files
+        (``session.json`` / ``messages.jsonl``). Sessions with an attempt in
+        flight are never touched.
+
+        Returns:
+            The session ids deleted (or, in a dry run, that would be).
+        """
+        import os
+        import time as _time
+
+        days = max_age_days if max_age_days is not None else self._retention_days()
+        if days is None:
+            return []
+        if dry_run is None:
+            dry_run = os.getenv(RETENTION_DRY_RUN_ENV, "").strip().lower() in {"1", "true", "yes"}
+        cutoff = _time.time() - days * 86400.0
+        expired: list[str] = []
+        base = self.store.base_dir
+        try:
+            candidates = [p for p in base.iterdir() if p.is_dir() and not p.is_symlink()]
+        except OSError as exc:
+            logger.warning("session retention sweep skipped: %s", exc)
+            return []
+        for session_dir in candidates:
+            sid = session_dir.name
+            if sid.startswith(".") or sid in self._inflight:
+                continue
+            stamps = []
+            for name in ("session.json", "messages.jsonl"):
+                try:
+                    stamps.append((session_dir / name).stat().st_mtime)
+                except OSError:
+                    continue
+            if not stamps or max(stamps) >= cutoff:
+                continue
+            expired.append(sid)
+            if not dry_run:
+                self.delete_session(sid)
+        if expired:
+            logger.info(
+                "session retention (%s days)%s: %d session(s) %s",
+                days, " dry run" if dry_run else "", len(expired),
+                "would be deleted" if dry_run else "deleted",
+                extra={"session_ids": expired[:50]},
+            )
+        return expired
+
+    def maybe_sweep_expired_sessions(self) -> None:
+        """Run the retention sweep at most once a day (no-op while it is disabled)."""
+        import time as _time
+
+        if self._retention_days() is None:
+            return
+        now = _time.monotonic()
+        if self._last_retention_sweep and now - self._last_retention_sweep < _RETENTION_INTERVAL_S:
+            return
+        self._last_retention_sweep = now
+        try:
+            self.sweep_expired_sessions()
+        except Exception:  # noqa: BLE001 - housekeeping must never block a request
+            logger.warning("session retention sweep failed", exc_info=True)
+
     def reconcile_orphans(self, goal_store: Optional[Any] = None) -> list[str]:
         """Drop index/ledger rows of sessions whose directory is gone.
 
@@ -270,6 +361,8 @@ class SessionService:
 
         message = Message(session_id=session_id, role=role, content=content)
         self.store.append_message(message)
+        # After the append: this session's own mtime is now fresh.
+        self.maybe_sweep_expired_sessions()
         self._search_index.index_message(session_id, role, content)
         self.event_bus.emit(session_id, "message.received", {"message_id": message.message_id, "role": role, "content": content})
 

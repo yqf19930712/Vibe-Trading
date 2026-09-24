@@ -1903,6 +1903,8 @@ def _get_session_service():
     # sessions.db rows behind; sweep them before the first search can
     # surface a deleted conversation.
     _session_service.reconcile_orphans(goal_store=_get_goal_store())
+    # Opt-in retention (VIBE_SESSION_RETENTION_DAYS); a no-op by default.
+    _session_service.maybe_sweep_expired_sessions()
     return _session_service
 
 
