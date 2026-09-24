@@ -574,22 +574,55 @@ _ANTHROPIC_CACHE_CONTROL = {"type": "ephemeral"}
 _ANTHROPIC_CACHEABLE_BLOCK_TYPES = {"text", "tool_result", "tool_use", "image", "document"}
 
 # The loop's ephemeral status bar changes every iteration; a breakpoint on it
-# would never be reusable, so the breakpoint goes on the newest message that
-# is NOT the status bar.
+# would never be reusable. langchain-anthropic merges consecutive user-side
+# messages (tool results + the status bar) into ONE user message, so the
+# status bar usually arrives as the LAST text block of a merged message, not
+# as a message of its own — the skip therefore works per block.
 _AGENT_STATUS_PREFIX = "<agent_status>"
 
 
-def _message_starts_with_status(message: dict) -> bool:
-    """Return True when an anthropic-format message is the loop's status bar."""
-    content = message.get("content")
-    if isinstance(content, str):
-        return content.startswith(_AGENT_STATUS_PREFIX)
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                return str(block.get("text") or "").startswith(_AGENT_STATUS_PREFIX)
-            break
-    return False
+def _is_status_text(text: Any) -> bool:
+    """Return True for the loop's per-iteration status-bar text."""
+    return isinstance(text, str) and text.startswith(_AGENT_STATUS_PREFIX)
+
+
+def _mark_newest_stable_block(msgs: list) -> None:
+    """Put the message-level breakpoint on the newest stable content block.
+
+    Walks messages newest-first and, inside each, blocks last-first, skipping
+    status-bar text, empty text (the API rejects ``cache_control`` there) and
+    block types that do not accept a breakpoint (thinking). The first block
+    that survives gets the marker — in a merged ``[tool_result…, status]``
+    user message that is the last tool result, whose bytes recur unchanged in
+    the next request, so the prefix written here is read back next turn.
+    """
+    for message in reversed(msgs):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            if not content or _is_status_text(content):
+                continue
+            message["content"] = [
+                {"type": "text", "text": content, "cache_control": dict(_ANTHROPIC_CACHE_CONTROL)}
+            ]
+            return
+        if not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type not in _ANTHROPIC_CACHEABLE_BLOCK_TYPES:
+                continue
+            if block_type == "text":
+                text = block.get("text")
+                if not text or _is_status_text(text):
+                    continue
+            block["cache_control"] = dict(_ANTHROPIC_CACHE_CONTROL)
+            return
+        # Nothing cacheable in this message (status-only, thinking-only) —
+        # try the next older one.
 
 
 def _apply_anthropic_cache_breakpoints(payload: dict) -> None:
@@ -597,10 +630,11 @@ def _apply_anthropic_cache_breakpoints(payload: dict) -> None:
 
     Mutates ``payload`` in place. Three breakpoints (max 4 allowed by the
     API): the last tool definition (tools precede system in the cache
-    prefix), the system block tail, and the newest non-status message's last
-    cacheable content block. On the next call the request prefix up to that
-    message is byte-identical, so Anthropic's longest-prefix lookup reuses
-    the cache even though the breakpoint itself advances every turn.
+    prefix), the system block tail, and the newest stable content block of
+    the conversation (see :func:`_mark_newest_stable_block`). On the next
+    call the request prefix up to that block is byte-identical, so
+    Anthropic's longest-prefix lookup reuses the cache even though the
+    breakpoint itself advances every turn.
     """
     if not isinstance(payload, dict):
         return
@@ -635,26 +669,7 @@ def _apply_anthropic_cache_breakpoints(payload: dict) -> None:
     msgs = payload.get("messages")
     if not isinstance(msgs, list):
         return
-    for message in reversed(msgs):
-        if not isinstance(message, dict):
-            continue
-        if _message_starts_with_status(message):
-            continue
-        content = message.get("content")
-        if isinstance(content, str) and content:
-            message["content"] = [
-                {"type": "text", "text": content, "cache_control": dict(_ANTHROPIC_CACHE_CONTROL)}
-            ]
-            return
-        if isinstance(content, list) and content:
-            for block in reversed(content):
-                if (
-                    isinstance(block, dict)
-                    and block.get("type") in _ANTHROPIC_CACHEABLE_BLOCK_TYPES
-                ):
-                    block["cache_control"] = dict(_ANTHROPIC_CACHE_CONTROL)
-                    return
-        # Message had no cacheable block (e.g. thinking-only) — try older.
+    _mark_newest_stable_block(msgs)
 
 
 def _build_native_anthropic(model: str, callbacks: Any = None) -> Any:

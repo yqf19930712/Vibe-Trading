@@ -213,6 +213,19 @@ def _coerce_usage_int(value: Any) -> int:
         return 0
 
 
+# Prompt-cache counters carried through from LangChain's
+# ``usage_metadata.input_token_details`` (both already INCLUDED in
+# ``input_tokens`` — they break it down, they do not add to it). Output keys
+# are the names the ``llm_usage`` event / ``llm_usage.json`` / attempt_stats
+# use; each appears only when non-zero so channels without caching keep the
+# original three-field shape.
+_CACHE_USAGE_FIELDS = (
+    ("cache_read", "cache_read_tokens"),
+    ("cache_creation", "cache_creation_tokens"),
+)
+_CACHE_CREATION_TTL_KEYS = ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
+
+
 def _normalize_llm_usage(usage: Any) -> dict[str, int] | None:
     """Normalize provider-reported usage metadata without estimating tokens."""
     if usage is None:
@@ -230,11 +243,24 @@ def _normalize_llm_usage(usage: Any) -> dict[str, int] | None:
         total_tokens = input_tokens + output_tokens
     if not (input_tokens or output_tokens or total_tokens):
         return None
-    return {
+    normalized = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
     }
+    details = usage.get("input_token_details")
+    if isinstance(details, dict):
+        for source_key, out_key in _CACHE_USAGE_FIELDS:
+            value = _coerce_usage_int(details.get(source_key))
+            if not value and source_key == "cache_creation":
+                # langchain-anthropic zeroes the generic key when the API
+                # reports the per-TTL split; the split then carries the count.
+                value = sum(
+                    _coerce_usage_int(details.get(key)) for key in _CACHE_CREATION_TTL_KEYS
+                )
+            if value:
+                normalized[out_key] = value
+    return normalized
 
 
 def _new_llm_usage_summary(llm: Any) -> dict[str, Any]:
@@ -270,6 +296,9 @@ def _record_llm_usage(
     totals["output_tokens"] = int(totals.get("output_tokens") or 0) + normalized["output_tokens"]
     totals["total_tokens"] = int(totals.get("total_tokens") or 0) + normalized["total_tokens"]
     totals["calls"] = int(totals.get("calls") or 0) + 1
+    for _source_key, out_key in _CACHE_USAGE_FIELDS:
+        if normalized.get(out_key):
+            totals[out_key] = int(totals.get(out_key) or 0) + normalized[out_key]
     summary.setdefault("per_iteration", []).append({"iter": iteration, **normalized})
     summary["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -1963,6 +1992,13 @@ class AgentLoop:
                 "input": int(totals.get("input_tokens") or 0),
                 "output": int(totals.get("output_tokens") or 0),
                 "total": int(totals.get("total_tokens") or 0),
+                # Prompt-cache breakdown of ``input`` (only when non-zero):
+                # cache_read / input is the cache hit rate.
+                **{
+                    out_key.removesuffix("_tokens"): int(totals[out_key])
+                    for _source_key, out_key in _CACHE_USAGE_FIELDS
+                    if totals.get(out_key)
+                },
             },
             "tools": tools,
             "data_fetches": [],
