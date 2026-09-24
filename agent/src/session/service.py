@@ -773,15 +773,13 @@ class SessionService:
            previous attempt) is prepended as background reference. Without it,
            everything an earlier attempt compressed away was simply gone: the
            replay only ever carried raw user/assistant text.
-        2. Raw turns are then filled newest-first against a TOKEN budget using
-           the CJK-weighted estimator, not a flat character count. The old
-           ``MAX_HISTORY_CHARS = 12000`` was annotated "roughly 3000 tokens",
-           which holds for English only — by this repo's own estimator 12k
-           Chinese characters is ~7.2k tokens, so the two co-existing units
-           disagreed by 2.4x. ``MAX_HISTORY_TOKENS`` is deliberately set to
-           6000 (≈ today's real Chinese-session volume) rather than the 3000 of
-           the stale comment: this change unifies the unit, it does not also
-           halve the budget.
+        2. Raw turns — a question with its answer — are then filled
+           newest-first against a TOKEN budget using the CJK-weighted
+           estimator (``src.session.replay``). The newest turn is always
+           replayed, cut in the middle when it alone is over budget; omitted
+           older turns leave a note where they were. ``MAX_HISTORY_TOKENS``
+           is 6000 (≈ a real Chinese session's volume); the old character
+           budget undercounted CJK text by 2.4x.
 
         Args:
             messages: Session message list without the current turn.
@@ -789,20 +787,18 @@ class SessionService:
                 no summary layer (the raw-replay behavior).
 
         Returns:
-            OpenAI-format messages: optional summary + omission note + the
-            newest raw turns that fit the token budget.
+            OpenAI-format messages: optional summary, then the replayed turns
+            with omission notes in place.
         """
         import re
         from pathlib import Path
 
-        from src.core.token_estimate import estimate_text_tokens
         from src.session import handoff
+        from src.session import replay
         from src.agent.context_policy import HANDOFF_PREFIX
 
         MAX_HISTORY_TOKENS = 6_000
         HANDOFF_INJECT_MAX_TOKENS = 2_000
-        # Rough per-message envelope overhead (role, delimiters).
-        PER_MESSAGE_TOKENS = 8
 
         def _shorten_run_dir(match: re.Match) -> str:
             path_str = match.group(0).replace("Run directory:", "").strip()
@@ -815,22 +811,14 @@ class SessionService:
             content = msg.content if hasattr(msg, "content") else msg.get("content", "")
             if not content.strip() or role not in ("user", "assistant"):
                 continue
+            if role == "assistant" and content.startswith(replay.FAILED_RECEIPT_PREFIX):
+                content = replay.failed_receipt_status(content)
             content = re.sub(r"Run directory:\s*\S+", _shorten_run_dir, content).strip()
             if content:
                 history.append({"role": role, "content": content})
 
-        budget = MAX_HISTORY_TOKENS
-        trimmed: list = []
-        dropped = 0
-        for msg in reversed(history):
-            cost = estimate_text_tokens(msg.get("content", "")) + PER_MESSAGE_TOKENS
-            if cost > budget:
-                # Not a break: a shorter older turn may still fit.
-                dropped += 1
-                continue
-            trimmed.append(msg)
-            budget -= cost
-        trimmed.reverse()
+        turns = replay.group_turns(history)
+        slots = replay.fit_turns(turns, MAX_HISTORY_TOKENS)
 
         out: list[Dict[str, Any]] = []
         summary = handoff.load(session_id) if session_id else ""
@@ -854,22 +842,28 @@ class SessionService:
                     ),
                 }
             )
-        if dropped:
-            out.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"[{dropped} earlier turns in this session were omitted "
-                        "from this replay to fit the context budget."
-                        + (
-                            " Their content is covered by the summary above.]"
-                            if summary
-                            else "]"
-                        )
-                    ),
-                }
-            )
-        out.extend(trimmed)
+        dropped = 0
+        for turn in slots:  # the newest slot is never None
+            if turn is None:
+                dropped += 1
+                continue
+            if dropped:
+                out.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"[{dropped} earlier turns in this session were omitted "
+                            "from this replay at this point to fit the context budget."
+                            + (
+                                " Their content is covered by the summary above.]"
+                                if summary
+                                else "]"
+                            )
+                        ),
+                    }
+                )
+                dropped = 0
+            out.extend(turn)
         return out
 
     @staticmethod

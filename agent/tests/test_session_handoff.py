@@ -155,6 +155,8 @@ class TestHistoryInjection:
     def test_dropped_turns_get_an_explicit_placeholder(self) -> None:
         """P2-9: silently vanishing turns read as "nothing happened"."""
         msgs = [{"role": "user", "content": "老" * 20_000}]
+        msgs += [{"role": "assistant", "content": "old answer"}]
+        msgs += [{"role": "user", "content": "recent question"}]
         msgs += [{"role": "assistant", "content": "recent answer"}]
         msgs += [{"role": "user", "content": "current turn"}]
 
