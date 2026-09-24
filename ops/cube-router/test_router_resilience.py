@@ -27,6 +27,7 @@ No CubeAPI, no sandbox, no engine: every upstream call is an async fake.
   · /forget writes a tombstone first and takes the tenant lock (bounded):
     a racing cold start aborts and removes its sandbox and data dir, and
     later asks for the tenant get 410 until the tombstone expires.
+  · uvicorn access-log lines carry tk8 instead of the raw userId.
 """
 from __future__ import annotations
 
@@ -982,3 +983,39 @@ class TestForgetTombstone:
         assert "u" in router.state
         router._drop_state_row("u")
         assert "u" not in router.state
+
+
+# ── no raw userId / memory title in router logs ──────────────────────────────
+
+
+class TestLogPrivacy:
+    def test_access_log_uid_becomes_tk8(self):
+        import logging as _logging
+
+        f = router._AccessLogUidRedactor()
+        uid = "user_2xYz+abc@example"
+        from urllib.parse import quote_plus
+
+        path = f"/memory?uid={quote_plus(uid)}&limit=5"
+        rec = _logging.LogRecord("uvicorn.access", _logging.INFO, __file__, 1,
+                                 '%s - "%s %s HTTP/%s" %d',
+                                 ("127.0.0.1:5555", "GET", path, "1.1", 200), None)
+        assert f.filter(rec) is True
+        line = rec.getMessage()
+        assert uid not in line and quote_plus(uid) not in line
+        assert f"uid=tk8:{router.tenant_key(uid)[:8]}&limit=5" in line
+
+    def test_filter_is_installed_on_the_uvicorn_access_logger(self):
+        import logging as _logging
+
+        assert any(isinstance(f, router._AccessLogUidRedactor)
+                   for f in _logging.getLogger("uvicorn.access").filters)
+
+    def test_lines_without_uid_are_untouched(self):
+        import logging as _logging
+
+        rec = _logging.LogRecord("uvicorn.access", _logging.INFO, __file__, 1,
+                                 '%s - "%s %s HTTP/%s" %d',
+                                 ("1.2.3.4:1", "POST", "/ask", "1.1", 200), None)
+        router._AccessLogUidRedactor().filter(rec)
+        assert rec.args[2] == "/ask"

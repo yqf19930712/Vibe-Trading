@@ -663,7 +663,12 @@ class TestMemoryDeleteIsAudited:
         assert (mem / "MEMORY.md").read_text() == "- [y](project_y.md) — y\n"
         line = next(r.getMessage() for r in caplog.records if "memory/delete" in r.getMessage())
         assert router.tenant_key(UID)[:8] in line
-        assert "project_x.md" in line and "existed=True" in line
+        assert "existed=True" in line
+        # The name is a slug of the memory's title: only its hash is logged.
+        import hashlib as _hashlib
+
+        assert "project_x" not in line
+        assert _hashlib.sha256(b"project_x.md").hexdigest()[:12] in line
         assert not (mem / ".MEMORY.lock").is_symlink()
 
 

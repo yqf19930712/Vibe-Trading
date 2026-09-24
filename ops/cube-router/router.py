@@ -50,6 +50,7 @@ import shutil
 import stat as stat_mod
 import subprocess
 import time
+import urllib.parse
 from collections import deque
 from pathlib import Path
 from typing import Any, Optional
@@ -192,6 +193,39 @@ def tenant_key(uid: str) -> str:
     """Stable, irreversible per-tenant id. Same derivation as vibe-router v1 so
     existing laicai thread↔session bindings keep their tenant identity."""
     return hmac.new(ROUTER_SECRET.encode(), uid.encode(), hashlib.sha256).hexdigest()
+
+
+class _AccessLogUidRedactor(logging.Filter):
+    """Replace ``uid=<userId>`` in uvicorn access-log lines with the tenant's tk8.
+
+    The GET endpoints (/memory, /obs/*) take the raw laicai userId as a query
+    parameter, and uvicorn logs the full path with its query string; the raw
+    id must not reach journald. tk8 is what every other router log line and
+    the ask log use, so correlation still works.
+    """
+
+    _UID_RE = re.compile(r"([?&]uid=)([^&\s]*)")
+
+    @classmethod
+    def _sub(cls, text: str) -> str:
+        return cls._UID_RE.sub(
+            lambda m: m.group(1) + "tk8:" + tenant_key(urllib.parse.unquote_plus(m.group(2)))[:8],
+            text,
+        )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple) and any(
+            isinstance(a, str) and "uid=" in a for a in record.args
+        ):
+            record.args = tuple(
+                self._sub(a) if isinstance(a, str) else a for a in record.args
+            )
+        elif isinstance(record.msg, str) and "uid=" in record.msg:
+            record.msg = self._sub(record.msg)
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_AccessLogUidRedactor())
 
 
 MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-\[\]]{0,99}")
@@ -2184,8 +2218,11 @@ async def memory_delete(body: dict, authorization: Optional[str] = Header(None))
 
     existed = await asyncio.to_thread(_delete)
     # Audit line: the only record of "which memory was removed, for which
-    # tenant, when" once the file is gone.
-    log.info("memory/delete tenant %s name %s existed=%s", tenant_key(uid)[:8], name, existed)
+    # tenant, when" once the file is gone. The file name is a slug of the
+    # memory's title (holdings, tickers…), so only its hash is logged —
+    # enough to match a later question about one specific entry.
+    log.info("memory/delete tenant %s entry %s existed=%s", tenant_key(uid)[:8],
+             hashlib.sha256(name.encode()).hexdigest()[:12], existed)
     return {"ok": True, "deleted": existed}
 
 
