@@ -12,9 +12,11 @@ The image cannot be built here, so the Dockerfile is parsed instead:
   · Bytecode is compiled at build time, before the image switches user; the
     runtime env disables bytecode writes and the user site-packages dir, and
     pins VIBE_DATA_DIR so no fallback lands tenant state in /app.
-  · The container runs as the unprivileged user.
+  · The container runs as the unprivileged user. CubeSandbox ignores USER
+    and starts the launcher as root; the launcher then runs the engine as
+    that user itself (test_launcher_privdrop.py).
   · The launcher writes nothing under /app (its only file write is the
-    egress key under ~/.ssh).
+    egress key, in a root-only dir when it is root, else ~/.ssh).
 """
 from __future__ import annotations
 
@@ -189,7 +191,7 @@ def test_checker_accepts_safe_lines(snippet):
 # ── launcher writes only under HOME ──────────────────────────────────────────
 
 
-def test_launcher_writes_only_the_egress_key_under_home():
+def test_launcher_writes_only_the_egress_key():
     tree = ast.parse(LAUNCHER.read_text(encoding="utf-8"))
     writes: list[str] = []
     makedirs: list[str] = []
@@ -206,6 +208,6 @@ def test_launcher_writes_only_the_egress_key_under_home():
     assert writes == ["key_path"]
     assert makedirs == ["ssh_dir"]
     src = LAUNCHER.read_text(encoding="utf-8")
-    assert "ssh_dir = os.path.expanduser('~/.ssh')" in src or \
-        'ssh_dir = os.path.expanduser("~/.ssh")' in src
+    assert "ssh_dir = _key_dir()" in src
+    assert 'ROOT_KEY_DIR = "/run/vibe-launcher"' in src
     assert 'key_path = os.path.join(ssh_dir, "egress_key")' in src

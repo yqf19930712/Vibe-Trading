@@ -74,7 +74,7 @@ flowchart LR
 - 级别：`VIBE_LOG_LEVEL`（默认 INFO）。
 - 数据链路（tushare/yfinance/okx loader）走 `logger.warning` + `source`/`symbol`/`error` 结构化字段；上游其余模块仍有 `print` 存量，不进 engine.jsonl。
 - 值得 grep 的几行：`swarm run finished after its attempt stopped waiting`（attempt 停止等待后仍在跑的 swarm run 结束，带尾段与总 token，见 §3.3）；`dotenv skipped (tenant profile)`（租户档不读 `.env`，启动一次）；`could not mark the engine process non-dumpable` / `prctl(PR_SET_DUMPABLE, 0) failed`（进程加固失败，只告警）。
-- 工具结果在进入日志/trace/轨迹之前已经过按值脱敏（`redaction.redact_secret_values`）：引擎 env 里的凭据值出现在任何工具输出中都被替换为 `[redacted:<KEY>]`，出境隧道私钥（`~/.ssh/egress_key`，不在引擎 env 里）替换为 `[redacted:VIBE_EGRESS_SSH_KEY]`，所以 engine.jsonl / trace.jsonl 里不会有明文 key（按字符串匹配，模型换一种编码输出可以绕过）。
+- 工具结果在进入日志/trace/轨迹之前已经过按值脱敏（`redaction.redact_secret_values`）：引擎 env 里的凭据值出现在任何工具输出中都被替换为 `[redacted:<KEY>]`，出境隧道私钥（不在引擎 env 里；生产上在 root 专属的 `/run/vibe-launcher/egress_key`，引擎与工具子进程读不到，只有非 root launcher 时才在 `~/.ssh/egress_key`）替换为 `[redacted:VIBE_EGRESS_SSH_KEY]`，所以 engine.jsonl / trace.jsonl 里不会有明文 key。
 
 ### 3.2 `attempt_stats` 事件
 
