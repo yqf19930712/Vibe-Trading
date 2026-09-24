@@ -129,11 +129,12 @@ class SessionService:
         """Delete a session: cancel its live loop, drop files, runs, events and FTS rows.
 
         Everything the session produced goes with it: the session directory,
-        every ``runs/<id>`` whose ``req.json`` names the session (the run
-        directories are the only other place the request lands), and the
-        ``sessions.db`` rows (otherwise ``session_search`` keeps returning
-        the deleted conversation as a snippet). Goal-ledger rows are the
-        caller's job (``api_server`` owns the GoalStore).
+        every ``runs/<id>`` whose ``req.json`` names the session, every
+        ``.swarm/runs/<id>`` whose ``run.json`` names it (its goal holds the
+        user's request), its background tasks, and the ``sessions.db`` rows
+        (otherwise ``session_search`` keeps returning the deleted
+        conversation as a snippet). Goal-ledger rows go through the purge
+        hook ``api_server`` registers (it owns the GoalStore).
         """
         # Tombstone first: an attempt of this session that is still running
         # finishes at its next cancel check, and every write it makes until
