@@ -145,7 +145,8 @@ ASK_LOG_MAX_BYTES = 20 * 1024 * 1024
 # router code change; the explicit list carries the credentials and the
 # single-name knobs (VIBE_MAX_OUTPUT_TOKENS, VIBE_LENGTH_CONTINUATIONS,
 # VIBE_CONTEXT_WINDOW_TOKENS — the model's context window the engine sizes
-# its compaction thresholds from, …).
+# its compaction thresholds from, TOKEN_THRESHOLD — the engine's compaction
+# threshold itself, …).
 #
 # VIBE_CONTEXT_WINDOW_TOKENS describes the builtin models, so a BYOK engine
 # does not get it: it gets VIBE_BYOK_CONTEXT_WINDOW_TOKENS instead when that
@@ -159,7 +160,7 @@ FORWARD_ENV = [
     "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_MODEL",
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
     "VIBE_MAX_OUTPUT_TOKENS", "VIBE_LENGTH_CONTINUATIONS", "VIBE_MEMORY_TTL_DAYS",
-    "VIBE_CONTEXT_WINDOW_TOKENS",
+    "VIBE_CONTEXT_WINDOW_TOKENS", "TOKEN_THRESHOLD",
     "TUSHARE_TOKEN", "VIBE_TRADING_SEARCH_BACKENDS", "JINA_API_KEY",
     "IFIND_MCP_TOKEN", "TICKFLOW_API_KEY", "TICKFLOW_BASE_URL",
 ]

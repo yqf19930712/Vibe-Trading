@@ -669,6 +669,7 @@ class TestForwardedEnv:
         monkeypatch.setenv("VIBE_LENGTH_CONTINUATIONS", "3")
         monkeypatch.setenv("VIBE_MEMORY_TTL_DAYS", "180")
         monkeypatch.setenv("VIBE_CONTEXT_WINDOW_TOKENS", "128000")
+        monkeypatch.setenv("TOKEN_THRESHOLD", "36000")
         monkeypatch.setenv("TICKFLOW_BASE_URL", "https://tickflow.example")
         monkeypatch.setenv("NOT_FORWARDED_SETTING", "x")
         monkeypatch.setenv("VIBE_ROUTER_SECRET", "must-stay-on-host")
@@ -683,6 +684,7 @@ class TestForwardedEnv:
         assert env["VIBE_LENGTH_CONTINUATIONS"] == "3"
         assert env["VIBE_MEMORY_TTL_DAYS"] == "180"
         assert env["VIBE_CONTEXT_WINDOW_TOKENS"] == "128000"
+        assert env["TOKEN_THRESHOLD"] == "36000"
         assert env["TICKFLOW_BASE_URL"] == "https://tickflow.example"
         assert "NOT_FORWARDED_SETTING" not in env
         assert "VIBE_ROUTER_SECRET" not in env
