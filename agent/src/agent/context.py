@@ -87,6 +87,12 @@ Decide which workflow to use based on the request:
 - The current date/time and workspace state arrive in the <agent_status> message at the end of the conversation.
 {memory_section}"""
 
+# The memory index block comes ready-made from ``PersistentMemory.snapshot``:
+# fenced in ``<memory-index>``, declared non-instructional, each line dated,
+# titles / descriptions clipped and the whole block within
+# ``persistent.MAX_SNAPSHOT_TOKENS``. It is inserted as is — a second fence,
+# declaration or cap here would duplicate that contract, and a cap that cut
+# lines could cut the closing tag.
 _MEMORY_SECTION = """
 ## Persistent Memory (cross-session)
 
@@ -210,8 +216,13 @@ class ContextBuilder:
             try:
                 recalls = self._persistent_memory.find_relevant(user_message, max_results=3)
                 if recalls:
-                    lines = [f"- **{r.title}** ({r.memory_type}): {r.body[:500]}" for r in recalls]
-                    recall_block = "\n".join(lines)
+                    # Imported here: persistent -> src.agent (package init)
+                    # -> loop -> context would otherwise be circular.
+                    from src.memory.persistent import recall_line
+
+                    # Dated (``recall_line``), so a months-old holding or
+                    # price note is read as history, not as the current state.
+                    recall_block = "\n".join(recall_line(r) for r in recalls)
                     # Recalled bodies are DATA (possibly distilled from
                     # external content) — declare them non-instructional so an
                     # injected imperative inside a stored memory does not read

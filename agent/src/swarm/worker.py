@@ -20,6 +20,8 @@ from src.agent.progress import HeartbeatTimer
 from src.agent.skills import SkillsLoader
 from src.agent.tools import ToolRegistry
 from src.config.schema import AgentConfig
+from src.config.tenant import tenant_safe_enabled
+from src.core.market_clock import clock_lines
 from src.core.token_estimate import estimate_messages_tokens, estimate_text_tokens
 from src.providers.chat import ChatLLM, LLMResponse, ProviderStreamError
 from src.swarm.models import (
@@ -90,6 +92,18 @@ _STREAM_RETRY_DELAY_S = _stream_retry_delay_s()
 _STREAM_RETRIES = _stream_retries()
 _STREAM_RETRY_MAX_DELAY_S = 60.0
 _MAX_TOKEN_ESTIMATE = 60_000
+# Past this share of the hard limit the worker gets one wrap-up nudge and
+# only the report-writing tools stay usable, so a data role that has pulled a
+# lot of data still ends with its report.md instead of hitting the wall
+# mid-fetch (which fails the task and blocks everything downstream).
+_WRAP_UP_TOKEN_ESTIMATE = int(_MAX_TOKEN_ESTIMATE * 0.85)
+_WRAP_UP_TOOLS = frozenset({"write_file", "edit_file"})
+_CONTEXT_WRAP_UP_NUDGE = (
+    "[SYSTEM] Your context is nearly full. Stop fetching and exploring: if "
+    "report.md is not written yet, write it NOW with write_file from what you "
+    "already have (mark unverified parts), then reply with the 2-3 sentence "
+    "summary. Other tools are disabled from here on."
+)
 
 
 def _emit(
@@ -121,6 +135,45 @@ def _emit(
         callback(event)
     except Exception:
         logger.warning("Event callback failed for %s", event_type, exc_info=True)
+
+
+# ``worker_text`` carries the streamed reply for the live dashboard. One event
+# per token delta meant one events.jsonl append (and one session-stream event)
+# per token for every worker in parallel; deltas are coalesced and flushed at
+# most every _WORKER_TEXT_FLUSH_S seconds or _WORKER_TEXT_FLUSH_CHARS chars,
+# plus once at the end of each call. The text is unchanged, only batched.
+_WORKER_TEXT_FLUSH_S = 0.5
+_WORKER_TEXT_FLUSH_CHARS = 2000
+
+
+class _TextCoalescer:
+    """Batches streamed text deltas into fewer ``worker_text`` events."""
+
+    def __init__(self, emit: Callable[[str], None]) -> None:
+        self._emit = emit
+        self._parts: list[str] = []
+        self._size = 0
+        self._last_flush = time.monotonic()
+
+    def add(self, delta: str) -> None:
+        if not delta:
+            return
+        self._parts.append(delta)
+        self._size += len(delta)
+        if (
+            self._size >= _WORKER_TEXT_FLUSH_CHARS
+            or time.monotonic() - self._last_flush >= _WORKER_TEXT_FLUSH_S
+        ):
+            self.flush()
+
+    def flush(self) -> None:
+        self._last_flush = time.monotonic()
+        if not self._parts:
+            return
+        text = "".join(self._parts)
+        self._parts = []
+        self._size = 0
+        self._emit(text)
 
 
 def _filter_skill_descriptions(loader: SkillsLoader, skill_names: list[str]) -> str:
@@ -285,6 +338,25 @@ def build_worker_prompt(
         "it and proceed without."
     )
 
+    if tenant_safe_enabled():
+        # Hosted sandbox: shell subprocesses carry no data-source
+        # credentials and cannot reach sites outside mainland China (see the
+        # data-routing skill). Point roles at the data they can actually get
+        # instead of scripts that cannot run here; no tool is added.
+        fetch_rule = (
+            "- Hosted sandbox: scripts run by `bash` have no data-source "
+            "credentials and no access to sites outside mainland China, so do "
+            "NOT write yfinance / OKX / tushare download scripts. Take prices "
+            "from `get_market_data` when it is in your tools, otherwise from "
+            "the Ground Truth block and the upstream context; use scripts only "
+            "to compute on data you already have. A number you cannot source "
+            "this way is stated as directional only.\n"
+        )
+    else:
+        fetch_rule = (
+            "- Do NOT fetch data with curl/requests. Use the patterns from "
+            "load_skill (yfinance, OKX API via Python).\n"
+        )
     prompt_parts.append(
         "## Execution Rules\n\n"
         "You have a HARD LIMIT of 20 tool calls. After that you will be cut off. Work efficiently.\n\n"
@@ -293,8 +365,8 @@ def build_worker_prompt(
         "- `load_skill` first to get data access methods and analysis patterns.\n"
         "- Write ONE focused Python script via `write_file`, then run it with `bash python script.py`.\n"
         "- Do NOT write long Python code inside bash. Use write_file + bash.\n"
-        "- Do NOT fetch data with curl/requests. Use the patterns from load_skill (yfinance, OKX API via Python).\n"
-        "- If a script fails, read the error, fix with `edit_file`, re-run. Max 2 retries per script.\n\n"
+        + fetch_rule
+        + "- If a script fails, read the error, fix with `edit_file`, re-run. Max 2 retries per script.\n\n"
         "**Phase 3 — Summarize (MUST use write_file):**\n"
         "- You MUST call `write_file` with path `report.md` to save your final report as a markdown file.\n"
         "- This is REQUIRED, not optional. Your final response MUST include a write_file call for report.md.\n"
@@ -303,11 +375,9 @@ def build_worker_prompt(
         "- Respond in the same language as the task prompt."
     )
 
-    now = datetime.now()
-    prompt_parts.append(
-        f"## Current Date & Time\n\n"
-        f"Today is {now.strftime('%A, %B %d, %Y %H:%M (local)')}."
-    )
+    # Same clock as the main loop's status bar: Beijing and US Eastern time
+    # with market session state — the container clock is UTC.
+    prompt_parts.append("## Current Date & Time\n\n" + "\n".join(clock_lines()))
 
     return "\n\n".join(prompt_parts)
 
@@ -444,6 +514,7 @@ def run_worker(
         invoke_tool_guarded,
         tool_is_readonly,
         tool_timeout_for,
+        truncated_tool_call_messages,
     )
     from src.agent.tool_result_store import prepare_for_context
     from src.core.cancel import sleep_unless_cancelled
@@ -458,6 +529,8 @@ def run_worker(
     length_continuations = 0
     # Partial replies cut by the output ceiling, awaiting their continuation.
     truncated_parts: list[str] = []
+    # Set once the context passed _WRAP_UP_TOKEN_ESTIMATE (see there).
+    context_wrap_up = False
 
     def _cancelled_result(at_iteration: int) -> WorkerResult:
         summary = _best_summary(messages, last_assistant_content) or (
@@ -479,6 +552,26 @@ def run_worker(
             tool_ms=total_tool_ms,
         )
 
+    def _timeout_result(at_iteration: int) -> WorkerResult:
+        elapsed = time.monotonic() - t0
+        summary = _best_summary(messages, last_assistant_content) or (
+            f"Worker timed out after {elapsed:.0f}s ({at_iteration} iterations)"
+        )
+        summary = _resolve_summary(artifact_dir, summary)
+        _emit(event_callback, "worker_timeout", agent_id, task_id, {"elapsed": elapsed})
+        _write_summary(artifact_dir, summary)
+        _persist_messages(artifact_dir, messages)
+        return WorkerResult(
+            status="timeout",
+            summary=summary,
+            artifact_paths=_collect_artifacts(artifact_dir),
+            iterations=at_iteration,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            llm_ms=total_llm_ms,
+            tool_ms=total_tool_ms,
+        )
+
     for iteration in range(max_iterations):
         if cancel_event is not None and cancel_event.is_set():
             return _cancelled_result(iteration)
@@ -493,23 +586,8 @@ def run_worker(
         )
 
         # Check timeout
-        elapsed = time.monotonic() - t0
-        if elapsed > timeout:
-            summary = _best_summary(messages, last_assistant_content) or f"Worker timed out after {elapsed:.0f}s ({iteration} iterations)"
-            summary = _resolve_summary(artifact_dir, summary)
-            _emit(event_callback, "worker_timeout", agent_id, task_id, {"elapsed": elapsed})
-            _write_summary(artifact_dir, summary)
-            _persist_messages(artifact_dir, messages)
-            return WorkerResult(
-                status="timeout",
-                summary=summary,
-                artifact_paths=_collect_artifacts(artifact_dir),
-                iterations=iteration,
-                input_tokens=total_input_tokens,
-                output_tokens=total_output_tokens,
-                llm_ms=total_llm_ms,
-                tool_ms=total_tool_ms,
-            )
+        if time.monotonic() - t0 > timeout:
+            return _timeout_result(iteration)
 
         # Check token estimate (CJK-weighted, see src.core.token_estimate)
         token_estimate = estimate_messages_tokens(messages, count_reasoning=count_reasoning)
@@ -518,6 +596,27 @@ def run_worker(
             summary = _resolve_summary(artifact_dir, summary)
             _emit(event_callback, "worker_token_limit", agent_id, task_id, {"tokens": token_estimate})
             _write_summary(artifact_dir, summary)
+            _persist_messages(artifact_dir, messages)
+            if _report_written(artifact_dir) and _classify_deliverable(
+                summary,
+                is_data_agent=_is_data_agent(agent_spec),
+                report_written=True,
+                data_tool_calls=data_tool_calls,
+            ) is None:
+                # The wall came after the deliverable: the report on disk
+                # meets the output contract, so the task is done.
+                _emit(event_callback, "worker_completed", agent_id, task_id,
+                      {"iterations": iteration, "token_limit": True})
+                return WorkerResult(
+                    status="completed",
+                    summary=summary,
+                    artifact_paths=_collect_artifacts(artifact_dir),
+                    iterations=iteration,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    llm_ms=total_llm_ms,
+                    tool_ms=total_tool_ms,
+                )
             return WorkerResult(
                 status="token_limit",
                 summary=summary,
@@ -528,6 +627,12 @@ def run_worker(
                 llm_ms=total_llm_ms,
                 tool_ms=total_tool_ms,
             )
+
+        if not context_wrap_up and token_estimate > _WRAP_UP_TOKEN_ESTIMATE:
+            context_wrap_up = True
+            messages.append({"role": "user", "content": _CONTEXT_WRAP_UP_NUDGE})
+            _emit(event_callback, "worker_context_wrap_up", agent_id, task_id,
+                  {"tokens": token_estimate, "iteration": iteration})
 
         # Inject wrap-up nudge when approaching iteration limit
         if iteration == wrap_up_at:
@@ -561,10 +666,14 @@ def run_worker(
         # Stream the LLM — moonshot/kimi non-streaming invoke is unreliable
         # (issue #42), and streaming also feeds dashboard live progress.
         llm_t0 = time.monotonic()
+        text_out = _TextCoalescer(
+            lambda content, _it=iteration: _emit(
+                event_callback, "worker_text", agent_id, task_id,
+                {"content": content, "iteration": _it},
+            )
+        )
         try:
-            def _on_text_chunk(delta: str) -> None:
-                _emit(event_callback, "worker_text", agent_id, task_id,
-                      {"content": delta, "iteration": iteration})
+            _on_text_chunk = text_out.add
 
             # LLM streaming can stall for 30s+ between request start and the
             # first text chunk (slow first-token providers, reasoning models'
@@ -586,9 +695,11 @@ def run_worker(
             def _stream_once() -> LLMResponse:
                 """Run one heartbeat-wrapped streaming LLM call.
 
-                Recomputes the remaining time budget at call time so the
-                single retry after a stream failure never reuses a stale
-                timeout.
+                Recomputes the remaining time budget at call time so a retry
+                after a stream failure never reuses a stale timeout. The
+                value is the call's wall-clock budget (``stream_chat`` stops
+                the stream at it and returns ``interrupted="deadline"``) and
+                tightens the SDK read timeout once it is the smaller one.
 
                 Returns:
                     Parsed ``LLMResponse`` from ``ChatLLM.stream_chat``.
@@ -661,6 +772,7 @@ def run_worker(
                     # of after the full sleep plus one more LLM call.
                     if sleep_unless_cancelled(delay, cancel_event):
                         return _cancelled_result(iteration)
+            text_out.flush()
             llm_elapsed_ms = int((time.monotonic() - llm_t0) * 1000)
             total_llm_ms += llm_elapsed_ms
             # Event ts = LLM call end; elapsed lets the gantt draw the exact
@@ -670,7 +782,12 @@ def run_worker(
                 {"iteration": iteration, "elapsed_ms": llm_elapsed_ms},
             )
         except Exception as exc:
+            text_out.flush()
             total_llm_ms += int((time.monotonic() - llm_t0) * 1000)
+            if time.monotonic() - t0 > timeout:
+                # The failure came from the worker's own budget running out
+                # (retries stop there too): a timeout, not an LLM fault.
+                return _timeout_result(iteration)
             error_msg = f"LLM call failed at iteration {iteration}: {exc}"
             logger.warning(error_msg)
             _emit(event_callback, "worker_failed", agent_id, task_id, {"error": error_msg})
@@ -691,9 +808,40 @@ def run_worker(
         total_input_tokens += iter_in
         total_output_tokens += iter_out
 
+        # A stream stopped early is partial: its tool calls may carry
+        # half-written arguments, so nothing of it is executed or kept.
+        interrupted = getattr(response, "interrupted", None)
+        if interrupted == "cancelled" or (cancel_event is not None and cancel_event.is_set()):
+            return _cancelled_result(iteration)
+        if interrupted:
+            return _timeout_result(iteration)
+
         # Track last meaningful assistant content
         if response.content and len(response.content.strip()) > 20:
             last_assistant_content = response.content
+
+        # Tool calls whose arguments were cut by the output ceiling are never
+        # executed (a half-written report.md would pass the output contract
+        # and flow downstream as this task's summary): each gets a structured
+        # error and the model re-issues shorter calls. Same helper and the
+        # same continuation budget as the main loop.
+        if getattr(response, "finish_reason", "stop") == "length" and response.has_tool_calls:
+            length_continuations += 1
+            truncated_parts = []
+            _emit(
+                event_callback, "worker_output_truncated", agent_id, task_id,
+                {"iteration": iteration, "chars": len(response.content or ""),
+                 "continuation": None,
+                 "tool_calls_refused": [tc.name for tc in response.tool_calls]},
+            )
+            messages.extend(
+                truncated_tool_call_messages(
+                    response.tool_calls,
+                    content=response.content,
+                    reasoning_content=response.reasoning_content,
+                )
+            )
+            continue
 
         # If no tool calls, this is the final response — unless the output
         # ceiling cut it (finish_reason=length): then keep the partial text
@@ -777,6 +925,25 @@ def run_worker(
                  **mcp_meta},
             )
             tc_start = time.monotonic()
+            if context_wrap_up and tc.name not in _WRAP_UP_TOOLS:
+                refusal = json.dumps({
+                    "status": "error",
+                    "error_code": "context_budget_reached",
+                    "tool": tc.name,
+                    "message": (
+                        "Not executed: the context budget is nearly used up. "
+                        "Only write_file / edit_file for report.md remain "
+                        "available — write the report from what you have."
+                    ),
+                }, ensure_ascii=False)
+                _emit(
+                    event_callback, "tool_result", agent_id, task_id,
+                    {"tool": tc.name, "elapsed_ms": 0, "status": "error",
+                     "iteration": iteration, "result_preview": _preview_tool_result(refusal),
+                     **mcp_meta},
+                )
+                messages.append(ContextBuilder.format_tool_result(tc.id, tc.name, refusal))
+                continue
             args = {**tc.arguments, "run_dir": str(artifact_dir)}
 
             # The guard supplies the heartbeat (the events.jsonl tail keeps

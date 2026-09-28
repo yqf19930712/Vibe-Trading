@@ -98,6 +98,36 @@ class TestValueRedaction:
         assert redaction.redact_secret_values(None) == ""
         assert redaction.redact_secret_values(42) == "42"
 
+    def test_egress_key_file_is_scrubbed(self, tmp_path, monkeypatch):
+        """The launcher strips the tunnel key from the engine env and writes
+        it to a file the shell can read: its lines and base64 form go too."""
+        import base64
+
+        body = ["b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW",
+                "QyNTUxOQAAACBx3mQpmVY0pHc8Q2cN0cGxkZXItZmFrZS1rZXktZm9yLXRlc3RzAAAA"]
+        pem = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "\n".join(body) + "\n-----END OPENSSH PRIVATE KEY-----\n"
+        key = tmp_path / "egress_key"
+        key.write_text(pem)
+        monkeypatch.setattr(redaction, "EGRESS_KEY_FILE", str(key))
+        redaction.refresh_secret_values()
+
+        whole = redaction.redact_secret_values(pem)
+        partial = redaction.redact_secret_values(f"$ head -2 key\n{body[0]}\n")
+        encoded = redaction.redact_secret_values(base64.b64encode(pem.encode()).decode())
+
+        assert not any(line in whole for line in body)
+        assert body[0] not in partial and "[redacted:VIBE_EGRESS_SSH_KEY]" in partial
+        assert encoded == "[redacted:VIBE_EGRESS_SSH_KEY]"
+        # The armour line alone is not a secret.
+        assert redaction.redact_secret_values("-----BEGIN OPENSSH PRIVATE KEY-----") == (
+            "-----BEGIN OPENSSH PRIVATE KEY-----"
+        )
+
+    def test_missing_egress_key_file_changes_nothing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(redaction, "EGRESS_KEY_FILE", str(tmp_path / "absent"))
+        redaction.refresh_secret_values()
+        assert redaction.redact_secret_values("plain output") == "plain output"
+
 
 class TestBashToolDoesNotLeak:
     def test_env_dump_has_path_but_no_secret(self, tmp_path, monkeypatch):

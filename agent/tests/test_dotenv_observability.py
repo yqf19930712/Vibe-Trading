@@ -93,3 +93,51 @@ def test_latch_still_skips_second_call(tmp_path, fresh, monkeypatch, caplog):
     with caplog.at_level(logging.INFO, logger=LOGGER):
         llm._ensure_dotenv()  # latched -> early return, no new log
     assert not [r for r in caplog.records if "dotenv resolved" in r.getMessage()]
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ["VIBE_TRADING_TENANT_SAFE", "VIBE_MULTITENANT"],
+)
+def test_tenant_profile_never_reads_a_dotenv(tmp_path, fresh, monkeypatch, caplog, flag):
+    """A tenant engine takes its config from the router's /boot env only.
+
+    Every candidate path is writable by the tenant's shell tools (the HOME
+    bind-mount and the image app dir the tools' uid owns), so a planted
+    ``.env`` must not reach the engine process on its next start.
+    """
+    planted = tmp_path / ".env"
+    planted.write_text("VIBE_PLANTED_BY_TENANT=1\nHTTPS_PROXY_PLANTED=http://x\n", encoding="utf-8")
+    monkeypatch.setattr(llm, "_ENV_CANDIDATES", [planted])
+    monkeypatch.delenv("VIBE_TRADING_TENANT_SAFE", raising=False)
+    monkeypatch.delenv("VIBE_MULTITENANT", raising=False)
+    monkeypatch.delenv("VIBE_PLANTED_BY_TENANT", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY_PLANTED", raising=False)
+    monkeypatch.setenv(flag, "1")
+
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        llm._ensure_dotenv()
+
+    import os
+
+    assert "VIBE_PLANTED_BY_TENANT" not in os.environ
+    assert "HTTPS_PROXY_PLANTED" not in os.environ
+    msg = "\n".join(r.getMessage() for r in caplog.records)
+    assert "dotenv skipped (tenant profile)" in msg
+    assert str(planted) not in msg
+
+
+def test_non_tenant_process_still_reads_its_dotenv(tmp_path, fresh, monkeypatch):
+    planted = tmp_path / ".env"
+    planted.write_text("VIBE_LOCAL_DEV_VALUE=ok\n", encoding="utf-8")
+    monkeypatch.setattr(llm, "_ENV_CANDIDATES", [planted])
+    monkeypatch.delenv("VIBE_TRADING_TENANT_SAFE", raising=False)
+    monkeypatch.delenv("VIBE_MULTITENANT", raising=False)
+    monkeypatch.delenv("VIBE_LOCAL_DEV_VALUE", raising=False)
+
+    llm._ensure_dotenv()
+
+    import os
+
+    assert os.environ.get("VIBE_LOCAL_DEV_VALUE") == "ok"
+    monkeypatch.delenv("VIBE_LOCAL_DEV_VALUE", raising=False)

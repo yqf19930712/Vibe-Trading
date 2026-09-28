@@ -11,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from src.agent.progress import emit_progress
 from src.agent.tools import BaseTool
@@ -55,7 +55,7 @@ def _effective_timeout() -> float:
     )
 
 
-# F4: dangerous-pattern AUDIT blacklist. Matching commands are NOT blocked —
+# Dangerous-pattern AUDIT blacklist. Matching commands are NOT blocked —
 # the sandbox is the enforcement layer — but each match is recorded in the
 # result payload (which lands in the trace via the tool_result entry) and
 # emitted as a progress event, so the observability panel can review what the
@@ -79,7 +79,7 @@ _DANGEROUS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 
 def _audit_command(command: str) -> list[str]:
-    """Return the ids of dangerous patterns matched by ``command`` (F4)."""
+    """Return the ids of dangerous patterns matched by ``command``."""
     return [name for name, pattern in _DANGEROUS_PATTERNS if pattern.search(command)]
 
 
@@ -99,6 +99,14 @@ class CappedRun:
     stdout: str
     stderr: str
     capped: tuple[str, ...] = ()
+
+
+class CommandCancelled(Exception):
+    """The command was killed because its owner asked it to stop."""
+
+
+# How often a running command checks ``should_stop``.
+_STOP_POLL_S = 0.5
 
 
 def _kill_tree(proc: subprocess.Popen[bytes]) -> None:
@@ -130,6 +138,7 @@ def run_capped(
     cwd: str | Path | None,
     env: dict[str, str],
     timeout_s: float,
+    should_stop: Callable[[], bool] | None = None,
 ) -> CappedRun:
     """Run ``command`` in a shell, streaming its output under the hard cap.
 
@@ -137,11 +146,15 @@ def run_capped(
     ``_OUTPUT_HARD_CAP`` bytes kills the whole process group and the read
     stops there. The process group is also killed on ``timeout_s`` — this
     covers grandchildren of the shell, which ``subprocess.run`` leaves alive
-    (and blocks on, since they keep the pipes open).
+    (and blocks on, since they keep the pipes open) — and, when
+    ``should_stop`` is given, as soon as it returns True (checked every
+    ``_STOP_POLL_S``): an attempt cancel then stops the command instead of
+    leaving it to run out its timeout.
 
     Raises:
         subprocess.TimeoutExpired: The process, or a child still holding a
             pipe, outlived ``timeout_s``.
+        CommandCancelled: ``should_stop`` fired; the process group is dead.
     """
     proc = subprocess.Popen(  # noqa: S602 - shell is the tool's contract
         command,
@@ -182,7 +195,23 @@ def run_capped(
         t.start()
     deadline = time.monotonic() + timeout_s
     try:
-        proc.wait(timeout=timeout_s)
+        if should_stop is None:
+            proc.wait(timeout=timeout_s)
+        else:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout_s)
+                try:
+                    proc.wait(timeout=min(_STOP_POLL_S, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    if should_stop():
+                        _kill_tree(proc)
+                        proc.wait()
+                        for t in readers:
+                            t.join(_DRAIN_GRACE_S)
+                        raise CommandCancelled(command) from None
         for t in readers:
             t.join(max(0.0, deadline - time.monotonic()))
         if any(t.is_alive() for t in readers):
@@ -240,7 +269,7 @@ class BashTool(BaseTool):
         command = kwargs["command"]
         cwd = kwargs.get("run_dir")
 
-        # F4: audit-only dangerous-pattern scan (never blocks — see constant).
+        # Audit-only dangerous-pattern scan (never blocks — see constant).
         audit_findings = _audit_command(str(command))
         if audit_findings:
             emit_progress(
@@ -252,7 +281,12 @@ class BashTool(BaseTool):
         try:
             # Allowlisted env only: the engine process env carries
             # tenant-shared LLM/data-source credentials.
-            result = run_capped(command, cwd=cwd, env=_subprocess_env(), timeout_s=timeout_s)
+            from src.core.cancel import is_cancelled
+
+            result = run_capped(
+                command, cwd=cwd, env=_subprocess_env(), timeout_s=timeout_s,
+                should_stop=is_cancelled,
+            )
             # Value-based scrub here so neither the trajectory copy nor the
             # offloaded full copy (tool_result_store) carries a secret.
             stdout = redact_secret_values(result.stdout)
@@ -292,6 +326,15 @@ class BashTool(BaseTool):
             if audit_findings:
                 payload["security_audit"] = audit_findings
             return json.dumps(payload, ensure_ascii=False)
+        except CommandCancelled:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error_code": "cancelled",
+                    "error": "The attempt was cancelled; the command was killed.",
+                },
+                ensure_ascii=False,
+            )
         except Exception as exc:
             payload = {
                 "status": "error",

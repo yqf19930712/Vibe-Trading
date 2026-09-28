@@ -1,7 +1,8 @@
-"""Tests for the native Anthropic Messages channel adaptations (2026-08-26).
+"""Tests for the native Anthropic Messages channel adaptations.
 
 Offline: block-list content flattening, stop_reason mapping, provider branch
-env guards. Live streaming is covered by the deployment smoke.
+env guards, prompt-cache breakpoints on the real request payload. Live
+streaming is covered by the deployment smoke.
 """
 
 from __future__ import annotations
@@ -227,6 +228,145 @@ class TestAnthropicCacheBreakpoints:
 
         _apply_anthropic_cache_breakpoints(None)
         _apply_anthropic_cache_breakpoints({"messages": "not-a-list", "system": 3})
+
+    def test_status_block_inside_merged_message_skipped(self):
+        """Merged ``[tool_result, status]`` user message: the breakpoint goes
+        on the tool result, never on the trailing status text."""
+        payload = self._apply(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                            {"type": "text", "text": "<agent_status>\nNow: x\n</agent_status>"},
+                        ],
+                    }
+                ]
+            }
+        )
+        blocks = payload["messages"][0]["content"]
+        assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+        assert "cache_control" not in blocks[1]
+
+    def test_empty_text_block_never_marked(self):
+        payload = self._apply(
+            {
+                "messages": [
+                    {"role": "user", "content": "stable"},
+                    {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+                ]
+            }
+        )
+        assert payload["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+        assert "cache_control" not in payload["messages"][1]["content"][0]
+
+
+class TestCacheBreakpointsOnRealMergedPayload:
+    """The message-level breakpoint, checked on the payload the real
+    ``ChatAnthropicCompat._get_request_payload`` builds from loop-shaped
+    trajectories — langchain-anthropic merges the tool results and the status
+    bar into one user message, which a hand-built payload never shows."""
+
+    TOOLS = [{"type": "function", "function": {
+        "name": "get_market_data", "description": "d",
+        "parameters": {"type": "object", "properties": {"codes": {"type": "string"}}},
+    }}]
+
+    @pytest.fixture()
+    def render(self, monkeypatch):
+        pytest.importorskip("langchain_anthropic")
+        from src.providers.llm import _build_native_anthropic
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+        llm = _build_native_anthropic("claude-opus-5")
+        kwargs = dict(llm.bind_tools(self.TOOLS).kwargs)
+
+        def _render(messages):
+            return llm._get_request_payload(messages, **kwargs)["messages"]
+
+        return _render
+
+    @staticmethod
+    def _trajectories():
+        """Three successive iterations exactly as the loop assembles them."""
+        from types import SimpleNamespace
+
+        from src.agent.context import ContextBuilder
+        from src.agent.loop import _build_status_message
+
+        system = {"role": "system", "content": "SYSTEM PROMPT"}
+        request = {"role": "user", "content": "分析贵州茅台", "vibe_class": "request"}
+        turns: list = []
+        out = [[system, request, _build_status_message("-", [])]]
+        for n, code in enumerate(("600519.SH", "300750.SZ"), start=1):
+            call = SimpleNamespace(id=f"toolu_{n}", name="get_market_data",
+                                   arguments={"codes": code})
+            turns.append(ContextBuilder.format_assistant_tool_calls([call], content=""))
+            turns.append({"role": "tool", "tool_call_id": f"toolu_{n}",
+                          "name": "get_market_data", "content": f'{{"rows": {n}}}'})
+            out.append([system, request, *turns,
+                        _build_status_message(f"get_market_data={n}", [])])
+        return out
+
+    @staticmethod
+    def _breakpoints(messages):
+        return [
+            (i, j)
+            for i, message in enumerate(messages)
+            if isinstance(message["content"], list)
+            for j, block in enumerate(message["content"])
+            if "cache_control" in block
+        ]
+
+    @staticmethod
+    def _strip(messages):
+        """Messages without cache markers, string content as one text block."""
+        out = []
+        for message in messages:
+            content = message["content"]
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            out.append({
+                "role": message["role"],
+                "content": [
+                    {k: v for k, v in block.items() if k != "cache_control"}
+                    for block in content
+                ],
+            })
+        return out
+
+    def test_breakpoint_skips_status_and_lands_on_stable_block(self, render):
+        for messages in (render(t) for t in self._trajectories()):
+            marks = self._breakpoints(messages)
+            assert len(marks) == 1
+            i, j = marks[0]
+            block = messages[i]["content"][j]
+            assert not str(block.get("text", "")).startswith("<agent_status>")
+            # The status bar is merged into the same (last) user message.
+            assert i == len(messages) - 1
+            assert messages[i]["content"][-1]["text"].startswith("<agent_status>")
+
+        first, second, third = (render(t) for t in self._trajectories())
+        assert first[0]["content"][0]["text"] == "分析贵州茅台"
+        assert "cache_control" in first[0]["content"][0]
+        for messages in (second, third):
+            i, j = self._breakpoints(messages)[0]
+            assert messages[i]["content"][j]["type"] == "tool_result"
+
+    def test_cached_prefix_recurs_in_next_iteration(self, render):
+        """What iteration N writes to the cache (its prefix up to the
+        breakpoint) appears byte-for-byte in iteration N+1's request."""
+        rendered = [render(t) for t in self._trajectories()]
+        for current, following in zip(rendered, rendered[1:]):
+            i, j = self._breakpoints(current)[0]
+            written = self._strip(current)[: i + 1]
+            written[-1]["content"] = written[-1]["content"][: j + 1]
+            nxt = self._strip(following)[: i + 1]
+            nxt[-1]["content"] = nxt[-1]["content"][: j + 1]
+            assert nxt == written
 
 
 class TestToolChoiceNoneNativeChannel:

@@ -6,7 +6,9 @@ relocates all run/session/upload artifacts under that per-tenant HOME so
 tenants are isolated. Unset (single-user / upstream) it falls back to the
 install ``agent/`` dir, leaving behavior unchanged. Every run/session/upload
 path resolver — including ``api_server._data_root`` — derives from here so a
-new write site can't silently escape the tenant root.
+new write site can't silently escape the tenant root. One resolver still
+reads ``VIBE_DATA_DIR`` on its own: ``src.swarm.store.swarm_runs_root``
+(same variable, same install-dir fallback, so the two agree).
 See PRODUCT_DESIGN.md §2.3.
 """
 from __future__ import annotations

@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -20,7 +21,24 @@ logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SECONDS = 5
 _MAX_WAIT_SECONDS = int(os.getenv("SWARM_TIMEOUT", "7200"))
-# V2 payload budget for the ``run_swarm`` return. The whole point is that the
+
+# Swarm token billing is incremental per run: every ``llm_usage`` it emits
+# carries only what was not reported before for that run (``billed.json``
+# next to run.json, plus this in-process copy). A wait that ran out of budget
+# bills the tokens so far; the resume that later sees the run finish bills the
+# rest — not the whole total a second time.
+_BILLED_FILE = "billed.json"
+_BILLING_LOCK = threading.Lock()
+_BILLED: dict[str, tuple[int, int]] = {}
+# A run left running after its wait budget ran out is watched until it ends,
+# so the tokens it keeps spending are reported (``source="swarm_tail"``) and
+# logged instead of vanishing. The hosting session delivers that report: on
+# the stream of an attempt running then, or at the start of the next one
+# (``SessionService._deliver_swarm_tail``).
+_TAIL_POLL_SECONDS = 15.0
+_TAIL_MAX_SECONDS = _MAX_WAIT_SECONDS + 600
+_TAIL_METERS: set[str] = set()
+# Payload budget for the ``run_swarm`` return. The whole point is that the
 # result arrives as VALID JSON inside the loop's ``TOOL_RESULT_LIMIT`` (10k
 # chars) instead of being cut mid-document on the way into the trajectory, so
 # the target sits just under it with room for the JSON scaffolding.
@@ -45,7 +63,7 @@ TASKS_BLOCK_TARGET_CHARS = 4_800
 # target so the preview budget reflects what is actually left for prose.
 _TASK_FIXED_OVERHEAD_CHARS = 400
 
-# Nesting invariant (V1). The tool's own wait keeps back MORE than the loop's
+# Nesting invariant. The tool's own wait keeps back MORE than the loop's
 # watchdog does, so on a bounded attempt budget the tool ALWAYS expires first
 # and gets to return ``wait_budget_exhausted`` + run_id + the partial report.
 # The loop's watchdog then only ever fires on a real hang (e.g. a wedged
@@ -575,7 +593,7 @@ _SECTOR_PATTERNS: list[tuple[str, list[str]]] = [
 
 
 def _discover_preset_names() -> frozenset[str]:
-    """Return the preset roster, sourced from the bundled YAML files (V1).
+    """Return the preset roster, sourced from the bundled YAML files.
 
     The single source of truth is ``agent/src/swarm/presets/*.yaml``, NOT the
     keyword table. Deriving the roster from ``_PRESET_KEYWORDS`` (as it used to
@@ -630,7 +648,7 @@ def _is_phrase_hit(matched_text: str) -> bool:
     A multi-word English phrase ("funding rate", "sector rotation") or a CJK
     term of 3+ characters ("资金费率") is specific evidence of intent; a single
     short token ("crypto", "macro", "因子") is ambient vocabulary that shows up
-    in unrelated prompts too. Used only to break score ties (V1) — it never
+    in unrelated prompts too. Used only to break score ties — it never
     changes a decision that the weighted score already settles.
 
     Args:
@@ -688,7 +706,7 @@ def _match_preset_scored(prompt: str) -> tuple[str, float]:
 
     scores = _score_presets(prompt)
     order = {name: idx for idx, (name, _, _) in enumerate(_PRESET_KEYWORDS)}
-    # Tie-break (V1): on equal weighted score, prefer the preset with more
+    # Tie-break: on equal weighted score, prefer the preset with more
     # exact-phrase hits — "crypto funding rate" ties crypto_research_lab (the
     # bare word "crypto") against crypto_trading_desk ("funding rate"), and the
     # phrase is the one that actually identifies the desk. Table order is the
@@ -716,7 +734,7 @@ def _match_preset(prompt: str) -> str:
 
 
 def _preset_route_score(prompt: str, preset_name: str) -> float:
-    """Routing confidence for ``preset_name`` given ``prompt`` (V1).
+    """Routing confidence for ``preset_name`` given ``prompt``.
 
     Surfaced as ``preset_score`` next to ``auto_variables`` so a reader of the
     result (model, trace, ops tab) can tell a confident keyword match from the
@@ -919,7 +937,7 @@ def _first_label(prompt: str, table: list[tuple[str, list[str]]], default: str) 
 
 
 def _extract_commodity(prompt: str) -> str | None:
-    """Extract the commodity under discussion (V1).
+    """Extract the commodity under discussion.
 
     Returns:
         A commodity label, or None when the prompt names none — the caller
@@ -960,7 +978,7 @@ def _extract_fund_type(prompt: str) -> str:
 
 
 def _extract_crypto_targets(prompt: str) -> str:
-    """Extract the crypto assets named in ``prompt`` (V1).
+    """Extract the crypto assets named in ``prompt``.
 
     Args:
         prompt: User's natural language prompt.
@@ -1115,16 +1133,15 @@ class SwarmTool(BaseTool):
 
     @property
     def timeout_seconds(self) -> float:
-        """Loop-side watchdog bound for run_swarm (V1).
+        """Loop-side watchdog bound for run_swarm.
 
         A swarm is a multi-layer DAG of LLM workers; tens of minutes is its
         NORMAL runtime, not a hang. The tool runs its own budget-clamped wait
         (``cap_timeout(SWARM_TIMEOUT, reserve_s=_WAIT_RESERVE_S)``) and returns
         ``wait_budget_exhausted`` with the run_id when that expires — the
         loop's watchdog must sit strictly OUTSIDE it so it only ever fires on a
-        real hang. Pinning the watchdog to the tenant-wide tool timeout instead
-        made it fire at 600s and discard the run_id, which is the P0 this
-        property fixes.
+        real hang. A watchdog pinned to the tenant-wide tool timeout would
+        fire long before the run can finish and discard the run_id.
 
         A property (not a class attribute) so ``SWARM_TIMEOUT`` / test
         monkeypatching of ``_MAX_WAIT_SECONDS`` still apply at call time;
@@ -1154,13 +1171,13 @@ class SwarmTool(BaseTool):
         self.include_shell_tools = include_shell_tools
         self._event_callback = event_callback
         self._session_id = session_id
-        # preset -> {"ts", "run_id", "salvage"} for the failure cooldown (F3).
+        # preset -> {"ts", "run_id", "salvage"} for the failure cooldown.
         # Instance-scoped: one SwarmTool lives per session registry, so the
         # cooldown naturally covers "the same run/session".
         self._recent_failures: dict[str, dict[str, Any]] = {}
 
     def _record_preset_failure(self, preset: str, run_obj: Any) -> None:
-        """Remember a failed run's completed-worker products for salvage (F3)."""
+        """Remember a failed run's completed-worker products for salvage."""
         completed: list[dict[str, Any]] = []
         for task in (getattr(run_obj, "tasks", None) or [])[:_SALVAGE_MAX_TASKS * 2]:
             status = getattr(task, "status", None)
@@ -1187,7 +1204,7 @@ class SwarmTool(BaseTool):
         }
 
     def _cooldown_rejection(self, preset: str) -> str | None:
-        """Return a structured refusal when ``preset`` failed recently (F3)."""
+        """Return a structured refusal when ``preset`` failed recently."""
         record = self._recent_failures.get(preset)
         if record is None:
             return None
@@ -1217,27 +1234,95 @@ class SwarmTool(BaseTool):
             ensure_ascii=False,
         )
 
-    def _emit_swarm_usage(self, run_id: str, run_obj: Any) -> None:
-        """Report swarm worker token totals through the same ``llm_usage``
-        event channel the main loop uses. Without this the caller's billing /
+    def _emit_swarm_usage(
+        self, run_id: str, run_obj: Any, *, store: Any = None, source: str = "swarm"
+    ) -> tuple[int, int]:
+        """Report swarm worker tokens through the same ``llm_usage`` event
+        channel the main loop uses. Without this the caller's billing /
         daily-quota accounting only ever saw main-loop usage — swarm-heavy
         attempts would under-report by orders of magnitude (an attempt
         recording 21k output tokens while its two swarm runs burn hundreds
-        of thousands)."""
+        of thousands).
+
+        Only the part not yet reported for this run is emitted (see
+        ``_BILLED_FILE``). A tail report also carries ``tail_key`` — the run
+        id and its billed totals after this report — which names the report
+        across a deferred delivery. Returns the ``(input, output)`` delta
+        emitted."""
         tin = int(getattr(run_obj, "total_input_tokens", 0) or 0)
         tout = int(getattr(run_obj, "total_output_tokens", 0) or 0)
-        if tin <= 0 and tout <= 0:
-            return
-        self._emit_session_event(
-            "llm_usage",
-            {
-                "input_tokens": tin,
-                "output_tokens": tout,
-                "total_tokens": tin + tout,
-                "source": "swarm",
-                "run_id": run_id,
-            },
-        )
+        with _BILLING_LOCK:
+            prev_in, prev_out = _billed_so_far(run_id, store)
+            d_in, d_out = max(0, tin - prev_in), max(0, tout - prev_out)
+            if d_in <= 0 and d_out <= 0:
+                return (0, 0)
+            billed_in, billed_out = max(tin, prev_in), max(tout, prev_out)
+            _record_billed(run_id, store, billed_in, billed_out)
+        payload: dict[str, Any] = {
+            "input_tokens": d_in,
+            "output_tokens": d_out,
+            "total_tokens": d_in + d_out,
+            "source": source,
+            "run_id": run_id,
+        }
+        if source == "swarm_tail":
+            payload["tail_key"] = f"{run_id}:{billed_in}:{billed_out}"
+        self._emit_session_event("llm_usage", payload)
+        return (d_in, d_out)
+
+    def _start_tail_meter(self, store: Any, run_id: str) -> None:
+        """Watch a run the attempt stopped waiting for and report its tail.
+
+        The run keeps working by design (a later attempt may resume it), but
+        its tokens past this point used to be neither billed nor visible.
+        When it ends, the remainder goes out as ``llm_usage`` with
+        ``source="swarm_tail"`` through the session callback (which sends it
+        on a running attempt's stream or parks it for the next attempt) and
+        as a structured engine-log line either way. A resume that sees the
+        run finish first reports the remainder itself; the meter then finds
+        nothing left to report.
+        """
+        with _BILLING_LOCK:
+            if run_id in _TAIL_METERS:
+                return
+            _TAIL_METERS.add(run_id)
+
+        def _watch() -> None:
+            deadline = time.monotonic() + _TAIL_MAX_SECONDS
+            try:
+                while time.monotonic() < deadline:
+                    time.sleep(_TAIL_POLL_SECONDS)
+                    try:
+                        run = store.load_run(run_id)
+                    except Exception:  # noqa: BLE001 - a vanished / half-written run
+                        run = None
+                    if run is None:
+                        return
+                    status = getattr(getattr(run, "status", None), "value", "")
+                    if status not in ("completed", "failed", "cancelled"):
+                        continue
+                    d_in, d_out = self._emit_swarm_usage(
+                        run_id, run, store=store, source="swarm_tail"
+                    )
+                    logger.info(
+                        "swarm run finished after its attempt stopped waiting",
+                        extra={
+                            "run_id": run_id,
+                            "session": self._session_id,
+                            "status": status,
+                            "tail_input_tokens": d_in,
+                            "tail_output_tokens": d_out,
+                            "total_input_tokens": int(getattr(run, "total_input_tokens", 0) or 0),
+                            "total_output_tokens": int(getattr(run, "total_output_tokens", 0) or 0),
+                        },
+                    )
+                    return
+                logger.warning("swarm tail meter gave up on run %s", run_id)
+            finally:
+                with _BILLING_LOCK:
+                    _TAIL_METERS.discard(run_id)
+
+        threading.Thread(target=_watch, name=f"swarm-tail-{run_id}", daemon=True).start()
 
     def _emit_session_event(self, event_type: str, data: dict[str, Any]) -> None:
         """Forward swarm status to the hosting session SSE channel if present."""
@@ -1286,7 +1371,7 @@ class SwarmTool(BaseTool):
             )
         assert preset is not None
 
-        # F3: refuse an identical-preset re-run inside the failure cooldown.
+        # Refuse an identical-preset re-run inside the failure cooldown.
         rejection = self._cooldown_rejection(preset)
         if rejection is not None:
             logger.warning("SwarmTool: preset %s rejected by failure cooldown", preset)
@@ -1294,7 +1379,7 @@ class SwarmTool(BaseTool):
 
         variables = _build_variables(preset, prompt)
         # An explicitly passed preset_name is by definition an explicit choice;
-        # otherwise report how confidently the keywords picked it (V1).
+        # otherwise report how confidently the keywords picked it.
         preset_score = (
             _EXPLICIT_NAME_SCORE
             if kwargs.get("preset_name")
@@ -1320,7 +1405,7 @@ class SwarmTool(BaseTool):
 
         from src.config import load_swarm_agent_config
         from src.swarm.runtime import SwarmRuntime
-        from src.swarm.store import SwarmStore, swarm_runs_root
+        from src.swarm.store import SwarmStore, run_owner, swarm_runs_root
 
         # Single source of truth (honors VIBE_DATA_DIR for per-tenant isolation).
         swarm_base_dir = swarm_runs_root()
@@ -1351,12 +1436,15 @@ class SwarmTool(BaseTool):
                     {"run_id": current_run_id, "event": payload},
                 )
 
-            run = runtime.start_run(
-                preset,
-                variables,
-                live_callback=_live_callback if self._event_callback is not None else None,
-                include_shell_tools=self.include_shell_tools,
-            )
+            # The run records its owning session so deleting the session
+            # also deletes the run (run.json holds the user's request).
+            with run_owner(self._session_id):
+                run = runtime.start_run(
+                    preset,
+                    variables,
+                    live_callback=_live_callback if self._event_callback is not None else None,
+                    include_shell_tools=self.include_shell_tools,
+                )
         except FileNotFoundError as exc:
             _record("start_failed")
             return json.dumps(
@@ -1445,7 +1533,7 @@ class SwarmTool(BaseTool):
             run_tasks: Task count, for accounting.
             record: ``_record``-shaped callable for per-attempt swarm stats.
             resumed: Whether this wait resumed an existing background run.
-            preset_score: Routing confidence for the chosen preset (V1).
+            preset_score: Routing confidence for the chosen preset.
             cancel_run: Signals the run to stop; called only on an
                 attempt-level cancel.
 
@@ -1512,9 +1600,9 @@ class SwarmTool(BaseTool):
                     input_tokens=reconciled.total_input_tokens,
                     output_tokens=reconciled.total_output_tokens,
                 )
-                self._emit_swarm_usage(run_id, reconciled)
+                self._emit_swarm_usage(run_id, reconciled, store=store)
                 if reconciled.status.value == "failed":
-                    # F3: arm the cooldown with salvageable worker products.
+                    # Arm the cooldown with salvageable worker products.
                     self._record_preset_failure(preset, reconciled)
                 return _format_result(
                     reconciled, preset, variables,
@@ -1535,9 +1623,10 @@ class SwarmTool(BaseTool):
                 input_tokens=loaded.total_input_tokens,
                 output_tokens=loaded.total_output_tokens,
             )
-            # Tokens burned so far still get billed; the run keeps burning in
-            # the background and that tail is knowingly under-reported.
-            self._emit_swarm_usage(run_id, loaded)
+            # Tokens burned so far are billed now; the run keeps working in
+            # the background and the tail meter reports the rest when it ends.
+            self._emit_swarm_usage(run_id, loaded, store=store)
+            self._start_tail_meter(store, run_id)
             return _format_result(
                 store.reconcile_run(loaded, write=True),
                 preset,
@@ -1555,7 +1644,7 @@ class SwarmTool(BaseTool):
         )
 
     def _resume_run(self, run_id: str) -> str:
-        """Resume waiting on an existing background run (V1 / F).
+        """Resume waiting on an existing background run.
 
         ``wait_budget_exhausted`` has always told the model to "re-invoke with
         the returned run_id", but ``parameters`` carried no such field, so the
@@ -1644,8 +1733,8 @@ def _format_result(
         variables: Extracted variables.
         timed_out: Whether the run was terminated due to timeout.
         resumed: Whether this result came from a run_id resume.
-        preset_score: Routing confidence for the chosen preset (V1).
-        run_dir: Run directory, used to build artifact pointers (V2). Omitted
+        preset_score: Routing confidence for the chosen preset.
+        run_dir: Run directory, used to build artifact pointers. Omitted
             = previews carry no ``report_path``.
 
     Returns:
@@ -1746,10 +1835,47 @@ def _format_result(
         result["resumed"] = True
     if timed_out:
         # Spell out the executable next step: the run_id above is now an
-        # accepted parameter, so "wait more" is a real option (V1).
+        # accepted parameter, so "wait more" is a real option.
         result["next_step"] = (
             "This run is still executing in the background. To keep waiting, call "
             f"run_swarm(run_id='{run.id}') — it starts no new run and costs no extra "
             "tokens. Otherwise report the partial results above as partial."
         )
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _billed_path(store: Any, run_id: str) -> Path | None:
+    try:
+        return Path(store.run_dir(run_id)) / _BILLED_FILE
+    except Exception:  # noqa: BLE001 - stores without run_dir (tests, fakes)
+        return None
+
+
+def _billed_so_far(run_id: str, store: Any) -> tuple[int, int]:
+    """Tokens already reported for ``run_id`` (caller holds ``_BILLING_LOCK``)."""
+    best = _BILLED.get(run_id, (0, 0))
+    path = _billed_path(store, run_id) if store is not None else None
+    if path is not None:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            best = (
+                max(best[0], int(data.get("input_tokens", 0) or 0)),
+                max(best[1], int(data.get("output_tokens", 0) or 0)),
+            )
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    return best
+
+
+def _record_billed(run_id: str, store: Any, tin: int, tout: int) -> None:
+    """Remember what has been reported for ``run_id`` (caller holds the lock)."""
+    _BILLED[run_id] = (tin, tout)
+    path = _billed_path(store, run_id) if store is not None else None
+    if path is None or not path.parent.is_dir():
+        return
+    try:
+        from src.core.atomic_write import atomic_write_text
+
+        atomic_write_text(path, json.dumps({"input_tokens": tin, "output_tokens": tout}))
+    except OSError:
+        logger.debug("billed.json not written for swarm run %s", run_id, exc_info=True)

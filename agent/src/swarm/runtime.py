@@ -47,12 +47,12 @@ from src.swarm.worker import run_worker
 logger = logging.getLogger(__name__)
 
 # Worker outcomes worth another attempt. ``timeout`` / ``token_limit`` are
-# deliberately excluded — a re-run hits the same wall. ``incomplete`` (V2) is
+# deliberately excluded — a re-run hits the same wall. ``incomplete`` is
 # the deliverable-contract failure (no report.md written, or a data role that
 # never called a data tool): exactly the class where one more attempt usually
-# succeeds, and what the presets' ``max_retries`` budget was meant for. Before
-# V2 only ``failed`` retried, so a contract miss silently blocked every
-# downstream task that depended on it.
+# succeeds, and what the presets' ``max_retries`` budget was meant for.
+# Retrying only ``failed`` would let a contract miss silently block every
+# downstream task that depends on it.
 _RETRYABLE_WORKER_STATUSES = frozenset({"failed", "incomplete"})
 
 # Cap on a single upstream report injected into a downstream worker's system

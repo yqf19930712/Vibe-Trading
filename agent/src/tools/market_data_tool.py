@@ -41,7 +41,9 @@ class MarketDataTool(BaseTool):
         "yfinance/OKX/Tushare scripts. Returns compact JSON per symbol: "
         '{"summary": {start, end, rows, first_close, last_close, high, low, change_pct}, '
         '"columns": [...], "rows": [[...], ...]} (column names listed once; daily dates '
-        "as YYYY-MM-DD; numbers rounded to 4 decimals). Default max_rows="
+        "as YYYY-MM-DD; numbers rounded to 4 decimals). summary.change_pct is the "
+        "period return in PERCENT (2.5 means +2.5%); summary high/low are the extremes "
+        "of the whole requested period even when rows are downsampled. Default max_rows="
         f"{DEFAULT_MAX_ROWS} per symbol keeps a single-symbol call inside the 10k-char "
         "context budget; a longer series is evenly downsampled (every step-th bar, last "
         "bar pinned) with truncated=true. Results over 10k chars are written to disk "

@@ -6,6 +6,7 @@ ChatLLM is designed specifically for the AgentLoop ReAct cycle.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -108,6 +109,11 @@ class LLMResponse:
             ``{"input_tokens": int, "output_tokens": int, "total_tokens": int}``.
             ``None`` if the provider did not return usage information; callers
             should fall back to a heuristic in that case.
+        interrupted: Why a stream stopped before the provider finished it:
+            ``"cancelled"`` (``should_cancel``) or ``"deadline"`` (the call's
+            wall-clock ``timeout`` ran out). ``None`` for a complete reply.
+            An interrupted response is partial — its tool calls may carry
+            half-written arguments and must not be executed.
     """
 
     content: Optional[str] = None
@@ -115,6 +121,7 @@ class LLMResponse:
     reasoning_content: Optional[str] = None
     finish_reason: str = "stop"
     usage_metadata: Optional[Dict[str, int]] = None
+    interrupted: Optional[str] = None
 
     @property
     def has_tool_calls(self) -> bool:
@@ -174,6 +181,39 @@ def _redact_provider_error(message: str) -> str:
         if any(marker in key.upper() for marker in sensitive_markers):
             redacted = redacted.replace(value, "[redacted]")
     return redacted
+
+
+# Floor for a tightened per-request SDK timeout, so a nearly spent budget
+# still allows the connection to be opened.
+_MIN_REQUEST_TIMEOUT_S = 5.0
+
+
+def _default_request_timeout_s() -> float:
+    """The SDK request timeout every client is built with (``TIMEOUT_SECONDS``)."""
+    try:
+        return float(os.getenv("TIMEOUT_SECONDS", "120"))
+    except ValueError:
+        return 120.0
+
+
+def _with_request_timeout(runnable: Any, seconds: Optional[float]) -> Any:
+    """Tighten the SDK request timeout for one call; never loosen it.
+
+    The value reaches the SDK's ``create(timeout=…)`` through LangChain's
+    bound kwargs (both ``ChatAnthropic`` and ``ChatOpenAI`` merge call kwargs
+    into the request payload). A ``RunnableConfig`` ``timeout`` key would
+    not: LangChain files unknown config keys under ``configurable``, where no
+    chat model reads them. For a stream this is the read timeout between
+    bytes, not a total — the caller's per-chunk deadline check covers the
+    total. Runnables without ``bind`` (the Codex adapter, test doubles) are
+    returned unchanged.
+    """
+    if not seconds or seconds >= _default_request_timeout_s():
+        return runnable
+    bind = getattr(runnable, "bind", None)
+    if not callable(bind):
+        return runnable
+    return bind(timeout=max(_MIN_REQUEST_TIMEOUT_S, float(seconds)))
 
 
 class ChatLLM:
@@ -266,15 +306,15 @@ class ChatLLM:
         Args:
             messages: Message list (OpenAI format).
             tools: Tool definition list (OpenAI function calling format).
-            timeout: Optional per-call timeout in seconds.
+            timeout: Optional per-call timeout in seconds; tightens the SDK
+                request timeout for this call (see ``_with_request_timeout``).
             tool_choice: ``None`` or :data:`TOOL_CHOICE_NONE` (see ``_bind``).
 
         Returns:
             LLMResponse.
         """
-        llm = self._bind(tools, tool_choice)
-        config = {"timeout": timeout} if timeout else {}
-        ai_message = llm.invoke(messages, config=config)
+        llm = _with_request_timeout(self._bind(tools, tool_choice), timeout)
+        ai_message = llm.invoke(messages)
         return self._parse_response(ai_message)
 
     def stream_chat(
@@ -283,7 +323,7 @@ class ChatLLM:
         tools: Optional[List[Dict[str, Any]]] = None,
         on_text_chunk: Optional[Any] = None,
         on_reasoning_chunk: Optional[Any] = None,
-        timeout: Optional[int] = None,
+        timeout: Optional[float] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
         tool_choice: Optional[str] = None,
     ) -> LLMResponse:
@@ -298,10 +338,17 @@ class ChatLLM:
             tools: Tool definitions for function calling.
             on_text_chunk: Optional callback ``(delta: str) -> None``.
             on_reasoning_chunk: Optional callback ``(delta: str) -> None``.
-            timeout: Optional per-call timeout in seconds.
+            timeout: Optional wall-clock budget for the whole call, in
+                seconds. Checked per chunk; once spent the stream is closed
+                and the partial reply returned with ``interrupted="deadline"``
+                (a transport error raised after that instant — the SDK's own
+                read timeout, which this also tightens — ends the same way
+                instead of raising). Silent stretches without any chunk are
+                bounded by the SDK read timeout only.
             should_cancel: Optional predicate polled per chunk; when it returns
-                True the stream stops early and the partial response is returned.
-                Lets a caller abort a live stream promptly (cooperative cancel).
+                True the stream stops early and the partial response is
+                returned with ``interrupted="cancelled"``. Lets a caller abort
+                a live stream promptly (cooperative cancel).
             tool_choice: ``None`` (model decides) or :data:`TOOL_CHOICE_NONE`
                 for a forced text turn — tools stay in the payload, the model
                 is told not to call any (providers without ``none`` support
@@ -310,12 +357,88 @@ class ChatLLM:
         Returns:
             Parsed ``LLMResponse``.
         """
+        deadline = time.monotonic() + timeout if timeout else None
         try:
-            llm = self._bind(tools, tool_choice)
-            config = {"timeout": timeout} if timeout else {}
-            accumulated = None
-            for chunk in llm.stream(messages, config=config):
+            llm = _with_request_timeout(self._bind(tools, tool_choice), timeout)
+        except Exception as exc:
+            raise self._stream_error(exc) from exc
+        return self._consume_stream(
+            llm,
+            messages,
+            deadline=deadline,
+            should_cancel=should_cancel,
+            on_text_chunk=on_text_chunk,
+            on_reasoning_chunk=on_reasoning_chunk,
+        )
+
+    def summarize(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        timeout: Optional[float] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> LLMResponse:
+        """Streamed, cancellable, retry-free call for context summaries.
+
+        The Layer 3 compaction entry point. Streaming keeps bytes flowing
+        through middleboxes during a long generation (the reason the native
+        channel exists) and makes the call interruptible per chunk; the
+        client behind it is built with ``max_retries=0`` because a failed
+        summary is already a handled degradation — SDK retries would only
+        multiply the time it can take.
+
+        Args:
+            messages: Messages in OpenAI format (no tools are bound).
+            timeout: Wall-clock budget for the call, as in :meth:`stream_chat`.
+            should_cancel: Cooperative cancel predicate, as in :meth:`stream_chat`.
+
+        Returns:
+            Parsed ``LLMResponse``; ``interrupted`` is set when cut short.
+        """
+        deadline = time.monotonic() + timeout if timeout else None
+        llm = _with_request_timeout(self._summary_client(), timeout)
+        return self._consume_stream(
+            llm, messages, deadline=deadline, should_cancel=should_cancel
+        )
+
+    def _summary_client(self) -> Any:
+        """The no-retry client behind :meth:`summarize` (built once, lazily)."""
+        cached = getattr(self, "_summary_llm", None)
+        if cached is not None:
+            return cached
+        try:
+            cached = build_llm(model_name=self.model_name, max_retries=0)
+        except Exception:  # noqa: BLE001 - fall back to the regular client
+            cached = self._llm
+        self._summary_llm = cached
+        return cached
+
+    def _stream_error(self, exc: Exception) -> ProviderStreamError:
+        model = self.model_name or os.getenv("LANGCHAIN_MODEL_NAME", "").strip() or "(unset)"
+        return ProviderStreamError(provider=self.provider, model=model, original=exc)
+
+    def _consume_stream(
+        self,
+        llm: Any,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline: Optional[float],
+        should_cancel: Optional[Callable[[], bool]],
+        on_text_chunk: Optional[Any] = None,
+        on_reasoning_chunk: Optional[Any] = None,
+    ) -> LLMResponse:
+        """Drain ``llm.stream`` into one response, honouring cancel and deadline."""
+        accumulated = None
+        interrupted: Optional[str] = None
+        stream = None
+        try:
+            stream = llm.stream(messages)
+            for chunk in stream:
                 if should_cancel and should_cancel():
+                    interrupted = "cancelled"
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    interrupted = "deadline"
                     break
                 # Native Anthropic chunks carry block-list content; flatten to
                 # text/thinking deltas so callers keep receiving plain strings.
@@ -329,12 +452,31 @@ class ChatLLM:
                 if reasoning and not text_delta and on_reasoning_chunk:
                     on_reasoning_chunk(reasoning)
                 accumulated = chunk if accumulated is None else accumulated + chunk
-            if accumulated is None:
-                return LLMResponse(content="", tool_calls=[], finish_reason="stop")
-            return self._parse_response(accumulated)
         except Exception as exc:
-            model = self.model_name or os.getenv("LANGCHAIN_MODEL_NAME", "").strip() or "(unset)"
-            raise ProviderStreamError(provider=self.provider, model=model, original=exc) from exc
+            if deadline is None or time.monotonic() < deadline:
+                raise self._stream_error(exc) from exc
+            # The call's budget is spent: a transport error now (typically
+            # the tightened SDK read timeout) is the deadline, not a failure.
+            interrupted = "deadline"
+        finally:
+            if interrupted is not None and stream is not None:
+                # Close the HTTP stream now instead of at garbage collection,
+                # so an abandoned generation stops being paid for.
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:  # noqa: BLE001 - best-effort close
+                        pass
+        if accumulated is None:
+            return LLMResponse(content="", tool_calls=[], finish_reason="stop",
+                               interrupted=interrupted)
+        try:
+            response = self._parse_response(accumulated)
+        except Exception as exc:
+            raise self._stream_error(exc) from exc
+        response.interrupted = interrupted
+        return response
 
     @staticmethod
     def _tool_call_thought_signature_maps(ai_message: Any) -> tuple[dict[str, str], dict[int, str]]:

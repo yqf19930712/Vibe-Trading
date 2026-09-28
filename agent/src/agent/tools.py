@@ -158,7 +158,7 @@ class ToolRegistry:
             return tool.execute(**_coerce_params(tool.parameters, params))
         except Exception as exc:
             logger.exception("Tool %s failed", name)
-            # F6: the raw exception text can leak internal filesystem topology
+            # The raw exception text can leak internal filesystem topology
             # (home dir, venv paths) to the model. Individual tools already
             # redact their own error paths (e.g. read_file); this is the
             # registry-level backstop for every tool that doesn't.

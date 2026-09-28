@@ -17,11 +17,15 @@ class WriteFileTool(BaseTool):
     name = "write_file"
     description = (
         "Write content to a file under run_dir (path is relative to run_dir), "
-        "creating parent directories; an existing file is overwritten whole — "
-        "use edit_file for a targeted change. Use it for strategy code "
+        "creating parent directories. mode='overwrite' (default) replaces an "
+        "existing file whole — use edit_file for a targeted change; "
+        "mode='append' adds content to the end (creating the file if needed). "
+        "For a long report or script, write it in parts — first part with the "
+        "default mode, the rest with mode='append' — so no single call has to "
+        "fit the whole text into one reply. Use it for strategy code "
         "(code/signal_engine.py, config.json), notes and reports. Returns "
-        "{status:'ok', path, bytes_written}; status:'error' with the reason when "
-        "the path resolves outside run_dir or the write fails."
+        "{status:'ok', path, bytes_written, mode}; status:'error' with the reason "
+        "when the path resolves outside run_dir or the write fails."
     )
     is_readonly = False
     parameters = {
@@ -29,6 +33,11 @@ class WriteFileTool(BaseTool):
         "properties": {
             "path": {"type": "string", "description": "File path relative to run_dir"},
             "content": {"type": "string", "description": "Content to write"},
+            "mode": {
+                "type": "string",
+                "enum": ["overwrite", "append"],
+                "description": "overwrite (default) or append to the end of the file",
+            },
         },
         "required": ["path", "content"],
     }
@@ -46,6 +55,12 @@ class WriteFileTool(BaseTool):
         file_path = kwargs["path"]
         content = kwargs["content"]
         run_dir = kwargs.get("run_dir")
+        mode = str(kwargs.get("mode") or "overwrite").strip().lower()
+        if mode not in ("overwrite", "append"):
+            return json.dumps(
+                {"status": "error", "error": "mode must be 'overwrite' or 'append'"},
+                ensure_ascii=False,
+            )
 
         if not run_dir:
             return json.dumps(
@@ -70,12 +85,17 @@ class WriteFileTool(BaseTool):
 
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
-            resolved.write_text(content, encoding="utf-8")
+            if mode == "append":
+                with resolved.open("a", encoding="utf-8") as fh:
+                    fh.write(content)
+            else:
+                resolved.write_text(content, encoding="utf-8")
             return json.dumps(
                 {
                     "status": "ok",
                     "path": str(resolved),
                     "bytes_written": len(content.encode("utf-8")),
+                    "mode": mode,
                 },
                 ensure_ascii=False,
             )

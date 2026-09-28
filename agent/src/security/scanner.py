@@ -23,11 +23,10 @@ class InjectionRule:
     message: str
 
 
-# Every rule carries an English pattern AND a Chinese one (V2). The five
-# original patterns were English-only, while this product's external content —
-# 雪球 posts, exchange filings, Chinese news, uploaded broker statements — is
-# overwhelmingly Chinese, so the context-layer guardrail was blind to the
-# majority of its own traffic. Note the Chinese variants cannot use ``\b``:
+# Every rule carries an English pattern AND a Chinese one: this product's
+# external content — 雪球 posts, exchange filings, Chinese news, uploaded
+# broker statements — is overwhelmingly Chinese, and English-only patterns
+# would leave the context-layer guardrail blind to most of its traffic. Note the Chinese variants cannot use ``\b``:
 # there are no word boundaries between CJK characters.
 _RULES: tuple[InjectionRule, ...] = (
     InjectionRule(

@@ -16,6 +16,19 @@ research sessions. Weights used here:
 
 These are estimates for *thresholding* only — billing always prefers real
 provider ``usage_metadata`` when present.
+
+Calibration and margins. The CJK weight matches DeepSeek-style tokenizers;
+Claude's tokenizer is denser on Chinese, so there the real count is higher
+than the estimate. Every budget built on this module (the loop's
+``TOKEN_THRESHOLD`` and tail/summary budgets, the session replay and handoff
+budgets) is therefore a budget in *estimator units*, sized far below any
+supported model's window — they are cost budgets, not overflow guards. The
+main loop measures the real/estimate ratio of every call (provider
+``input_tokens`` against the estimate of the same request, EMA per attempt)
+and reports it as ``attempt_stats.token_estimate_ratio``; the only overflow
+guard, the ``VIBE_CONTEXT_WINDOW_TOKENS`` cap, converts with that ratio and
+keeps 20% of the window in reserve (``loop.CONTEXT_WINDOW_SAFETY``).
+Recalibrate the weights here from that production ratio, not by guessing.
 """
 
 from __future__ import annotations

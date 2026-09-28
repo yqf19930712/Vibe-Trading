@@ -6,6 +6,9 @@ import ipaddress
 import json
 import logging
 import os
+import re
+import socket
+import threading
 from urllib.parse import urlsplit
 
 import requests
@@ -32,6 +35,87 @@ _MAX_LENGTH = 8000
 _CACHED_MARKER = "Warning: This is a cached snapshot"
 
 
+_NUMERIC_HOST_RE = re.compile(r"^(0x[0-9a-f]*|[0-9]+)(\.(0x[0-9a-f]*|[0-9]+)){0,3}$")
+# Resolving the host is a best-effort extra check (the fetch itself runs on
+# r.jina.ai's side), so it gets a short, bounded wait.
+_RESOLVE_TIMEOUT_S = 2.0
+
+
+def _legacy_ipv4(host: str) -> ipaddress.IPv4Address | None:
+    """Decode the inet_aton spellings browsers and curl still accept.
+
+    ``2852039166``, ``0xa9fea9fe``, ``0251.0376.0251.0376`` and ``169.254.43518``
+    all mean 169.254.169.254; ``ipaddress`` rejects them, so they used to pass
+    as ordinary host names.
+    """
+    if not _NUMERIC_HOST_RE.match(host):
+        return None
+    values: list[int] = []
+    for part in host.split("."):
+        try:
+            if part.startswith("0x"):
+                values.append(int(part[2:] or "0", 16))
+            elif len(part) > 1 and part.startswith("0"):
+                values.append(int(part, 8))
+            else:
+                values.append(int(part, 10))
+        except ValueError:
+            return None
+    head, last = values[:-1], values[-1]
+    if any(v > 255 for v in head) or last >= 1 << (8 * (4 - len(head))):
+        return None
+    number = 0
+    for v in head:
+        number = (number << 8) | v
+    number = (number << (8 * (4 - len(head)))) | last
+    return ipaddress.IPv4Address(number)
+
+
+def _is_public(ip: ipaddress._BaseAddress) -> bool:
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+        or not ip.is_global
+    )
+
+
+def _resolves_to_non_public(host: str) -> bool:
+    """Whether ``host`` resolves (here, within a short wait) to a non-public address.
+
+    Only consulted for hosted tenants; an unresolvable host or a slow
+    resolver is not a rejection — the remote reader resolves on its side.
+    """
+    from src.config.tenant import tenant_profile_active
+
+    if not tenant_profile_active():
+        return False
+    found: list[str] = []
+
+    def _lookup() -> None:
+        try:
+            found.extend(info[4][0] for info in socket.getaddrinfo(host, None))
+        except (OSError, UnicodeError):
+            pass
+
+    worker = threading.Thread(target=_lookup, daemon=True)
+    worker.start()
+    worker.join(_RESOLVE_TIMEOUT_S)
+    for address in list(found):
+        try:
+            if not _is_public(ipaddress.ip_address(address.split("%", 1)[0])):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def _url_allowed(url: str) -> tuple[bool, str]:
     """Return whether a URL is safe to forward to the remote reader service."""
     try:
@@ -52,19 +136,15 @@ def _url_allowed(url: str) -> tuple[bool, str]:
 
     ip_host = host.split("%", 1)[0]
     try:
-        ip = ipaddress.ip_address(ip_host)
+        ip: ipaddress._BaseAddress | None = ipaddress.ip_address(ip_host)
     except ValueError:
-        return True, ""
+        ip = _legacy_ipv4(ip_host)
 
-    if (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-        or not ip.is_global
-    ):
+    if ip is None:
+        if _resolves_to_non_public(host):
+            return False, "target URL is not allowed"
+        return True, ""
+    if not _is_public(ip):
         return False, "target URL is not allowed"
     return True, ""
 

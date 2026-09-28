@@ -4,14 +4,34 @@ Listens on :8898 (template probe target) and manages the engine process on
 :8899. The router boots/reboots the engine with per-tenant env via POST /boot,
 so a single template serves every tenant and every LLM configuration.
 
-Endpoints (no authentication — the launcher is reachable only through
-cube-proxy's host routing from the host itself; the engine on :8899 is the
-one that checks `Authorization: Bearer API_AUTH_KEY`):
+Authentication: /health is open (it is the template probe). /boot and /stop
+are open unless the router handed over a token with the launcher's FIRST
+/boot (env key VIBE_LAUNCHER_TOKEN); from then on both require
+`Authorization: Bearer <token>` (the launcher is reachable from inside the
+guest too, e.g. by the engine's shell tools over loopback). Only the first
+/boot may set a token: no tenant code runs in the guest before it, whereas
+after it an unauthenticated caller could be guest code, so a launcher that
+started without a token stays without one. An authenticated /boot without
+a token drops the requirement, which is how the router switches it off.
+The engine on :8899 checks its own `Authorization: Bearer API_AUTH_KEY`.
+
+Privileges: CubeSandbox starts the template's CMD as root whatever the
+image's USER says, so the launcher runs as root in production. It keeps
+root for itself (router token, egress key and tunnel) and runs the engine —
+and with it every tool subprocess, the tenant's shell tools included — as
+the unprivileged image user (VIBE_ENGINE_USER, default "vibe"). Before each
+spawn it hands the host-mounted tenant data dir to that user: engines used
+to run as root, so a tenant dir carries root-owned files. If the launcher is
+not root (e.g. `docker run` honours USER) nothing changes; if it is root and
+the engine user does not exist, /boot fails rather than run the engine as root.
+
+Endpoints:
   GET  /health -> 200 {"launcher": "ok",
                        "engine": "running"|"starting"|"stopped",
                        "egress_tunnel": "up"|"down"|"off"}
                   (also respawns a dead egress tunnel, >=10s apart)
   POST /boot   -> {"env": {...}} kill current engine (if any), pop the
+                  VIBE_LAUNCHER_* keys (token adoption, see above) and the
                   VIBE_EGRESS_* keys out of env and (re)start the ssh egress
                   tunnel with them (key material never reaches the engine),
                   spawn `vibe-trading serve --host 0.0.0.0 --port 8899` with
@@ -21,8 +41,10 @@ one that checks `Authorization: Bearer API_AUTH_KEY`):
 """
 
 import base64
+import hmac
 import json
 import os
+import pwd
 import signal
 import socket
 import subprocess
@@ -35,14 +57,102 @@ ENGINE_PORT = 8899
 LAUNCHER_PORT = 8898
 BOOT_TIMEOUT_SEC = int(os.environ.get("VIBE_LAUNCHER_BOOT_TIMEOUT", "120"))
 TUNNEL_LOCAL_PORT = int(os.environ.get("VIBE_EGRESS_LOCAL_PORT", "8118"))
+ENGINE_USER = os.environ.get("VIBE_ENGINE_USER", "vibe")
+# Where a root launcher keeps the egress key: outside the engine user's HOME,
+# readable by root only.
+ROOT_KEY_DIR = "/run/vibe-launcher"
 
 _engine = {"proc": None}
+# One engine lifecycle change at a time. The HTTP server is threaded, and a
+# /boot whose client went away keeps running here; a second /boot (or /stop)
+# arriving meanwhile waits for it instead of interleaving kill/spawn with it.
+_lifecycle_lock = threading.Lock()
+# Router token for /boot and /stop (None = not required), and how many
+# /boot requests this launcher has taken; see module doc.
+_auth = {"token": None, "boots": 0}
+
+
+def _authorized(headers):
+    token = _auth["token"]
+    if not token:
+        return True
+    got = str(headers.get("Authorization") or "")
+    return hmac.compare_digest(got.encode(), ("Bearer " + token).encode())
+
+
+def _adopt_token(extra_env):
+    """Pop the router-auth keys out of an (already authorized) /boot env.
+
+    The token is set on the first /boot, and changed or dropped by a later
+    one only while a token is in force (the request then carried it).
+    """
+    token = str(extra_env.pop("VIBE_LAUNCHER_TOKEN", "") or "")
+    extra_env.pop("VIBE_LAUNCHER_AUTH", None)
+    if _auth["boots"] == 0 or _auth["token"]:
+        _auth["token"] = token or None
+    _auth["boots"] += 1
+
+
+def _no_dumps():
+    """Keep same-uid processes (the engine's shell tools) from ptrace-ing
+    this process or reading its memory, where the router token lives."""
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE = 4
+    except Exception:  # noqa: BLE001 - not Linux / no libc: nothing to harden
+        pass
 # In-guest encrypted egress tunnel: sandbox -> ssh -> server B's loopback
 # tinyproxy (domain-whitelisted). A plaintext HTTP proxy across the border
 # gets keyword-reset on the CONNECT line for blocked domains; SSH does not.
 # The key is delivered via /boot env and is restricted server-side to
 # port-forwarding tinyproxy only (authorized_keys restrict,permitopen).
 _tunnel = {"proc": None, "cmd": None, "last_spawn": 0.0}
+
+
+def _key_dir():
+    """Directory for the egress key: root-only when we are root, so the
+    engine user (and its shell tools) cannot read it; ~/.ssh otherwise."""
+    if os.geteuid() == 0:
+        return ROOT_KEY_DIR
+    return os.path.expanduser("~/.ssh")
+
+
+def _engine_identity():
+    """(uid, gid, home) to run the engine as, or None to keep our own.
+
+    Raises KeyError when we are root and the engine user is missing — the
+    caller refuses to boot instead of running the engine as root.
+    """
+    if os.geteuid() != 0:
+        return None
+    pw = pwd.getpwnam(ENGINE_USER)
+    return pw.pw_uid, pw.pw_gid, pw.pw_dir
+
+
+def _hand_over_data_dir(data_dir, uid, gid):
+    """Give the tenant data dir to the engine user, without following links.
+
+    Engines used to run as root, so a host-mounted tenant dir holds root-owned
+    files an unprivileged engine could not update. Only entries not already
+    owned by (uid, gid) are touched, so a steady-state boot is a plain walk.
+    """
+    if not os.path.isdir(data_dir) or os.path.islink(data_dir):
+        return
+
+    def _own(path):
+        try:
+            st = os.lstat(path)
+            if st.st_uid != uid or st.st_gid != gid:
+                os.lchown(path, uid, gid)
+        except OSError:
+            pass
+
+    _own(data_dir)
+    for dirpath, dirnames, filenames in os.walk(data_dir, followlinks=False):
+        for name in dirnames + filenames:
+            _own(os.path.join(dirpath, name))
 
 
 def _engine_alive():
@@ -98,8 +208,9 @@ def _configure_tunnel(extra_env):
     _tunnel["cmd"] = None
     if not key_b64 or not dest:
         return
-    ssh_dir = os.path.expanduser("~/.ssh")
+    ssh_dir = _key_dir()
     os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
+    os.chmod(ssh_dir, 0o700)
     key_path = os.path.join(ssh_dir, "egress_key")
     with open(key_path, "wb") as f:
         f.write(base64.b64decode(key_b64))
@@ -174,14 +285,28 @@ def _tunnel_keeper():
 
 def _boot_engine(extra_env):
     _stop_engine()
+    try:
+        identity = _engine_identity()
+    except KeyError:
+        return False, f"engine user {ENGINE_USER!r} missing; refusing to run the engine as root"
     _configure_tunnel(extra_env)
     env = dict(os.environ)
     env.update({str(k): str(v) for k, v in extra_env.items()})
+    drop = {}
+    if identity is not None:
+        uid, gid, home = identity
+        env.update({"HOME": home, "USER": ENGINE_USER, "LOGNAME": ENGINE_USER})
+        data_dir = env.get("VIBE_DATA_DIR") or os.path.join(home, ".vibe-trading")
+        _hand_over_data_dir(data_dir, uid, gid)
+        # Popen's user/group switch in the child without a preexec_fn, which
+        # is unsafe here: this server is multi-threaded.
+        drop = {"user": uid, "group": gid, "extra_groups": []}
     _engine["proc"] = subprocess.Popen(
         ["vibe-trading", "serve", "--host", "0.0.0.0", "--port", str(ENGINE_PORT)],
         env=env,
         cwd=os.environ.get("VIBE_APP_DIR", "/app"),
         start_new_session=True,
+        **drop,
     )
     deadline = time.time() + BOOT_TIMEOUT_SEC
     while time.time() < deadline:
@@ -215,7 +340,7 @@ class Handler(BaseHTTPRequestHandler):
             tunnel_proc = _tunnel["proc"]
             ssh_alive = tunnel_proc is not None and tunnel_proc.poll() is None
             # "up" requires the forward to actually accept connections — an
-            # alive ssh with a dead forward is what starved run 88e080ef0a46.
+            # alive ssh whose forward is dead still fails every proxied call.
             tunnel = (
                 "off" if not _tunnel["cmd"]
                 else "up" if ssh_alive and _tunnel_port_open()
@@ -226,6 +351,9 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path in ("/boot", "/stop") and not _authorized(self.headers):
+            self._reply(401, {"error": "unauthorized"})
+            return
         if self.path == "/boot":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -236,10 +364,13 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, json.JSONDecodeError) as exc:
                 self._reply(400, {"error": str(exc)})
                 return
-            ok, msg = _boot_engine(extra_env)
+            with _lifecycle_lock:
+                _adopt_token(extra_env)
+                ok, msg = _boot_engine(extra_env)
             self._reply(200 if ok else 500, {"ok": ok, "detail": msg})
         elif self.path == "/stop":
-            _stop_engine()
+            with _lifecycle_lock:
+                _stop_engine()
             self._reply(200, {"ok": True})
         else:
             self._reply(404, {"error": "not found"})
@@ -249,5 +380,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    _no_dumps()
     threading.Thread(target=_tunnel_keeper, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", LAUNCHER_PORT), Handler).serve_forever()

@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from rich.console import Console
 
+from src.config.tenant import multitenant_enabled, tenant_profile_active
 from src.core.paths import data_root as _core_data_root
 from src.goal.context import default_goal_criteria
 from src.ui_services import build_run_analysis, load_run_context
@@ -53,9 +54,7 @@ def _data_root() -> Path:
 
 # Fail loud rather than silently writing tenant state into the shared install
 # dir when a multi-tenant launcher forgot to set the per-tenant data dir.
-if os.getenv("VIBE_MULTITENANT", "").strip().lower() in {"1", "true", "yes"} and not os.getenv(
-    "VIBE_DATA_DIR"
-):
+if multitenant_enabled() and not os.getenv("VIBE_DATA_DIR"):
     raise SystemExit(
         "VIBE_MULTITENANT is set but VIBE_DATA_DIR is not — refusing to write tenant "
         "state into the shared install directory. Set VIBE_DATA_DIR=$HOME/.vibe-trading."
@@ -663,6 +662,7 @@ async def _run_startup_preflight() -> None:
     from src.preflight import run_preflight
 
     setup_logging()
+    _harden_tenant_process()
     # Several data SDKs (tushare/akshare/baostock) issue blocking HTTP calls
     # with no timeout — a stalled upstream would hang a tool thread for the
     # whole tool timeout. This floor only affects blocking sockets; asyncio's
@@ -791,7 +791,7 @@ def _require_shutdown_authorization(
         if not token or not hmac.compare_digest(token, api_key):
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
         return
-    if not _is_local_client(request):
+    if not _loopback_trusted(request):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="API_AUTH_KEY is required for non-local API access",
@@ -806,9 +806,11 @@ def _validate_api_auth(
     allow_query: bool = False,
 ) -> None:
     """Validate configured auth, preserving loopback-only dev mode."""
-    # Loopback clients are always trusted, even when API_AUTH_KEY is set.
-    # The key only gates non-local (LAN/remote) access.
-    if _is_local_client(request):
+    # Single-user installs: loopback clients are trusted even when
+    # API_AUTH_KEY is set; the key only gates non-local (LAN/remote) access.
+    # Hosted tenants (VIBE_MULTITENANT) get no such exemption — see
+    # _loopback_trusted.
+    if _loopback_trusted(request):
         return
 
     api_key = _configured_api_key()
@@ -821,6 +823,21 @@ def _validate_api_auth(
     token = _auth_credential_from_header_or_query(cred, query_api_key, allow_query=allow_query)
     if not token or not hmac.compare_digest(token, api_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+def _loopback_trusted(request: Request) -> bool:
+    """Whether a loopback peer may skip the API key.
+
+    Never in the hosted multi-tenant profile: the router reaches the engine
+    through cube-proxy (not loopback) and always sends the Bearer key, while
+    the only loopback callers inside a tenant guest are the model's own
+    shell / background subprocesses. Trusting them would let a tool call
+    start attempts or swarm runs outside the router's budget and metering.
+    The launcher only probes ``/health``, which is unauthenticated.
+    """
+    if multitenant_enabled():
+        return False
+    return _is_local_client(request)
 
 
 def _is_local_client(request: Request) -> bool:
@@ -905,7 +922,7 @@ async def require_local_or_auth(
     if _configured_api_key():
         await require_auth(request, cred)
         return
-    if not _is_local_client(request):
+    if not _loopback_trusted(request):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Settings access requires API_AUTH_KEY or a local loopback client",
@@ -930,11 +947,74 @@ async def require_settings_write_auth(
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
         return
 
-    if not _is_local_client(request):
+    if not _loopback_trusted(request):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Settings writes require API_AUTH_KEY or a local loopback client",
         )
+
+
+async def deny_in_tenant_profile() -> None:
+    """Close control-plane entry points a hosted tenant must never reach.
+
+    The router drives a tenant engine only through ``/sessions/*``; every
+    attempt it starts carries a deadline and its usage flows through the
+    router's event pump. Direct swarm starts (``POST /swarm/runs`` and its
+    retry) bypass both, and the mandate / live-trading endpoints are the
+    execution-layer twin of the registry-level money red line
+    (``trading_*`` / ``propose_mandate_profiles`` are never registered in
+    this profile). Refusing them here makes that red line hold even for a
+    caller that already passed authentication.
+    """
+    if tenant_profile_active():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Endpoint disabled for hosted tenants",
+        )
+
+
+# Wall-clock budget applied to an attempt whose caller sent no deadline_s.
+# VIBE_DEFAULT_DEADLINE_S overrides; unset means 900s (the router's standard
+# ask budget) for hosted tenants and no deadline for a local single-user
+# install, where long interactive runs are the norm.
+_DEFAULT_DEADLINE_ENV = "VIBE_DEFAULT_DEADLINE_S"
+_TENANT_DEFAULT_DEADLINE_S = 900.0
+
+
+def _default_attempt_deadline_s() -> Optional[float]:
+    """Return the deadline for an attempt started without ``deadline_s``."""
+    raw = os.getenv(_DEFAULT_DEADLINE_ENV, "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return value
+    return _TENANT_DEFAULT_DEADLINE_S if tenant_profile_active() else None
+
+
+def _harden_tenant_process() -> None:
+    """Keep same-uid guest processes out of the engine's /proc entries.
+
+    The model's shell subprocesses run as the engine's uid, so without this
+    they could read ``/proc/<engine>/environ`` (which holds API_AUTH_KEY and
+    the shared LLM credentials) and replay the key against this API.
+    ``PR_SET_DUMPABLE=0`` hands the process's /proc files to root and blocks
+    ptrace; children reset it on exec, so tools are unaffected. Linux only,
+    best effort.
+    """
+    if not multitenant_enabled() or not _sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        pr_set_dumpable = 4
+        if libc.prctl(pr_set_dumpable, 0, 0, 0, 0) != 0:
+            logger.warning("prctl(PR_SET_DUMPABLE, 0) failed: errno %s", ctypes.get_errno())
+    except Exception:  # noqa: BLE001 - hardening must never block serving
+        logger.warning("could not mark the engine process non-dumpable", exc_info=True)
 
 
 # ============================================================================
@@ -1816,10 +1896,15 @@ def _get_session_service():
         event_bus=event_bus,
         runs_dir=RUNS_DIR,
     )
+    # A deleted session's goal ledger goes with it — also on the late sweep
+    # after an attempt that outlived the delete finally exits.
+    _session_service.add_purge_hook(lambda sid: _get_goal_store().delete_session_goals(sid))
     # Sessions deleted from the host while the engine was down leave their
     # sessions.db rows behind; sweep them before the first search can
     # surface a deleted conversation.
     _session_service.reconcile_orphans(goal_store=_get_goal_store())
+    # Opt-in retention (VIBE_SESSION_RETENTION_DAYS); a no-op by default.
+    _session_service.maybe_sweep_expired_sessions()
     return _session_service
 
 
@@ -2148,7 +2233,11 @@ async def send_message(session_id: str, payload: SendMessageRequest, http_reques
             session_id=session_id,
             content=payload.content,
             include_shell_tools=_shell_tools_enabled_for_request(http_request),
-            deadline_s=payload.deadline_s,
+            deadline_s=(
+                payload.deadline_s
+                if payload.deadline_s is not None
+                else _default_attempt_deadline_s()
+            ),
         )
         return result
     except ValueError as exc:
@@ -2210,16 +2299,26 @@ async def session_events(
     event_id = header_id or last_event_id
     replay_active = (replay or "").lower() == "active"
     replay_all = False
-    if replay_active and not event_id and session.last_attempt_id:
+    # Also on a reconnect (Last-Event-ID set): an id this process issued
+    # resumes right after it, even once that event has left the buffer (ids
+    # are ``<epoch>-<seq>``, see src.session.events); any other id falls back
+    # to the running attempt's whole window instead of nothing, so events
+    # emitted while disconnected (an ``llm_usage`` included) are not lost.
+    # Callers skip ids they already hold.
+    if replay_active and session.last_attempt_id:
         attempt = svc.store.get_attempt(session_id, session.last_attempt_id)
         attempt_status = getattr(attempt.status, "value", attempt.status) if attempt else None
         replay_all = attempt_status == "running"
 
     async def event_generator():
+        # replay=active hydrates the RUNNING attempt only: the buffer is per
+        # session, and its tail still holds the previous attempt's llm_usage
+        # and attempt_stats, which a billing consumer would count twice.
         async for event in svc.event_bus.subscribe(
             session_id,
             last_event_id=event_id,
             replay_all=replay_all,
+            since_attempt=session.last_attempt_id if replay_all else None,
         ):
             if await request.is_disconnected():
                 break
@@ -2381,7 +2480,7 @@ async def list_swarm_presets():
     return list_presets()
 
 
-@app.post("/swarm/runs", dependencies=[Depends(require_auth)])
+@app.post("/swarm/runs", dependencies=[Depends(require_auth), Depends(deny_in_tenant_profile)])
 async def create_swarm_run(payload: dict, http_request: Request):
     """Start a swarm run: body must include preset_name and user_vars."""
     runtime = _get_swarm_runtime()
@@ -2492,7 +2591,7 @@ async def cancel_swarm_run(run_id: str):
     return {"status": "cancelled"}
 
 
-@app.post("/swarm/runs/{run_id}/retry", dependencies=[Depends(require_auth)])
+@app.post("/swarm/runs/{run_id}/retry", dependencies=[Depends(require_auth), Depends(deny_in_tenant_profile)])
 async def retry_swarm_run(run_id: str, http_request: Request):
     """Retry a failed, stale, or cancelled swarm run.
 
@@ -2769,7 +2868,7 @@ def _fetch_broker_ceilings(broker: str) -> Optional[Dict[str, Any]]:
     }
 
 
-@app.post("/mandate/commit", dependencies=[Depends(require_auth)])
+@app.post("/mandate/commit", dependencies=[Depends(require_auth), Depends(deny_in_tenant_profile)])
 async def commit_mandate_endpoint(payload: CommitMandateRequest):
     """Commit a user-selected mandate profile — the only mandate write path.
 
@@ -2817,7 +2916,7 @@ async def commit_mandate_endpoint(payload: CommitMandateRequest):
     return result
 
 
-@app.post("/live/halt", dependencies=[Depends(require_auth)])
+@app.post("/live/halt", dependencies=[Depends(require_auth), Depends(deny_in_tenant_profile)])
 async def halt_live_endpoint(payload: LiveHaltRequest):
     """Trip the live kill switch (privileged surface action, Consent §4).
 
@@ -2842,7 +2941,7 @@ async def halt_live_endpoint(payload: LiveHaltRequest):
     return result
 
 
-@app.post("/live/resume", dependencies=[Depends(require_auth)])
+@app.post("/live/resume", dependencies=[Depends(require_auth), Depends(deny_in_tenant_profile)])
 async def resume_live_endpoint(payload: LiveHaltRequest):
     """Clear the live kill switch (privileged surface action, Consent §4).
 
@@ -3015,7 +3114,7 @@ async def live_status_endpoint(broker: Optional[str] = Query(None, max_length=64
     return LiveStatusResponse(global_halted=halt_flag_set(broker=None), brokers=statuses)
 
 
-@app.post("/live/authorize", dependencies=[Depends(require_auth)])
+@app.post("/live/authorize", dependencies=[Depends(require_auth), Depends(deny_in_tenant_profile)])
 async def live_authorize_endpoint(payload: LiveAuthorizeRequest):
     """Describe the OAuth bootstrap on-ramp for a live broker (C2 web on-ramp).
 
@@ -3220,7 +3319,7 @@ async def _drive_runner(runner: Any) -> None:
         await asyncio.get_running_loop().run_in_executor(None, lambda: result)
 
 
-@app.post("/live/runner/start", dependencies=[Depends(require_auth)])
+@app.post("/live/runner/start", dependencies=[Depends(require_auth), Depends(deny_in_tenant_profile)])
 async def start_runner_endpoint(payload: LiveRunnerControlRequest):
     """Start the persistent live runner for a broker (SPEC §7.5).
 
@@ -3275,7 +3374,7 @@ async def start_runner_endpoint(payload: LiveRunnerControlRequest):
     return {"broker": broker, "started": True, "already_running": False}
 
 
-@app.post("/live/runner/stop", dependencies=[Depends(require_auth)])
+@app.post("/live/runner/stop", dependencies=[Depends(require_auth), Depends(deny_in_tenant_profile)])
 async def stop_runner_endpoint(payload: LiveRunnerControlRequest):
     """Stop the persistent live runner for a broker (SPEC §7.5).
 

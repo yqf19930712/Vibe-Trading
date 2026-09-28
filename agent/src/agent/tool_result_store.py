@@ -1,4 +1,4 @@
-"""Off-disk storage + explicit truncation preview for oversized tool results (V2).
+"""Off-disk storage + explicit truncation preview for oversized tool results.
 
 Before this module every tool result was silently clipped with
 ``result[:10_000]`` on its way into the trajectory. The model was never told,

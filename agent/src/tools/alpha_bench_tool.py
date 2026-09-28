@@ -886,7 +886,10 @@ class AlphaBenchTool(BaseTool):
             },
             "output_dir": {
                 "type": "string",
-                "description": "Where to write the HTML report; default ~/.vibe-trading/reports/.",
+                "description": (
+                    "Where to write the HTML report, relative to run_dir; "
+                    "default ~/.vibe-trading/reports/."
+                ),
             },
         },
         "required": ["universe", "period"],
@@ -896,7 +899,7 @@ class AlphaBenchTool(BaseTool):
 
     @property
     def timeout_seconds(self) -> float:
-        """Loop-side watchdog bound for alpha_bench (V1).
+        """Loop-side watchdog bound for alpha_bench.
 
         A cold csi300/sp500 bench legitimately runs for many minutes, well past
         the tenant-wide tool timeout, so the loop's 1×/2× write-tool window
@@ -910,5 +913,17 @@ class AlphaBenchTool(BaseTool):
         return _BENCH_BUDGET_S + _BENCH_LOOP_WATCHDOG_MARGIN_S
 
     def execute(self, **kwargs: Any) -> str:
+        output_dir = kwargs.get("output_dir")
+        if output_dir:
+            # A model-chosen report directory stays inside the run roots like
+            # every other file tool's output (the default report dir is fixed).
+            from src.tools.path_utils import safe_tool_output_dir
+
+            try:
+                kwargs["output_dir"] = str(
+                    safe_tool_output_dir(str(output_dir), kwargs.get("run_dir"))
+                )
+            except ValueError as exc:
+                return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
         envelope = run_alpha_bench(**kwargs)
         return json.dumps(envelope, ensure_ascii=False)

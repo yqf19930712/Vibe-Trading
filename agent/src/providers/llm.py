@@ -399,6 +399,18 @@ def max_output_tokens(channel: str) -> Optional[int]:
 _dotenv_loaded: bool = False
 
 
+def _sdk_max_retries(override: Optional[int] = None) -> int:
+    """SDK-level retry count for a client: ``override`` or ``MAX_RETRIES``.
+
+    The Layer 3 summary call builds its client with ``0`` — its failure is
+    already a handled degradation, and SDK retries of a long summary request
+    would multiply its wall-clock cost by up to ``MAX_RETRIES + 1``.
+    """
+    if override is not None:
+        return max(0, int(override))
+    return int(os.getenv("MAX_RETRIES", "2"))
+
+
 def _redact_env_source(loaded: Path | None) -> str:
     """Map a resolved `.env` candidate to a stable, leak-free label.
 
@@ -483,6 +495,7 @@ def _build_native_deepseek(
     model: str,
     temperature: float,
     callbacks: Any = None,
+    max_retries: Optional[int] = None,
 ) -> Any | None:
     """Build the optional native DeepSeek adapter when installed.
 
@@ -504,7 +517,7 @@ def _build_native_deepseek(
         model=model,
         temperature=temperature,
         timeout=int(os.getenv("TIMEOUT_SECONDS", "120")),
-        max_retries=int(os.getenv("MAX_RETRIES", "2")),
+        max_retries=_sdk_max_retries(max_retries),
         # None = no ceiling field in the request (ChatDeepSeek sends the
         # legacy ``max_tokens`` name when one is set).
         max_tokens=max_output_tokens("openai"),
@@ -529,12 +542,48 @@ def _load_env_file(path: Path) -> None:
                 os.environ.setdefault(key, value.strip().strip('"').strip("'"))
 
 
+_TRUTHY_ENV = frozenset({"1", "true", "yes"})
+
+
+def _tenant_profile_active() -> bool:
+    """Whether this engine serves one tenant behind the multi-tenant gateway.
+
+    Either marker the router injects qualifies: the tenant-safe profile
+    (``src.config.tenant.tenant_safe_enabled`` — the same check that keeps
+    ``agent.json`` and the backtest Runner's ``load_dotenv`` off the tenant
+    disk) or the multi-tenant data-root flag ``VIBE_MULTITENANT``.
+    """
+    from src.config.tenant import tenant_safe_enabled
+
+    if tenant_safe_enabled():
+        return True
+    return os.getenv("VIBE_MULTITENANT", "").strip().lower() in _TRUTHY_ENV
+
+
 def _ensure_dotenv() -> None:
-    """Load `.env` from the first found candidate path."""
+    """Load `.env` from the first found candidate path.
+
+    Skipped entirely for a tenant engine: its whole configuration arrives as
+    process env from the router's ``/boot``. ``~/.vibe-trading`` is the
+    tenant's own bind-mount, writable by the tenant's shell tools, and a
+    ``.env`` dropped there would be read into the engine process (which
+    holds the shared LLM credentials) on its next start, filling in any
+    name the router did not set itself. ``AGENT_DIR`` / the working
+    directory sit in the image's ``/app``, read-only in the current image;
+    they are skipped as well rather than trusted to stay that way.
+    """
     global _dotenv_loaded
     if _dotenv_loaded:
         return
     loaded = None
+    if _tenant_profile_active():
+        _dotenv_loaded = True
+        logger.info(
+            "dotenv skipped (tenant profile) | provider=%s model=%s",
+            os.getenv("LANGCHAIN_PROVIDER", "(unset)"),
+            os.getenv("LANGCHAIN_MODEL_NAME", "(unset)"),
+        )
+        return
     for candidate in _ENV_CANDIDATES:
         if candidate.exists():
             _load_env_file(candidate)
@@ -574,22 +623,55 @@ _ANTHROPIC_CACHE_CONTROL = {"type": "ephemeral"}
 _ANTHROPIC_CACHEABLE_BLOCK_TYPES = {"text", "tool_result", "tool_use", "image", "document"}
 
 # The loop's ephemeral status bar changes every iteration; a breakpoint on it
-# would never be reusable, so the breakpoint goes on the newest message that
-# is NOT the status bar.
+# would never be reusable. langchain-anthropic merges consecutive user-side
+# messages (tool results + the status bar) into ONE user message, so the
+# status bar usually arrives as the LAST text block of a merged message, not
+# as a message of its own — the skip therefore works per block.
 _AGENT_STATUS_PREFIX = "<agent_status>"
 
 
-def _message_starts_with_status(message: dict) -> bool:
-    """Return True when an anthropic-format message is the loop's status bar."""
-    content = message.get("content")
-    if isinstance(content, str):
-        return content.startswith(_AGENT_STATUS_PREFIX)
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                return str(block.get("text") or "").startswith(_AGENT_STATUS_PREFIX)
-            break
-    return False
+def _is_status_text(text: Any) -> bool:
+    """Return True for the loop's per-iteration status-bar text."""
+    return isinstance(text, str) and text.startswith(_AGENT_STATUS_PREFIX)
+
+
+def _mark_newest_stable_block(msgs: list) -> None:
+    """Put the message-level breakpoint on the newest stable content block.
+
+    Walks messages newest-first and, inside each, blocks last-first, skipping
+    status-bar text, empty text (the API rejects ``cache_control`` there) and
+    block types that do not accept a breakpoint (thinking). The first block
+    that survives gets the marker — in a merged ``[tool_result…, status]``
+    user message that is the last tool result, whose bytes recur unchanged in
+    the next request, so the prefix written here is read back next turn.
+    """
+    for message in reversed(msgs):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            if not content or _is_status_text(content):
+                continue
+            message["content"] = [
+                {"type": "text", "text": content, "cache_control": dict(_ANTHROPIC_CACHE_CONTROL)}
+            ]
+            return
+        if not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type not in _ANTHROPIC_CACHEABLE_BLOCK_TYPES:
+                continue
+            if block_type == "text":
+                text = block.get("text")
+                if not text or _is_status_text(text):
+                    continue
+            block["cache_control"] = dict(_ANTHROPIC_CACHE_CONTROL)
+            return
+        # Nothing cacheable in this message (status-only, thinking-only) —
+        # try the next older one.
 
 
 def _apply_anthropic_cache_breakpoints(payload: dict) -> None:
@@ -597,10 +679,11 @@ def _apply_anthropic_cache_breakpoints(payload: dict) -> None:
 
     Mutates ``payload`` in place. Three breakpoints (max 4 allowed by the
     API): the last tool definition (tools precede system in the cache
-    prefix), the system block tail, and the newest non-status message's last
-    cacheable content block. On the next call the request prefix up to that
-    message is byte-identical, so Anthropic's longest-prefix lookup reuses
-    the cache even though the breakpoint itself advances every turn.
+    prefix), the system block tail, and the newest stable content block of
+    the conversation (see :func:`_mark_newest_stable_block`). On the next
+    call the request prefix up to that block is byte-identical, so
+    Anthropic's longest-prefix lookup reuses the cache even though the
+    breakpoint itself advances every turn.
     """
     if not isinstance(payload, dict):
         return
@@ -635,29 +718,12 @@ def _apply_anthropic_cache_breakpoints(payload: dict) -> None:
     msgs = payload.get("messages")
     if not isinstance(msgs, list):
         return
-    for message in reversed(msgs):
-        if not isinstance(message, dict):
-            continue
-        if _message_starts_with_status(message):
-            continue
-        content = message.get("content")
-        if isinstance(content, str) and content:
-            message["content"] = [
-                {"type": "text", "text": content, "cache_control": dict(_ANTHROPIC_CACHE_CONTROL)}
-            ]
-            return
-        if isinstance(content, list) and content:
-            for block in reversed(content):
-                if (
-                    isinstance(block, dict)
-                    and block.get("type") in _ANTHROPIC_CACHEABLE_BLOCK_TYPES
-                ):
-                    block["cache_control"] = dict(_ANTHROPIC_CACHE_CONTROL)
-                    return
-        # Message had no cacheable block (e.g. thinking-only) — try older.
+    _mark_newest_stable_block(msgs)
 
 
-def _build_native_anthropic(model: str, callbacks: Any = None) -> Any:
+def _build_native_anthropic(
+    model: str, callbacks: Any = None, max_retries: Optional[int] = None
+) -> Any:
     """Build a native Anthropic Messages API client (LANGCHAIN_PROVIDER=anthropic).
 
     Motivation: the OpenAI-compat conversion path swallows Anthropic's SSE
@@ -748,7 +814,7 @@ def _build_native_anthropic(model: str, callbacks: Any = None) -> Any:
         "model": model,
         "max_tokens": max_output_tokens("anthropic"),
         "timeout": int(os.getenv("TIMEOUT_SECONDS", "120")),
-        "max_retries": int(os.getenv("MAX_RETRIES", "2")),
+        "max_retries": _sdk_max_retries(max_retries),
         "api_key": api_key,
         "callbacks": callbacks,
     }
@@ -875,12 +941,19 @@ def provider_diagnostics() -> dict[str, Any]:
     }
 
 
-def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any:
+def build_llm(
+    *,
+    model_name: Optional[str] = None,
+    callbacks: Any = None,
+    max_retries: Optional[int] = None,
+) -> Any:
     """Construct a ChatOpenAI instance.
 
     Args:
         model_name: Model name; defaults to LANGCHAIN_MODEL_NAME.
         callbacks: Optional LangChain callbacks.
+        max_retries: SDK-level retries for this client; ``None`` = the
+            ``MAX_RETRIES`` env default.
 
     Returns:
         ChatOpenAI instance.
@@ -907,7 +980,7 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         )
 
     if provider == "anthropic":
-        return _build_native_anthropic(name, callbacks=callbacks)
+        return _build_native_anthropic(name, callbacks=callbacks, max_retries=max_retries)
 
     if provider == "deepseek":
         adapter_mode = _deepseek_adapter_mode()
@@ -916,6 +989,7 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
                 model=name,
                 temperature=temperature,
                 callbacks=callbacks,
+                max_retries=max_retries,
             )
             if native_llm is not None:
                 return native_llm
@@ -951,7 +1025,7 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         "model": name,
         "temperature": temperature_param,
         "timeout": int(os.getenv("TIMEOUT_SECONDS", "120")),
-        "max_retries": int(os.getenv("MAX_RETRIES", "2")),
+        "max_retries": _sdk_max_retries(max_retries),
         # None = no ceiling field in the request; a value goes out as
         # ``max_completion_tokens`` (ChatOpenAI renames it, see max_output_tokens).
         "max_tokens": max_output_tokens("openai"),

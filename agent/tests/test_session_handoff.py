@@ -21,8 +21,13 @@ from src.session import handoff
 
 @pytest.fixture(autouse=True)
 def _tenant_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Point the per-tenant data root at a temp dir (VIBE_DATA_DIR contract)."""
+    """Point the per-tenant data root at a temp dir (VIBE_DATA_DIR contract).
+
+    The sidecar only ever lives next to an existing session, so the session
+    directory the tests write for is created up front.
+    """
     monkeypatch.setenv("VIBE_DATA_DIR", str(tmp_path))
+    (tmp_path / "sessions" / "s1").mkdir(parents=True)
     return tmp_path
 
 
@@ -61,20 +66,20 @@ class TestRoundTrip:
 class TestRobustness:
     def test_corrupt_json_returns_empty(self, _tenant_root: Path) -> None:
         path = _tenant_root / "sessions" / "s1" / "handoff.json"
-        path.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{not json", encoding="utf-8")
         assert handoff.load("s1") == ""
 
     def test_wrong_shape_returns_empty(self, _tenant_root: Path) -> None:
         path = _tenant_root / "sessions" / "s1" / "handoff.json"
-        path.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('["a list"]', encoding="utf-8")
         assert handoff.load("s1") == ""
 
     def test_stale_summary_is_not_carried_over(self, _tenant_root: Path) -> None:
         """A summary from a long-abandoned topic is worse than none."""
         path = _tenant_root / "sessions" / "s1" / "handoff.json"
-        path.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         old = datetime.now(timezone.utc) - timedelta(
             days=handoff.HANDOFF_TTL_DAYS + 1
         )
@@ -86,7 +91,7 @@ class TestRobustness:
 
     def test_fresh_summary_within_ttl_is_carried_over(self, _tenant_root: Path) -> None:
         path = _tenant_root / "sessions" / "s1" / "handoff.json"
-        path.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         recent = datetime.now(timezone.utc) - timedelta(days=1)
         path.write_text(
             json.dumps({"summary": "recent", "updated_at": recent.isoformat()}),
@@ -100,7 +105,7 @@ class TestRobustness:
         def _boom(*_args, **_kwargs):
             raise OSError(28, "No space left on device")
 
-        monkeypatch.setattr(Path, "mkdir", _boom)
+        monkeypatch.setattr(handoff, "atomic_write_text", _boom)
         assert handoff.save("s1", "text") is False
 
     def test_oversized_summary_is_clipped_with_a_marker(self) -> None:
@@ -150,6 +155,8 @@ class TestHistoryInjection:
     def test_dropped_turns_get_an_explicit_placeholder(self) -> None:
         """P2-9: silently vanishing turns read as "nothing happened"."""
         msgs = [{"role": "user", "content": "老" * 20_000}]
+        msgs += [{"role": "assistant", "content": "old answer"}]
+        msgs += [{"role": "user", "content": "recent question"}]
         msgs += [{"role": "assistant", "content": "recent answer"}]
         msgs += [{"role": "user", "content": "current turn"}]
 
@@ -173,3 +180,78 @@ class TestHistoryInjection:
 
         assert total <= 6_000
         assert kept, "the budget must still admit at least the newest turn"
+
+
+class TestDeletedSession:
+    def test_save_never_recreates_a_missing_session_directory(self, _tenant_root: Path) -> None:
+        assert handoff.save("gone", "## Goal\nsecret") is False
+        assert not (_tenant_root / "sessions" / "gone").exists()
+
+    def test_save_is_refused_for_a_tombstoned_session(self, _tenant_root: Path) -> None:
+        from src.session import tombstone
+
+        tombstone.mark("s1", _tenant_root / "sessions")
+        try:
+            assert handoff.save("s1", "## Goal\nsecret") is False
+            assert not (_tenant_root / "sessions" / "s1" / "handoff.json").exists()
+        finally:
+            tombstone._reset_for_tests()
+
+
+class TestSectionAwareClipping:
+    """Over-budget summaries keep the goal, open asks and numbers first."""
+
+    @staticmethod
+    def _summary(filler_tokens: int = 3000) -> str:
+        filler = "past step details. " * filler_tokens
+        return (
+            "## Goal\nCompare CSI300 momentum vs value for the user.\n\n"
+            "## Constraints & Preferences\nmax drawdown 15%\n\n"
+            f"## Progress\n### Done\n- {filler}\n\n"
+            "## Key Decisions\nuse 20-day window\n\n"
+            f"## Resolved Questions\n{filler}\n\n"
+            "## Pending User Asks\nAdd a 2019 stress test.\n\n"
+            "## Relevant Files\nruns/abc/code/signal_engine.py\n\n"
+            "## Remaining Work\nstress test\n\n"
+            "## Critical Context\nSharpe 1.42, IC 0.031, lookback 20\n\n"
+            f"## Tools & Patterns\n{filler}\n"
+        )
+
+    def test_injection_keeps_pending_asks_and_critical_numbers(self) -> None:
+        from src.core.token_estimate import estimate_text_tokens
+
+        fitted = handoff.fit_summary(self._summary(), 2000, "\n\n...[summary clipped; omitted: {omitted}]")
+        assert estimate_text_tokens(fitted) <= 2000
+        assert "Add a 2019 stress test." in fitted
+        assert "Sharpe 1.42, IC 0.031" in fitted
+        assert "Compare CSI300 momentum" in fitted
+        assert "omitted:" in fitted and "Tools & Patterns" in fitted
+        # kept sections stay in template order
+        assert fitted.index("## Goal") < fitted.index("## Pending User Asks") < fitted.index("## Critical Context")
+
+    def test_history_injection_uses_the_section_aware_fit(self, _tenant_root: Path) -> None:
+        from src.session.service import SessionService
+
+        path = _tenant_root / "sessions" / "s1" / "handoff.json"
+        path.write_text(
+            json.dumps({"summary": self._summary(), "updated_at": datetime.now(timezone.utc).isoformat()}),
+            encoding="utf-8",
+        )
+        out = SessionService._convert_messages_to_history(
+            [{"role": "user", "content": "q"}, {"role": "user", "content": "current"}], session_id="s1"
+        )
+        assert "Sharpe 1.42" in out[0]["content"]
+        assert "Add a 2019 stress test." in out[0]["content"]
+
+    def test_unstructured_text_is_cut_in_the_middle(self) -> None:
+        text = "HEAD " + "middle " * 5000 + " TAIL-LATEST-STATE"
+        fitted = handoff.fit_summary(text, 500, "\n...[clipped: {omitted}]\n")
+        assert fitted.startswith("HEAD ")
+        assert fitted.endswith("TAIL-LATEST-STATE")
+        assert "clipped: middle of the summary" in fitted
+
+    def test_save_time_cap_is_section_aware_too(self) -> None:
+        handoff.save("s1", self._summary(filler_tokens=6000))
+        loaded = handoff.load("s1")
+        assert "Sharpe 1.42" in loaded and "Add a 2019 stress test." in loaded
+        assert "clipped at the size cap" in loaded
